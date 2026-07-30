@@ -130,7 +130,9 @@ fn wire_name(capability: CoreCapability) -> Option<&'static str> {
         | C::UserNamespace
         | C::MountNamespace
         | C::UtsNamespace
-        | C::IpcNamespace => capability_name::NAMESPACES,
+        | C::IpcNamespace
+        | C::CgroupNamespace
+        | C::TimeNamespace => capability_name::NAMESPACES,
         C::NetworkNamespace => capability_name::NETWORK_NAMESPACES,
         C::CgroupsV2 => capability_name::CGROUPS_V2,
         C::PrivilegedContainers => capability_name::PRIVILEGED_CONTAINERS,
@@ -162,6 +164,8 @@ mod tests {
             CoreCapability::NetworkNamespace,
             CoreCapability::UtsNamespace,
             CoreCapability::IpcNamespace,
+            CoreCapability::CgroupNamespace,
+            CoreCapability::TimeNamespace,
             CoreCapability::CgroupsV2,
             CoreCapability::PrivilegedContainers,
             CoreCapability::KernelModules,

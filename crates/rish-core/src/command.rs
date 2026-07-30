@@ -76,6 +76,7 @@ pub enum OutputChunk {
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum ExecutionPath {
     Builtin,
+    PortableApplet { name: String },
     NativeOffload { operation: String },
     NativeLinux,
     VirtualMachine,

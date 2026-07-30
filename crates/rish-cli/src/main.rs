@@ -2,10 +2,11 @@ use std::env;
 use std::fs;
 use std::process::ExitCode;
 
+use rish_applets::{AppletContext, AppletExecutor};
 use rish_core::{GuestCommand, Platform, PrivilegeMode};
-use rish_oci::{ImageConfiguration, plan_image};
+use rish_oci::{ImageConfiguration, OffloadHandlerRegistry, plan_image};
 use rish_registry::ImageReference;
-use rish_runtime::{OffloadRegistry, Planner, portable_offload_profile};
+use rish_runtime::{BackendCandidate, OffloadRegistry, Planner, portable_offload_profile};
 use serde_json::json;
 
 fn main() -> ExitCode {
@@ -26,9 +27,34 @@ fn run() -> Result<(), String> {
 
     match action {
         "plan" => plan_command(&args[1..]),
+        "applet" => execute_applet(&args[1..]),
         "image-plan" => plan_image_config(&args[1..]),
         "image-ref" => inspect_image_reference(&args[1..]),
         _ => plan_command(&args),
+    }
+}
+
+fn execute_applet(args: &[String]) -> Result<(), String> {
+    let root = args.first().ok_or_else(usage)?;
+    let program = args.get(1).ok_or_else(usage)?;
+    let command = GuestCommand::new(program.clone(), args[2..].iter().cloned());
+    let context = AppletContext::new(root).map_err(|error| error.to_string())?;
+    let outcome = AppletExecutor::new(context)
+        .execute(&command)
+        .map_err(|error| error.to_string())?;
+
+    std::io::Write::write_all(&mut std::io::stdout(), &outcome.stdout)
+        .map_err(|error| error.to_string())?;
+    std::io::Write::write_all(&mut std::io::stderr(), &outcome.stderr)
+        .map_err(|error| error.to_string())?;
+    if outcome.exit_code == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} exited with status {}",
+            command.basename(),
+            outcome.exit_code
+        ))
     }
 }
 
@@ -37,7 +63,9 @@ fn plan_command(args: &[String]) -> Result<(), String> {
     let program = args.get(1).ok_or_else(usage)?;
     let command = GuestCommand::new(program.clone(), args[2..].iter().cloned());
     let profile = portable_offload_profile(platform, PrivilegeMode::AppSandbox);
-    let planner = Planner::new(profile, OffloadRegistry::portable_defaults());
+    let candidate = BackendCandidate::portable_offload(profile, 0)
+        .map_err(|error| format!("invalid portable backend: {error}"))?;
+    let planner = Planner::new(candidate, OffloadRegistry::portable_defaults());
     let plan = planner.plan(&command).map_err(|error| error.to_string())?;
 
     print_json(&plan)
@@ -53,7 +81,9 @@ fn plan_image_config(args: &[String]) -> Result<(), String> {
     let image = serde_json::from_slice::<ImageConfiguration>(&bytes)
         .map_err(|error| format!("invalid OCI image config: {error}"))?;
     let profile = portable_offload_profile(platform, PrivilegeMode::AppSandbox);
-    let plan = plan_image(&image, &profile);
+    let candidate = BackendCandidate::portable_offload(profile, 0)
+        .map_err(|error| format!("invalid portable backend: {error}"))?;
+    let plan = plan_image(&image, &candidate, &OffloadHandlerRegistry::default());
     print_json(&plan)
 }
 
@@ -111,6 +141,7 @@ fn usage() -> String {
     [
         "usage:",
         "  rish-cli plan <ios|android|harmony|linux> <program> [args...]",
+        "  rish-cli applet <existing-canonical-sandbox-root> <program> [args...]",
         "  rish-cli image-plan <ios|android|harmony|linux> <config.json>",
         "  rish-cli image-ref <registry/repository[:tag|@digest]>",
         "",

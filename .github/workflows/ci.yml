@@ -38,6 +38,7 @@ jobs:
       - name: Check portable runtime crates
         run: >-
           cargo check --target ${{ matrix.target }}
+          -p rish-applets
           -p rish-ffi
           -p rish-content
           -p rish-layer

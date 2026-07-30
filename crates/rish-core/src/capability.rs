@@ -19,6 +19,8 @@ pub enum Capability {
     NetworkNamespace,
     UtsNamespace,
     IpcNamespace,
+    CgroupNamespace,
+    TimeNamespace,
     CgroupsV2,
     PrivilegedContainers,
     KernelModules,

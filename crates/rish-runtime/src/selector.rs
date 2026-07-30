@@ -1,10 +1,12 @@
 use std::fmt;
 
 use rish_core::{
-    Capability, CapabilityProfile, CapabilityRequirement, Platform, PrivilegeMode, SupportLevel,
+    Capability, CapabilityProfile, CapabilityRequirement, PrivilegeMode, SupportLevel,
 };
-use rish_vm::VerifiedVmProfile;
+use rish_vm::BootedVm;
 use serde::{Deserialize, Serialize};
+
+use crate::profile::VerifiedNativeProfile;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -16,9 +18,9 @@ pub enum BackendClass {
 
 /// A capability profile bound to a backend class through controlled constructors.
 ///
-/// In particular, a full-VM candidate can only be created from the evidence-gated
-/// [`VerifiedVmProfile`] token. Candidates are serializable for diagnostics but
-/// deliberately cannot be deserialized into trusted runtime state.
+/// Native-Linux and full-VM candidates require evidence-gated tokens.
+/// Candidates are serializable for diagnostics but deliberately cannot be
+/// deserialized into trusted runtime state.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct BackendCandidate {
     class: BackendClass,
@@ -39,25 +41,57 @@ impl BackendCandidate {
         })
     }
 
+    /// A caller-created `CapabilityProfile` is intentionally not accepted.
+    ///
+    /// ```compile_fail
+    /// use rish_core::{CapabilityProfile, Platform, PrivilegeMode};
+    /// use rish_runtime::BackendCandidate;
+    ///
+    /// let forged = CapabilityProfile::new(
+    ///     Platform::Linux,
+    ///     PrivilegeMode::Root,
+    ///     "native-linux",
+    /// );
+    /// let _ = BackendCandidate::native_linux(&forged, 0);
+    /// ```
     pub fn native_linux(
-        profile: CapabilityProfile,
+        profile: &VerifiedNativeProfile,
         startup_cost: u32,
     ) -> Result<Self, BackendCandidateError> {
-        validate_native_profile(&profile)?;
+        if profile.level(Capability::LinuxElf) != SupportLevel::Native {
+            return Err(BackendCandidateError::new(
+                "native-Linux candidate requires actively verified Linux ELF execution",
+            ));
+        }
         Ok(Self {
             class: BackendClass::NativeLinux,
-            profile,
+            profile: profile.capabilities().clone(),
             startup_cost,
         })
     }
 
-    #[must_use]
-    pub fn full_virtual_machine(profile: &VerifiedVmProfile, startup_cost: u32) -> Self {
-        Self {
-            class: BackendClass::FullVirtualMachine,
-            profile: profile.capabilities().clone(),
-            startup_cost,
+    pub fn full_virtual_machine(
+        vm: &BootedVm,
+        startup_cost: u32,
+    ) -> Result<Self, BackendCandidateError> {
+        let profile = vm.profile().capabilities();
+        if profile.level(Capability::FullVirtualMachine) != SupportLevel::Virtualized {
+            return Err(BackendCandidateError::new(
+                "full-VM candidate requires a verified virtual-machine token",
+            ));
         }
+        if profile.level(Capability::LinuxElf) != SupportLevel::Virtualized
+            && profile.level(Capability::CommandOffload) != SupportLevel::Virtualized
+        {
+            return Err(BackendCandidateError::new(
+                "full-VM candidate requires a verified guest execution capability",
+            ));
+        }
+        Ok(Self {
+            class: BackendClass::FullVirtualMachine,
+            profile: profile.clone(),
+            startup_cost,
+        })
     }
 
     #[must_use]
@@ -166,41 +200,26 @@ fn validate_portable_profile(profile: &CapabilityProfile) -> Result<(), BackendC
             "portable candidate cannot claim native or virtualized kernel semantics",
         ));
     }
-    if profile.level(Capability::FullVirtualMachine).is_runnable() {
+    for capability in [
+        Capability::OciImages,
+        Capability::DeviceNodes,
+        Capability::PortForwarding,
+    ] {
+        if profile.level(capability) != SupportLevel::Unavailable {
+            return Err(BackendCandidateError::new(format!(
+                "portable {capability} support requires a live dispatcher-bound evidence token"
+            )));
+        }
+    }
+    if matches!(
+        profile.level(Capability::FullVirtualMachine),
+        SupportLevel::Native
+            | SupportLevel::Virtualized
+            | SupportLevel::Bridged
+            | SupportLevel::Emulated
+    ) {
         return Err(BackendCandidateError::new(
             "portable candidate cannot claim a runnable full VM",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_native_profile(profile: &CapabilityProfile) -> Result<(), BackendCandidateError> {
-    if profile.backend != "native-linux" {
-        return Err(BackendCandidateError::new(
-            "native candidate requires a native-linux profile",
-        ));
-    }
-    if !matches!(
-        profile.privilege,
-        PrivilegeMode::Elevated | PrivilegeMode::Root
-    ) || profile.platform == Platform::Ios
-    {
-        return Err(BackendCandidateError::new(
-            "native Linux candidate requires elevated/root privilege on a non-iOS host",
-        ));
-    }
-    if profile
-        .levels()
-        .values()
-        .any(|level| *level == SupportLevel::Virtualized)
-    {
-        return Err(BackendCandidateError::new(
-            "native candidate cannot claim virtualized capabilities",
-        ));
-    }
-    if profile.level(Capability::FullVirtualMachine).is_runnable() {
-        return Err(BackendCandidateError::new(
-            "native candidate cannot claim a runnable full VM",
         ));
     }
     Ok(())

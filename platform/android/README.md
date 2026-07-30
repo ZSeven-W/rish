@@ -46,6 +46,37 @@ val job = lifecycleScope.launch {
 Injected handlers are `suspend` functions. A long-running implementation must
 check `RishCancellationToken` before and after blocking platform work.
 
+## Portable Rust applets
+
+`executePortableApplet` builds an Android/app-sandbox plan internally and
+calls the new JNI applet ABI only when the result is the exact matching
+`portable_applet`. The execute envelope always takes `sandbox_root` from
+`RishAppletConfiguration`, never from guest JSON:
+
+```kotlin
+val configuration = RishAppletConfiguration.inAppFiles(applicationContext)
+val responseJson = withContext(Dispatchers.IO) {
+    RishBridge.executePortableApplet(
+        RishGuestCommand(
+            program = "sha256sum",
+            stdin = byteArrayOf(0, 0xff.toByte()),
+        ),
+        configuration,
+    )
+}
+```
+
+`inAppFiles` derives and canonicalizes a strict child of
+`Context.filesDir`; the directory name is a bounded single component. The
+constructor is private, so a guest-provided absolute root cannot be inserted.
+The applet ABI is synchronous; keep filesystem-heavy applets off the main
+thread. Result stdout/stderr are still unsigned JSON byte arrays.
+
+The raw JNI/native JSON function is a trusted application implementation
+detail. Do not expose it to WebView JavaScript, a Guest process, or another
+untrusted JSON source; Guest-facing code should use the typed configuration
+entry point derived from Android `Context`.
+
 ## Implemented operations
 
 - `service.systemctl` stores unit names and active/inactive state in memory. It

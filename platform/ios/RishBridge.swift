@@ -1,16 +1,12 @@
 import Foundation
 
 #if RISH_STANDALONE_TYPECHECK
-// Local type-check stubs. Production targets import these declarations from
-// the rish.h bridging header and must not define this compilation condition.
 @_silgen_name("rish_plan_json")
-private func rish_plan_json(
-    _ input: UnsafePointer<CChar>
-) -> UnsafeMutablePointer<CChar>?
-
+private func rish_plan_json(_ input: UnsafePointer<CChar>, _ count: Int) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("rish_execute_applet_json")
+private func rish_execute_applet_json(_ input: UnsafePointer<CChar>, _ count: Int) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("rish_string_free")
 private func rish_string_free(_ value: UnsafeMutablePointer<CChar>?)
-
 @_silgen_name("rish_protocol_version")
 private func rish_protocol_version() -> UInt32
 #endif
@@ -112,6 +108,159 @@ public struct RishGuestCommand: Codable, Equatable, Sendable {
         env = try values.decodeIfPresent([String: String].self, forKey: .env) ?? [:]
         cwd = try values.decodeIfPresent(String.self, forKey: .cwd) ?? "/"
         stdin = try values.decodeIfPresent([UInt8].self, forKey: .stdin) ?? []
+    }
+}
+
+public struct RishAppletLimits: Codable, Equatable, Sendable {
+    public var maxInputBytes: Int
+    public var maxOutputBytes: Int
+    public var maxFilesystemEntries: Int
+    public var maxRecursionDepth: Int
+
+    private enum CodingKeys: String, CodingKey {
+        case maxInputBytes = "max_input_bytes"
+        case maxOutputBytes = "max_output_bytes"
+        case maxFilesystemEntries = "max_filesystem_entries"
+        case maxRecursionDepth = "max_recursion_depth"
+    }
+
+    public init(
+        maxInputBytes: Int = 1_048_576,
+        maxOutputBytes: Int = 1_048_576,
+        maxFilesystemEntries: Int = 10_000,
+        maxRecursionDepth: Int = 64
+    ) {
+        self.maxInputBytes = maxInputBytes
+        self.maxOutputBytes = maxOutputBytes
+        self.maxFilesystemEntries = maxFilesystemEntries
+        self.maxRecursionDepth = maxRecursionDepth
+    }
+}
+
+public enum RishAppletConfigurationError: Error {
+    case containerRootMustBeAbsolute
+    case containerRootMustBeDirectory
+    case sandboxRootMustBeDescendant
+    case sandboxRootMustBeDirectory
+    case unsafeIdentity
+    case invalidLimits
+}
+
+/// Host-owned portable applet boundary.
+///
+/// `appContainerRoot` must come from an Apple container API, such as
+/// `NSHomeDirectory()` or `FileManager.containerURL(...)`, never guest input.
+public struct RishAppletConfiguration: Sendable {
+    fileprivate let sandboxRoot: String
+    fileprivate let readOnly: Bool
+    fileprivate let user: String
+    fileprivate let hostname: String
+    fileprivate let limits: RishAppletLimits
+
+    public init(
+        sandboxRoot: URL,
+        appContainerRoot: URL = URL(
+            fileURLWithPath: NSHomeDirectory(),
+            isDirectory: true
+        ),
+        readOnly: Bool = false,
+        user: String = "rish",
+        hostname: String = "rish",
+        limits: RishAppletLimits = .init()
+    ) throws {
+        guard sandboxRoot.isFileURL,
+              appContainerRoot.isFileURL,
+              sandboxRoot.path.hasPrefix("/"),
+              appContainerRoot.path.hasPrefix("/")
+        else {
+            throw RishAppletConfigurationError.containerRootMustBeAbsolute
+        }
+        guard Self.isSafeIdentity(user), Self.isSafeIdentity(hostname) else {
+            throw RishAppletConfigurationError.unsafeIdentity
+        }
+        guard limits.maxInputBytes > 0,
+              limits.maxInputBytes <= 1_048_576,
+              limits.maxOutputBytes > 0,
+              limits.maxOutputBytes <= 1_048_576,
+              limits.maxFilesystemEntries > 0,
+              limits.maxFilesystemEntries <= 100_000,
+              limits.maxRecursionDepth > 0,
+              limits.maxRecursionDepth <= 256
+        else {
+            throw RishAppletConfigurationError.invalidLimits
+        }
+
+        let fileManager = FileManager.default
+        let lexicalContainer = appContainerRoot.standardizedFileURL
+        let lexicalSandbox = sandboxRoot.standardizedFileURL
+        guard lexicalContainer.path != "/",
+              Self.isStrictDescendant(lexicalSandbox, of: lexicalContainer),
+              lexicalSandbox.deletingLastPathComponent() == lexicalContainer,
+              Self.isSafeIdentity(lexicalSandbox.lastPathComponent) else {
+            throw RishAppletConfigurationError.sandboxRootMustBeDescendant
+        }
+
+        var containerIsDirectory: ObjCBool = false
+        guard fileManager.fileExists(
+            atPath: lexicalContainer.path,
+            isDirectory: &containerIsDirectory
+        ), containerIsDirectory.boolValue else {
+            throw RishAppletConfigurationError.containerRootMustBeDirectory
+        }
+        let canonicalContainer = lexicalContainer.resolvingSymlinksInPath()
+        let canonicalSandbox = canonicalContainer.appendingPathComponent(
+            lexicalSandbox.lastPathComponent,
+            isDirectory: true
+        )
+        if fileManager.fileExists(atPath: canonicalSandbox.path) {
+            let values = try canonicalSandbox.resourceValues(
+                forKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+            )
+            guard values.isDirectory == true, values.isSymbolicLink != true else {
+                throw RishAppletConfigurationError.sandboxRootMustBeDirectory
+            }
+        } else {
+            try fileManager.createDirectory(
+                at: canonicalSandbox,
+                withIntermediateDirectories: false
+            )
+        }
+        let verifiedSandbox = canonicalSandbox.resolvingSymlinksInPath()
+        guard verifiedSandbox == canonicalSandbox,
+              Self.isStrictDescendant(verifiedSandbox, of: canonicalContainer) else {
+            throw RishAppletConfigurationError.sandboxRootMustBeDescendant
+        }
+        var sandboxIsDirectory: ObjCBool = false
+        guard fileManager.fileExists(
+            atPath: verifiedSandbox.path,
+            isDirectory: &sandboxIsDirectory
+        ), sandboxIsDirectory.boolValue else {
+            throw RishAppletConfigurationError.sandboxRootMustBeDirectory
+        }
+
+        self.sandboxRoot = verifiedSandbox.path
+        self.readOnly = readOnly
+        self.user = user
+        self.hostname = hostname
+        self.limits = limits
+    }
+
+    private static func isStrictDescendant(_ child: URL, of parent: URL) -> Bool {
+        let childComponents = child.pathComponents
+        let parentComponents = parent.pathComponents
+        return childComponents.count > parentComponents.count
+            && childComponents.starts(with: parentComponents)
+    }
+
+    private static func isSafeIdentity(_ value: String) -> Bool {
+        !value.isEmpty && value.utf8.count <= 64
+            && value.unicodeScalars.allSatisfy { scalar in
+                let character = scalar.value
+                return (48 ... 57).contains(character)
+                    || (65 ... 90).contains(character)
+                    || (97 ... 122).contains(character)
+                    || character == 45 || character == 46 || character == 95
+            }
     }
 }
 
@@ -507,6 +656,46 @@ public final class RishHostDispatcher: Sendable {
 /// Swift adapter around the versioned Rust JSON planning ABI and host-call
 /// codec. Planning never dispatches a host operation by itself.
 public enum RishBridge {
+    private struct TypedPlanRequest: Encodable {
+        let platform = "ios"
+        let privilege = "app_sandbox"
+        let command: RishGuestCommand
+    }
+
+    private struct TypedPlanResponse: Decodable {
+        let protocolVersion: UInt32
+        let ok: Bool
+        let plan: TypedPlan?
+        let error: String?
+
+        private enum CodingKeys: String, CodingKey {
+            case protocolVersion = "protocol_version"
+            case ok, plan, error
+        }
+    }
+
+    private struct TypedPlan: Decodable {
+        let kind: String
+        let name: String?
+    }
+
+    private struct ExecuteAppletRequest: Encodable {
+        let protocolVersion: UInt32
+        let sandboxRoot: String
+        let readOnly: Bool
+        let user: String
+        let hostname: String
+        let limits: RishAppletLimits
+        let command: RishGuestCommand
+
+        private enum CodingKeys: String, CodingKey {
+            case protocolVersion = "protocol_version"
+            case sandboxRoot = "sandbox_root"
+            case readOnly = "read_only"
+            case user, hostname, limits, command
+        }
+    }
+
     public static var protocolVersion: UInt32 {
         rish_protocol_version()
     }
@@ -520,11 +709,62 @@ public enum RishBridge {
         }
 
         return try request.withCString { input in
-            guard let rawResponse = rish_plan_json(input) else {
+            guard let rawResponse = rish_plan_json(input, request.utf8.count) else {
                 throw BridgeError.nullResponse
             }
             defer { rish_string_free(rawResponse) }
             return Data(String(cString: rawResponse).utf8)
+        }
+    }
+
+    /// Plans a typed iOS command and executes only a `portable_applet` plan.
+    /// The sandbox root is copied exclusively from host configuration.
+    public static func executePortableApplet(
+        command: RishGuestCommand,
+        configuration: RishAppletConfiguration
+    ) throws -> Data {
+        guard command.stdin.count <= configuration.limits.maxInputBytes else {
+            throw BridgeError.inputTooLarge
+        }
+        let planRequest = try JSONEncoder().encode(TypedPlanRequest(command: command))
+        let planResponseData = try plan(request: planRequest)
+        let planned = try JSONDecoder().decode(
+            TypedPlanResponse.self,
+            from: planResponseData
+        )
+        guard planned.protocolVersion == protocolVersion, planned.ok else {
+            throw BridgeError.plannerRejected(planned.error ?? "planner rejected command")
+        }
+        let name = command.program.split(separator: "/").last.map(String.init) ?? ""
+        guard planned.plan?.kind == "portable_applet",
+              planned.plan?.name == name else {
+            throw BridgeError.notPortableApplet
+        }
+
+        let request = ExecuteAppletRequest(
+            protocolVersion: protocolVersion,
+            sandboxRoot: configuration.sandboxRoot,
+            readOnly: configuration.readOnly,
+            user: configuration.user,
+            hostname: configuration.hostname,
+            limits: configuration.limits,
+            command: command
+        )
+        let encoded = try JSONEncoder().encode(request)
+        guard encoded.count <= 8 * 1_024 * 1_024,
+              let json = String(data: encoded, encoding: .utf8) else {
+            throw BridgeError.inputTooLarge
+        }
+        return try json.withCString { input in
+            guard let rawResponse = rish_execute_applet_json(input, json.utf8.count) else {
+                throw BridgeError.nullResponse
+            }
+            defer { rish_string_free(rawResponse) }
+            let response = Data(String(cString: rawResponse).utf8)
+            guard response.count <= 8 * 1_024 * 1_024 else {
+                throw BridgeError.inputTooLarge
+            }
+            return response
         }
     }
 
@@ -552,5 +792,7 @@ public enum RishBridge {
         case invalidUTF8
         case nullResponse
         case inputTooLarge
+        case plannerRejected(String)
+        case notPortableApplet
     }
 }

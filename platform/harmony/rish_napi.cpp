@@ -10,16 +10,23 @@ namespace {
 
 constexpr size_t kMaximumRequestBytes = 8 * 1024 * 1024;
 
-napi_value PlanJson(napi_env env, napi_callback_info info) {
+using RustJsonOperation = char *(*)(const char *, size_t);
+
+napi_value InvokeJson(
+    napi_env env,
+    napi_callback_info info,
+    const char *operation_name,
+    RustJsonOperation operation
+) {
     size_t argc = 1;
     napi_value argv[1] = {nullptr};
     if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok) {
-        napi_throw_error(env, nullptr, "failed to read planJson arguments");
+        napi_throw_error(env, nullptr, "failed to read JSON operation arguments");
         return nullptr;
     }
 
     if (argc != 1) {
-        napi_throw_type_error(env, nullptr, "planJson expects one JSON string");
+        napi_throw_type_error(env, nullptr, operation_name);
         return nullptr;
     }
 
@@ -49,9 +56,9 @@ napi_value PlanJson(napi_env env, napi_callback_info info) {
         return nullptr;
     }
 
-    char *response = rish_plan_json(request.c_str());
+    char *response = operation(request.data(), request.size());
     if (response == nullptr) {
-        napi_throw_error(env, nullptr, "Rust planner returned null");
+        napi_throw_error(env, nullptr, "Rust JSON operation returned null");
         return nullptr;
     }
 
@@ -59,6 +66,24 @@ napi_value PlanJson(napi_env env, napi_callback_info info) {
     napi_create_string_utf8(env, response, std::strlen(response), &result);
     rish_string_free(response);
     return result;
+}
+
+napi_value PlanJson(napi_env env, napi_callback_info info) {
+    return InvokeJson(
+        env,
+        info,
+        "planJson expects one JSON string",
+        rish_plan_json
+    );
+}
+
+napi_value ExecuteAppletJson(napi_env env, napi_callback_info info) {
+    return InvokeJson(
+        env,
+        info,
+        "executeAppletJson expects one JSON string",
+        rish_execute_applet_json
+    );
 }
 
 napi_value ProtocolVersion(napi_env env, napi_callback_info) {
@@ -70,6 +95,16 @@ napi_value ProtocolVersion(napi_env env, napi_callback_info) {
 napi_value Init(napi_env env, napi_value exports) {
     napi_property_descriptor properties[] = {
         {"planJson", nullptr, PlanJson, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {
+            "executeAppletJson",
+            nullptr,
+            ExecuteAppletJson,
+            nullptr,
+            nullptr,
+            nullptr,
+            napi_default,
+            nullptr,
+        },
         {
             "protocolVersion",
             nullptr,
@@ -97,7 +132,7 @@ static napi_module module = {
     0,
     nullptr,
     Init,
-    "rish_ffi",
+    "rish_napi",
     nullptr,
     {nullptr},
 };

@@ -14,9 +14,9 @@ constexpr char kNullRequest[] =
 constexpr char kInvalidUnicode[] =
     R"({"protocol_version":1,"ok":false,"error":"request contains invalid Unicode"})";
 constexpr char kNullResponse[] =
-    R"({"protocol_version":1,"ok":false,"error":"Rust planner returned null"})";
+    R"({"protocol_version":1,"ok":false,"error":"Rust JSON operation returned null"})";
 constexpr char kInvalidResponse[] =
-    R"({"protocol_version":1,"ok":false,"error":"Rust planner returned invalid UTF-8"})";
+    R"({"protocol_version":1,"ok":false,"error":"Rust JSON operation returned invalid UTF-8"})";
 constexpr char kRequestTooLarge[] =
     R"({"protocol_version":1,"ok":false,"error":"request exceeds platform bridge limit"})";
 constexpr jsize kMaximumRequestCharacters = 8 * 1024 * 1024;
@@ -178,13 +178,12 @@ jstring Utf8ToJString(JNIEnv *env, std::string_view input) {
     );
 }
 
-}  // namespace
+using RustJsonOperation = char *(*)(const char *, size_t);
 
-extern "C" JNIEXPORT jstring JNICALL
-Java_dev_rish_runtime_RishBridge_planJson(
+jstring InvokeJson(
     JNIEnv *env,
-    jclass,
-    jstring request
+    jstring request,
+    RustJsonOperation operation
 ) {
     if (request == nullptr) {
         return AsciiError(env, kNullRequest);
@@ -201,7 +200,7 @@ Java_dev_rish_runtime_RishBridge_planJson(
         return AsciiError(env, kInvalidUnicode);
     }
 
-    char *response = rish_plan_json(request_utf8.c_str());
+    char *response = operation(request_utf8.data(), request_utf8.size());
     if (response == nullptr) {
         return AsciiError(env, kNullResponse);
     }
@@ -212,6 +211,26 @@ Java_dev_rish_runtime_RishBridge_planJson(
         return AsciiError(env, kInvalidResponse);
     }
     return result;
+}
+
+}  // namespace
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_rish_runtime_RishBridge_planJson(
+    JNIEnv *env,
+    jclass,
+    jstring request
+) {
+    return InvokeJson(env, request, rish_plan_json);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_rish_runtime_RishBridge_executeAppletJson(
+    JNIEnv *env,
+    jclass,
+    jstring request
+) {
+    return InvokeJson(env, request, rish_execute_applet_json);
 }
 
 extern "C" JNIEXPORT jint JNICALL

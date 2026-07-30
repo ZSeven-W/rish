@@ -1,7 +1,8 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
-use rish_core::{Capability, CapabilityProfile, CapabilityRequirement, GuestCommand};
+use rish_core::{Capability, CapabilityRequirement, GuestCommand};
+use rish_runtime::{BackendCandidate, BackendClass};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -137,43 +138,101 @@ pub enum ImageExecutionPlan {
     },
 }
 
+/// Host-owned evidence that a named native image handler is actually bound.
+///
+/// Image labels are untrusted declarations and cannot register handlers.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct OffloadHandlerRegistry {
+    handlers: BTreeSet<String>,
+}
+
+impl OffloadHandlerRegistry {
+    pub fn register(&mut self, handler: impl Into<String>) -> Result<(), OciError> {
+        let handler = handler.into();
+        if !valid_handler(&handler) {
+            return Err(OciError::InvalidContract(
+                "registered handler must use the canonical offload identifier grammar".to_owned(),
+            ));
+        }
+        self.handlers.insert(handler);
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn contains(&self, handler: &str) -> bool {
+        self.handlers.contains(handler)
+    }
+}
+
 #[must_use]
-pub fn plan_image(image: &ImageConfiguration, profile: &CapabilityProfile) -> ImageExecutionPlan {
+pub fn plan_image(
+    image: &ImageConfiguration,
+    backend: &BackendCandidate,
+    handlers: &OffloadHandlerRegistry,
+) -> ImageExecutionPlan {
     if let Err(error) = image.validate() {
         return ImageExecutionPlan::Rejected {
             reason: error.to_string(),
         };
     }
 
-    match OffloadContract::from_image(image) {
-        Ok(Some(contract)) => {
-            if let Err(error) = profile.require_all(&contract.requirements) {
+    match backend.class() {
+        BackendClass::PortableOffload => match OffloadContract::from_image(image) {
+            Ok(Some(contract)) => {
+                if !handlers.contains(&contract.handler) {
+                    return ImageExecutionPlan::Rejected {
+                        reason: format!(
+                            "native offload handler is not bound by the host: {}",
+                            contract.handler
+                        ),
+                    };
+                }
+                let mut requirements = contract.requirements;
+                requirements.push(CapabilityRequirement::any(Capability::CommandOffload));
+                if let Err(error) = backend.profile().require_all(&requirements) {
+                    return ImageExecutionPlan::Rejected {
+                        reason: error.to_string(),
+                    };
+                }
+                ImageExecutionPlan::NativeOffload {
+                    handler: contract.handler,
+                    command: image_command(image),
+                }
+            }
+            Err(error) => ImageExecutionPlan::Rejected {
+                reason: error.to_string(),
+            },
+            Ok(None) => ImageExecutionPlan::Rejected {
+                reason: "image has no bound rish native-offload contract".to_owned(),
+            },
+        },
+        BackendClass::NativeLinux => {
+            if backend.profile().level(Capability::LinuxElf) != rish_core::SupportLevel::Native {
                 return ImageExecutionPlan::Rejected {
-                    reason: error.to_string(),
+                    reason: "native backend lacks exact Linux ELF evidence".to_owned(),
                 };
             }
-            ImageExecutionPlan::NativeOffload {
-                handler: contract.handler,
-                command: image_command(image),
-            }
-        }
-        Err(error) => ImageExecutionPlan::Rejected {
-            reason: error.to_string(),
-        },
-        Ok(None) if profile.level(Capability::LinuxElf).is_runnable() => {
             ImageExecutionPlan::NativeLinux {
                 command: image_command(image),
             }
         }
-        Ok(None) if profile.level(Capability::FullVirtualMachine).is_runnable() => {
+        BackendClass::FullVirtualMachine => {
+            let profile = backend.profile();
+            let has_exec = profile.level(Capability::LinuxElf)
+                == rish_core::SupportLevel::Virtualized
+                || profile.level(Capability::CommandOffload)
+                    == rish_core::SupportLevel::Virtualized;
+            if profile.level(Capability::FullVirtualMachine) != rish_core::SupportLevel::Virtualized
+                || !has_exec
+            {
+                return ImageExecutionPlan::Rejected {
+                    reason: "full VM backend lacks exact VM/exec evidence".to_owned(),
+                };
+            }
             ImageExecutionPlan::VirtualMachine {
                 command: image_command(image),
             }
         }
-        Ok(None) => ImageExecutionPlan::Rejected {
-            reason: "image has no rish offload contract and no Linux ELF/VM backend is available"
-                .to_owned(),
-        },
     }
 }
 
@@ -297,6 +356,14 @@ mod tests {
 
     use super::*;
 
+    fn portable_backend(platform: Platform) -> BackendCandidate {
+        BackendCandidate::portable_offload(
+            portable_offload_profile(platform, PrivilegeMode::AppSandbox),
+            0,
+        )
+        .unwrap()
+    }
+
     fn image(labels: BTreeMap<String, String>) -> ImageConfiguration {
         ImageConfiguration {
             architecture: "arm64".to_owned(),
@@ -316,24 +383,42 @@ mod tests {
 
     #[test]
     fn portable_backend_accepts_declared_native_offload() {
-        let labels = BTreeMap::from([
-            (HANDLER_LABEL.to_owned(), "sample.demo".to_owned()),
-            (REQUIRES_LABEL.to_owned(), "port_forwarding".to_owned()),
-        ]);
-        let profile = portable_offload_profile(Platform::Ios, PrivilegeMode::AppSandbox);
+        let labels = BTreeMap::from([(HANDLER_LABEL.to_owned(), "sample.demo".to_owned())]);
+        let backend = portable_backend(Platform::Ios);
+        let mut handlers = OffloadHandlerRegistry::default();
+        handlers.register("sample.demo").unwrap();
 
         assert!(matches!(
-            plan_image(&image(labels), &profile),
+            plan_image(&image(labels), &backend, &handlers),
             ImageExecutionPlan::NativeOffload { handler, .. } if handler == "sample.demo"
         ));
     }
 
     #[test]
-    fn portable_backend_rejects_unknown_elf() {
-        let profile = portable_offload_profile(Platform::Ios, PrivilegeMode::AppSandbox);
+    fn image_labels_cannot_register_their_own_native_handler() {
+        let labels = BTreeMap::from([(HANDLER_LABEL.to_owned(), "sample.demo".to_owned())]);
+        let backend = portable_backend(Platform::Ios);
 
         assert!(matches!(
-            plan_image(&image(BTreeMap::new()), &profile),
+            plan_image(
+                &image(labels),
+                &backend,
+                &OffloadHandlerRegistry::default()
+            ),
+            ImageExecutionPlan::Rejected { reason } if reason.contains("not bound")
+        ));
+    }
+
+    #[test]
+    fn portable_backend_rejects_unknown_elf() {
+        let backend = portable_backend(Platform::Ios);
+
+        assert!(matches!(
+            plan_image(
+                &image(BTreeMap::new()),
+                &backend,
+                &OffloadHandlerRegistry::default()
+            ),
             ImageExecutionPlan::Rejected { .. }
         ));
     }
@@ -347,10 +432,12 @@ mod tests {
                 "network_namespace".to_owned(),
             ),
         ]);
-        let profile = portable_offload_profile(Platform::Android, PrivilegeMode::AppSandbox);
+        let backend = portable_backend(Platform::Android);
+        let mut handlers = OffloadHandlerRegistry::default();
+        handlers.register("sample.demo").unwrap();
 
         assert!(matches!(
-            plan_image(&image(labels), &profile),
+            plan_image(&image(labels), &backend, &handlers),
             ImageExecutionPlan::Rejected { .. }
         ));
     }
@@ -358,29 +445,33 @@ mod tests {
     #[test]
     fn rejects_malformed_offload_handler() {
         let labels = BTreeMap::from([(HANDLER_LABEL.to_owned(), "sample.demo\nforged".to_owned())]);
-        let profile = portable_offload_profile(Platform::Ios, PrivilegeMode::AppSandbox);
+        let backend = portable_backend(Platform::Ios);
 
         assert!(matches!(
-            plan_image(&image(labels), &profile),
+            plan_image(
+                &image(labels),
+                &backend,
+                &OffloadHandlerRegistry::default()
+            ),
             ImageExecutionPlan::Rejected { reason } if reason.contains("offload handler")
         ));
     }
 
     #[test]
     fn rejects_invalid_image_process_configuration() {
-        let profile = portable_offload_profile(Platform::Ios, PrivilegeMode::AppSandbox);
+        let backend = portable_backend(Platform::Ios);
         let mut invalid = image(BTreeMap::new());
         invalid.config.working_dir = "relative".to_owned();
 
         assert!(matches!(
-            plan_image(&invalid, &profile),
+            plan_image(&invalid, &backend, &OffloadHandlerRegistry::default()),
             ImageExecutionPlan::Rejected { reason } if reason.contains("WorkingDir")
         ));
 
         invalid.config.working_dir = "/".to_owned();
         invalid.config.env = vec!["MISSING_EQUALS".to_owned()];
         assert!(matches!(
-            plan_image(&invalid, &profile),
+            plan_image(&invalid, &backend, &OffloadHandlerRegistry::default()),
             ImageExecutionPlan::Rejected { reason } if reason.contains("Env")
         ));
     }

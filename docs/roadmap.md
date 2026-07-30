@@ -12,6 +12,10 @@
 - [x] VM trait、virtio 设备配置与 guest kernel contract
 - [x] Swift/JNI/N-API 共用 JSON C ABI
 - [x] Swift/Kotlin/ArkTS HostCall codec 与固定 allow-list dispatcher
+- [x] 首批 47 个 bounded Rust portable applets 与版本化执行 ABI
+- [x] Linux/VM backend 优先的完整命令路由
+- [x] live `BootedVm` 绑定的 verified VM command executor
+- [x] 不可伪造且保守失败关闭的 Native Linux probe token
 - [x] stock 平台失败关闭测试
 - [x] JNI 和 Harmony N-API shim 源码
 - [ ] 在真实 SDK 工程中编译并运行 JNI/Harmony N-API shim
@@ -44,6 +48,8 @@ portable backend。
 - [ ] permission broker
 - [ ] streaming stdin/stdout/stderr、deadline 与 backpressure
 - [ ] platform handler conformance suite
+- [ ] portable `rish-sh`（pipeline、redirection、变量和控制流）
+- [ ] tar/gzip/xargs 与 applet differential conformance suite
 
 验收：同一个带 `io.rish.offload.handler` 的镜像可在三端运行，输出一致。
 
@@ -58,6 +64,7 @@ portable backend。
 - [x] bootstrap Rust guest agent、严格握手和 capability gate
 - [x] 非阻塞 exec 监督、Cancel、timeout、进程组清理和有界输出
 - [ ] Youki/systemd capability probe 与完整 guest agent handler
+- [ ] Native Linux OEM executor 与执行时主动 syscall 重验
 - 用户态 NAT、DNS、TCP/UDP 端口转发
 - suspend/checkpoint/restore
 

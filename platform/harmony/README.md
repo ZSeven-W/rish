@@ -6,8 +6,10 @@ extract `plan.call`, decode it with `RishHostCodec`, and pass it through the
 fixed allow-list.
 
 Build `rish_napi.cpp` with the included `CMakeLists.txt`, place the Rust
-`librish_ffi.so` under `libs/<OHOS_ARCH>`, and import the resulting
-`librish_ffi.so` module from the HAP.
+`librish_ffi.so` under `libs/<OHOS_ARCH>`, and package both it and the
+resulting `librish_napi.so` wrapper in the HAP. ArkTS imports
+`librish_napi.so`; the wrapper resolves the Rust ABI from the sibling
+`librish_ffi.so`.
 
 ## Wire contract
 
@@ -34,6 +36,39 @@ const pendingReply = dispatchHostCall(
 // cancellation.cancel();
 const replyJson = await pendingReply;
 ```
+
+## Portable Rust applets
+
+The app creates configuration from its own
+`UIAbilityContext/ApplicationContext.filesDir`. `executePortableApplet`
+generates a Harmony/app-sandbox plan itself and reaches the N-API applet
+wrapper only for an exact matching `portable_applet` plan:
+
+```typescript
+const configuration = RishAppletConfiguration.inAppFiles(context);
+const responseJson = executePortableApplet(
+  {
+    program: 'sha256sum',
+    args: [],
+    env: {},
+    cwd: '/',
+    stdin: new Uint8Array([0, 255])
+  },
+  configuration
+);
+```
+
+There is no public configuration constructor that accepts an arbitrary guest
+root. Pass the platform `Context` itself, not `filesDir`, command payload, or UI
+text. The constructor creates and verifies one direct child of
+`Context.filesDir`. The native ABI is synchronous and bounded, so run
+filesystem-heavy applets in a Worker/taskpool rather than the UI thread.
+stdout/stderr stay as JSON byte arrays.
+
+The low-level N-API functions are trusted HAP implementation details. Do not
+expose `executeAppletJson` to a WebView, downloaded script, Guest process, or
+other untrusted JSON source; only `executePortableApplet` should be reachable
+from product code handling Guest requests.
 
 ## Implemented operations
 

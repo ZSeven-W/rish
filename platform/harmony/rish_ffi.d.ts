@@ -1,6 +1,7 @@
-declare module 'librish_ffi.so' {
+declare module 'librish_napi.so' {
   interface RishNativeModule {
     planJson(request: string): string;
+    executeAppletJson(request: string): string;
     protocolVersion(): number;
   }
 

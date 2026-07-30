@@ -6,7 +6,8 @@
 
 - 已知 Guest 命令由 Rust 拦截并分派给 Swift/Objective-C、Kotlin/Java、
   ArkTS 或系统特权服务。
-- OCI 镜像可以声明原生 handler 契约，无需解释执行其中的 ELF。
+- OCI 镜像可以请求原生 handler 契约；只有宿主 live allow-list 已绑定同名
+  handler 时才会采用，无需解释执行其中的 ELF。
 - 未知 ELF、真正的 systemd、Docker-in-Docker、内核模块和完整网络
   namespace 必须进入真实 Linux guest 或经过探测的宿主 Linux 后端。
 - 能力不足时失败关闭，不会把“模拟成功”伪装成真实内核隔离。
@@ -90,16 +91,18 @@ platform/
 
 ```bash
 cargo test --workspace
-cargo run -p rish-cli -- plan ios systemctl start demo
+cargo run -p rish-cli -- plan ios grep needle
 cargo run -p rish-cli -- plan ios docker ps
 cargo run -p rish-cli -- image-ref alpine
 ```
 
-第一条命令会输出 `service.systemctl` host call；第二条会输出
-`container.docker_api`。真实 `dockerd` 会因为 stock iOS 不具备
-guest/native kernel 后端而被拒绝：
+第一条命令会输出 `portable_applet` plan。通用 planner 未绑定 live Docker
+handler，因此第二条失败关闭；后续 dispatcher-bound capability token 才能启用
+`container.docker_api`。真实 `systemctl` 和 `dockerd` 也会因为 stock iOS
+不具备 guest/native kernel 后端而被拒绝：
 
 ```bash
+cargo run -p rish-cli -- plan ios systemctl status demo
 cargo run -p rish-cli -- plan ios dockerd
 ```
 
@@ -110,6 +113,25 @@ Swift、Kotlin/Java 和 ArkTS 侧现已包含二进制安全 HostCall/HostReply 
 Guest bootstrap exec 使用有界非阻塞监督器：长进程不会阻塞 Ping，Cancel、
 timeout、进程组清理、stdout/stderr 限额和定期 poll 均已接入。当前仍不提供
 TTY 或 streaming stdin。
+
+## Linux 命令兼容层
+
+`rish-applets` 现提供首批 47 个共享 Rust 原生命令入口，覆盖常用文本流、
+校验和、虚拟身份与 app-owned 文件系统操作。它们不解释 Guest ELF，并通过
+`rish_execute_applet_json` 从 Swift、Kotlin/Java 和 ArkTS 桥调用。路径被限制
+在应用创建的 canonical sandbox root 内，输入、输出、递归深度和文件数量均有
+硬上限。只有显式 bare command name 进入 applet；带路径的 Guest 程序不会因
+basename 相同而被原生实现截获。
+
+需要 `/proc`、netlink、namespace、cgroup、设备、模块、真实 systemd 或容器
+daemon 的命令不会使用近似 applet；它们通过绑定 live `BootedVm` 的 Full VM
+执行。Native Linux 已有不可伪造的保守 probe token；在主动 child-exec probe
+和 OEM executor 接入前，它不声明 `LinuxElf`，也不能成为可运行候选。完整命令分层和当前列表见
+[Linux 命令兼容说明](docs/command-compatibility.md)。
+
+移动端 C ABI 是可信宿主嵌入边界，不是 Guest API：请求使用显式字节长度且上限
+8 MiB，FFI applet 的输入/输出上限为 1 MiB。平台应用必须从自己的
+Context/container 构造根目录，不能把 Guest JSON 的路径转发给原始 native ABI。
 
 ## OCI 原生契约
 
@@ -126,6 +148,10 @@ TTY 或 streaming stdin。
   }
 }
 ```
+
+镜像 label 只是未受信请求，不能自行注册实现。`plan_image` 还要求
+evidence-gated `BackendCandidate` 和宿主构造的 `OffloadHandlerRegistry`；
+未绑定 handler 会失败关闭。
 
 - `io.rish.requires` 允许桥接或语义模拟。
 - `io.rish.requires-kernel` 只接受宿主原生或完整 VM guest 的真实内核语义。
@@ -144,7 +170,7 @@ TTY 或 streaming stdin。
 | 未知复杂 ELF/syscall | 不支持 | Linux 内核处理 | Linux 内核处理 |
 
 详细设计见 [架构说明](docs/architecture.md)、[平台能力矩阵](docs/platform-matrix.md)、
-[OCI 数据面](docs/oci-pipeline.md)、
+[OCI 数据面](docs/oci-pipeline.md)、[Linux 命令兼容说明](docs/command-compatibility.md)、
 [offload-first 决策](docs/decisions/0001-offload-first.md) 和
 [路线图](docs/roadmap.md)。
 

@@ -8,12 +8,13 @@ use rish_guest_protocol::{
     GuestCapabilities, GuestLimits, HandshakeOutcome, HelloAck, Message, PeerInfo, capability_name,
 };
 use rish_vm::{
-    GuestChannel, GuestKernelContract, GuestKernelEvidence, GuestSession, KernelEvidenceSource,
-    VmAcceleration, VmCandidate, VmConfig, VmDevice, VmEngine, VmError, VmProbe,
+    BootedVm, GuestChannel, GuestKernelContract, GuestKernelEvidence, GuestSession,
+    KernelEvidenceSource, VmAcceleration, VmCandidate, VmConfig, VmDevice, VmEngine, VmError,
+    VmProbe,
 };
 
 use super::*;
-use crate::portable_offload_profile;
+use crate::{CommandPlan, OffloadRegistry, Planner, VerifiedVmRuntime, portable_offload_profile};
 
 struct TestEngine;
 
@@ -53,13 +54,22 @@ impl GuestChannel for TestChannel {
                         init_system: "systemd".to_owned(),
                         cgroup_version: Some(2),
                         container_runtimes: vec!["youki".to_owned()],
-                        features: vec![GuestCapability {
-                            name: capability_name::NESTED_CONTAINERS.to_owned(),
-                            version: 1,
-                            status: CapabilityStatus::Available,
-                            attributes: BTreeMap::new(),
-                            reason: None,
-                        }],
+                        features: vec![
+                            GuestCapability {
+                                name: capability_name::NESTED_CONTAINERS.to_owned(),
+                                version: 1,
+                                status: CapabilityStatus::Available,
+                                attributes: BTreeMap::new(),
+                                reason: None,
+                            },
+                            GuestCapability {
+                                name: capability_name::EXEC.to_owned(),
+                                version: 1,
+                                status: CapabilityStatus::Available,
+                                attributes: BTreeMap::new(),
+                                reason: None,
+                            },
+                        ],
                     }),
                     limits: GuestLimits {
                         max_frame_size: rish_guest_protocol::DEFAULT_MAX_FRAME_SIZE as u32,
@@ -79,17 +89,44 @@ impl GuestChannel for TestChannel {
                 kernel_release: "6.12".to_owned(),
                 sha256: "a".repeat(64),
             },
-            ["CONFIG_NAMESPACES"],
+            ["CONFIG_NAMESPACES", "CONFIG_BINFMT_ELF"],
         )
     }
 
-    fn execute(&self, _command: &GuestCommand) -> Result<HostReply, VmError> {
-        Err(VmError::Guest("unused".to_owned()))
+    fn execute(&self, command: &GuestCommand) -> Result<HostReply, VmError> {
+        Ok(HostReply {
+            exit_code: 0,
+            stdout: command.program.as_bytes().to_vec(),
+            stderr: Vec::new(),
+            payload: serde_json::Value::Null,
+        })
     }
 }
 
-fn verified_vm_candidate() -> BackendCandidate {
-    let vm = VmCandidate::new(
+fn booted_vm() -> BootedVm {
+    VmCandidate::new(
+        Platform::Ios,
+        VmConfig {
+            architecture: "aarch64".to_owned(),
+            vcpus: 1,
+            memory_mib: 512,
+            kernel_path: "/app/kernel".to_owned(),
+            initrd_path: None,
+            root_disk_path: "/app/root.img".to_owned(),
+            acceleration: VmAcceleration::Interpreter,
+            devices: vec![VmDevice::Console],
+        },
+        GuestKernelContract::new(
+            ["CONFIG_NAMESPACES", "CONFIG_BINFMT_ELF"],
+            [Capability::NestedContainers, Capability::LinuxElf],
+        ),
+    )
+    .boot(&TestEngine)
+    .unwrap()
+}
+
+fn booted_vm_without_exec_contract() -> BootedVm {
+    VmCandidate::new(
         Platform::Ios,
         VmConfig {
             architecture: "aarch64".to_owned(),
@@ -104,8 +141,12 @@ fn verified_vm_candidate() -> BackendCandidate {
         GuestKernelContract::new(["CONFIG_NAMESPACES"], [Capability::NestedContainers]),
     )
     .boot(&TestEngine)
-    .unwrap();
-    BackendCandidate::full_virtual_machine(vm.profile(), 100)
+    .unwrap()
+}
+
+fn verified_vm_candidate() -> BackendCandidate {
+    let vm = booted_vm();
+    BackendCandidate::full_virtual_machine(&vm, 100).unwrap()
 }
 
 #[test]
@@ -131,6 +172,60 @@ fn real_dind_requirement_skips_semantic_offload_backend() {
 }
 
 #[test]
+fn verified_full_vm_candidate_routes_commands_to_vm_exec() {
+    let planner = Planner::new(
+        verified_vm_candidate(),
+        OffloadRegistry::portable_defaults(),
+    );
+    let command = GuestCommand::new("grep", ["--perl-regexp".to_owned(), "x".to_owned()]);
+
+    assert!(matches!(
+        planner.plan(&command).unwrap(),
+        CommandPlan::HostCall { call } if call.operation == "vm.exec"
+    ));
+    assert_eq!(planner.backend_class(), BackendClass::FullVirtualMachine);
+}
+
+#[test]
+fn path_elf_names_do_not_gain_registry_semantics_from_their_basename() {
+    let planner = Planner::new(
+        verified_vm_candidate(),
+        OffloadRegistry::portable_defaults(),
+    );
+    let command = GuestCommand::new("/tmp/docker", ["ps".to_owned()]);
+
+    let CommandPlan::HostCall { call } = planner.plan(&command).unwrap() else {
+        panic!("full VM should plan path-bearing Guest ELF through vm.exec");
+    };
+    assert_eq!(call.operation, "vm.exec");
+    assert!(
+        !call
+            .requirements
+            .iter()
+            .any(|requirement| requirement.capability == Capability::OciImages)
+    );
+}
+
+#[test]
+fn verified_vm_runtime_executes_through_the_live_booted_vm() {
+    let vm = booted_vm();
+    let runtime = VerifiedVmRuntime::new(&vm, OffloadRegistry::portable_defaults()).unwrap();
+    let command = GuestCommand::new("grep", ["needle".to_owned()]);
+
+    let outcome = runtime.execute(&command).unwrap();
+    assert_eq!(outcome.stdout, b"grep");
+    assert_eq!(outcome.path, rish_core::ExecutionPath::VirtualMachine);
+}
+
+#[test]
+fn vm_without_a_verified_exec_capability_is_not_a_runtime_candidate() {
+    let vm = booted_vm_without_exec_contract();
+
+    assert!(BackendCandidate::full_virtual_machine(&vm, 1).is_err());
+    assert!(VerifiedVmRuntime::new(&vm, OffloadRegistry::portable_defaults()).is_err());
+}
+
+#[test]
 fn portable_constructor_rejects_forged_vm_capability() {
     let profile =
         CapabilityProfile::new(Platform::Ios, PrivilegeMode::AppSandbox, "portable-offload")
@@ -140,20 +235,47 @@ fn portable_constructor_rejects_forged_vm_capability() {
 }
 
 #[test]
-fn native_constructor_rejects_vm_guest_and_virtualized_levels() {
-    let profile = CapabilityProfile::new(Platform::Android, PrivilegeMode::VmGuest, "native-linux")
-        .with(Capability::LinuxElf, SupportLevel::Virtualized);
+fn portable_constructor_rejects_unbound_optional_handlers() {
+    for capability in [
+        Capability::OciImages,
+        Capability::DeviceNodes,
+        Capability::PortForwarding,
+    ] {
+        let profile = portable_offload_profile(Platform::Ios, PrivilegeMode::AppSandbox)
+            .with(capability, SupportLevel::Bridged);
+        assert!(BackendCandidate::portable_offload(profile, 1).is_err());
+    }
+}
 
-    assert!(BackendCandidate::native_linux(profile, 1).is_err());
+#[test]
+fn native_candidate_is_created_from_verified_token() {
+    let profile = CapabilityProfile::new(Platform::Linux, PrivilegeMode::Root, "native-linux")
+        .with(Capability::LinuxElf, SupportLevel::Native)
+        .with(Capability::FullVirtualMachine, SupportLevel::Unavailable);
+    let verified = crate::VerifiedNativeProfile::for_test(profile);
+    let candidate = BackendCandidate::native_linux(&verified, 1).unwrap();
+
+    assert_eq!(candidate.class(), BackendClass::NativeLinux);
+    assert_eq!(
+        candidate.profile().level(Capability::LinuxElf),
+        SupportLevel::Native
+    );
+}
+
+#[test]
+fn native_candidate_requires_active_linux_elf_evidence() {
+    let profile = CapabilityProfile::new(Platform::Linux, PrivilegeMode::Root, "native-linux")
+        .with(Capability::LinuxElf, SupportLevel::Unavailable)
+        .with(Capability::VirtualFilesystem, SupportLevel::Native);
+    let verified = crate::VerifiedNativeProfile::for_test(profile);
+
+    assert!(BackendCandidate::native_linux(&verified, 1).is_err());
 }
 
 #[test]
 fn backend_classes_reject_wrong_privilege_boundaries() {
     let portable =
         CapabilityProfile::new(Platform::Android, PrivilegeMode::Root, "portable-offload");
-    let native =
-        CapabilityProfile::new(Platform::Android, PrivilegeMode::AppSandbox, "native-linux");
 
     assert!(BackendCandidate::portable_offload(portable, 1).is_err());
-    assert!(BackendCandidate::native_linux(native, 1).is_err());
 }

@@ -1,5 +1,7 @@
 package dev.rish.runtime
 
+import android.content.Context
+import java.io.File
 import java.util.concurrent.CancellationException
 import java.util.concurrent.atomic.AtomicBoolean
 import org.json.JSONArray
@@ -14,6 +16,85 @@ data class RishGuestCommand(
     /** Encoded as a JSON integer array, matching Rust `Vec<u8>`. */
     val stdin: ByteArray = byteArrayOf(),
 )
+
+data class RishAppletLimits(
+    val maxInputBytes: Int = 1_048_576,
+    val maxOutputBytes: Int = 1_048_576,
+    val maxFilesystemEntries: Int = 10_000,
+    val maxRecursionDepth: Int = 64,
+) {
+    init {
+        require(maxInputBytes in 1..1_048_576)
+        require(maxOutputBytes in 1..1_048_576)
+        require(maxFilesystemEntries in 1..100_000)
+        require(maxRecursionDepth in 1..256)
+    }
+}
+
+/**
+ * Host-owned sandbox configuration. Paths must come from Android Context or
+ * other application code, never a guest command or planner payload.
+ */
+class RishAppletConfiguration private constructor(
+    internal val sandboxRoot: String,
+    internal val readOnly: Boolean,
+    internal val user: String,
+    internal val hostname: String,
+    internal val limits: RishAppletLimits,
+) {
+    companion object {
+        fun inAppFiles(
+            context: Context,
+            directoryName: String = "rish-applets",
+            readOnly: Boolean = false,
+            user: String = "rish",
+            hostname: String = "rish",
+            limits: RishAppletLimits = RishAppletLimits(),
+        ): RishAppletConfiguration {
+            require(directoryName.matches(Regex("[A-Za-z0-9._-]{1,64}")))
+            return withinAppContainer(
+                context.filesDir,
+                File(context.filesDir, directoryName),
+                readOnly,
+                user,
+                hostname,
+                limits,
+            )
+        }
+
+        private fun withinAppContainer(
+            appContainerRoot: File,
+            sandboxRoot: File,
+            readOnly: Boolean = false,
+            user: String = "rish",
+            hostname: String = "rish",
+            limits: RishAppletLimits = RishAppletLimits(),
+        ): RishAppletConfiguration {
+            require(appContainerRoot.isAbsolute && sandboxRoot.isAbsolute)
+            require(safeIdentity(user) && safeIdentity(hostname))
+            val container = appContainerRoot.canonicalFile
+            require(container.isDirectory)
+            val sandbox = sandboxRoot.canonicalFile
+            require(isStrictDescendant(sandbox, container))
+            require(sandbox.mkdirs() || sandbox.isDirectory)
+            val verified = sandbox.canonicalFile
+            require(verified.isDirectory && isStrictDescendant(verified, container))
+            return RishAppletConfiguration(
+                verified.path,
+                readOnly,
+                user,
+                hostname,
+                limits,
+            )
+        }
+
+        private fun isStrictDescendant(child: File, parent: File): Boolean =
+            child.path.startsWith(parent.path.trimEnd(File.separatorChar) + File.separator)
+
+        private fun safeIdentity(value: String): Boolean =
+            value.matches(Regex("[A-Za-z0-9._-]{1,64}"))
+    }
+}
 
 /** JSON-compatible counterpart of `rish_core::CapabilityRequirement`. */
 data class RishCapabilityRequirement(
@@ -114,6 +195,26 @@ object RishHostCodec {
             .put("payload", reply.payload ?: JSONObject.NULL)
             .toString()
     }
+
+    internal fun encodeGuestCommand(command: RishGuestCommand): JSONObject {
+        val args = JSONArray()
+        command.args.forEach { args.put(it) }
+        val environment = JSONObject()
+        command.env.forEach { (key, value) -> environment.put(key, value) }
+        return JSONObject()
+            .put("program", command.program)
+            .put("args", args)
+            .put("env", environment)
+            .put("cwd", command.cwd)
+            .put("stdin", command.stdin.toJsonArray())
+    }
+
+    internal fun encodeAppletLimits(limits: RishAppletLimits): JSONObject =
+        JSONObject()
+            .put("max_input_bytes", limits.maxInputBytes)
+            .put("max_output_bytes", limits.maxOutputBytes)
+            .put("max_filesystem_entries", limits.maxFilesystemEntries)
+            .put("max_recursion_depth", limits.maxRecursionDepth)
 
     private fun JSONObject.requiredString(key: String): String {
         val value = getString(key)
@@ -513,7 +614,54 @@ object RishBridge {
     }
 
     external fun planJson(request: String): String
+    private external fun executeAppletJson(request: String): String
     external fun protocolVersion(): Int
+
+    /**
+     * Builds its own Android/app-sandbox plan and invokes Rust only when the
+     * returned plan is exactly the matching portable applet.
+     */
+    fun executePortableApplet(
+        command: RishGuestCommand,
+        configuration: RishAppletConfiguration,
+    ): String {
+        require(command.stdin.size <= configuration.limits.maxInputBytes)
+        val planRequest = JSONObject()
+            .put("platform", "android")
+            .put("privilege", "app_sandbox")
+            .put("command", RishHostCodec.encodeGuestCommand(command))
+            .toString()
+        val planned = JSONObject(planJson(planRequest))
+        require(planned.getInt("protocol_version") == protocolVersion())
+        require(planned.get("ok") == true) {
+            planned.optString("error", "planner rejected command")
+        }
+        val plan = planned.getJSONObject("plan")
+        require(plan.getString("kind") == "portable_applet") {
+            "plan is not a portable applet"
+        }
+        require(
+            plan.getString("name") == command.program.substringAfterLast('/'),
+        ) {
+            "portable applet plan does not match command"
+        }
+
+        val executeRequest = JSONObject()
+            .put("protocol_version", protocolVersion())
+            .put("sandbox_root", configuration.sandboxRoot)
+            .put("read_only", configuration.readOnly)
+            .put("user", configuration.user)
+            .put("hostname", configuration.hostname)
+            .put("limits", RishHostCodec.encodeAppletLimits(configuration.limits))
+            .put("command", RishHostCodec.encodeGuestCommand(command))
+            .toString()
+        require(executeRequest.length <= 8 * 1024 * 1024)
+        return executeAppletJson(executeRequest).also {
+            require(it.length <= 8 * 1024 * 1024) {
+                "portable applet response exceeds platform bridge limit"
+            }
+        }
+    }
 
     fun decodeHostCall(json: String): RishHostCall =
         RishHostCodec.decodeHostCall(json)

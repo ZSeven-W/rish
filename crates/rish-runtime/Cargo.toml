@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+rish-applets.workspace = true
 rish-core.workspace = true
 rish-vm.workspace = true
 serde.workspace = true

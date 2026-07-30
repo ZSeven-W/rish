@@ -4,7 +4,9 @@
  * A plan is never permission to execute an arbitrary operation. Dispatch below
  * uses a fixed allow-list and rejects Linux-kernel semantics on the HAP side.
  */
-import rish from 'librish_ffi.so';
+import { common } from '@kit.AbilityKit';
+import { fileIo as fs } from '@kit.CoreFileKit';
+import rish from 'librish_napi.so';
 
 // ArkTS represents aggregate JSON values as Object; the codec boundary still
 // accepts only data produced by JSON.parse/JSON.stringify.
@@ -19,6 +21,121 @@ export interface RishGuestCommand {
   cwd: string;
   /** Kept binary in ArkTS; the codec maps it to Rust's JSON integer array. */
   stdin: Uint8Array;
+}
+
+export interface RishAppletLimits {
+  readonly maxInputBytes: number;
+  readonly maxOutputBytes: number;
+  readonly maxFilesystemEntries: number;
+  readonly maxRecursionDepth: number;
+}
+
+/**
+ * Host-owned root constructed from UIAbility/ApplicationContext.filesDir.
+ * There is deliberately no constructor that accepts a guest sandbox root.
+ */
+export class RishAppletConfiguration {
+  readonly sandboxRoot: string;
+  readonly readOnly: boolean;
+  readonly user: string;
+  readonly hostname: string;
+  private readonly configuredLimits: RishAppletLimits;
+
+  private constructor(
+    sandboxRoot: string,
+    readOnly: boolean,
+    user: string,
+    hostname: string,
+    limits: RishAppletLimits
+  ) {
+    this.sandboxRoot = sandboxRoot;
+    this.readOnly = readOnly;
+    this.user = user;
+    this.hostname = hostname;
+    this.configuredLimits = {
+      maxInputBytes: limits.maxInputBytes,
+      maxOutputBytes: limits.maxOutputBytes,
+      maxFilesystemEntries: limits.maxFilesystemEntries,
+      maxRecursionDepth: limits.maxRecursionDepth
+    };
+  }
+
+  get limits(): RishAppletLimits {
+    return {
+      maxInputBytes: this.configuredLimits.maxInputBytes,
+      maxOutputBytes: this.configuredLimits.maxOutputBytes,
+      maxFilesystemEntries: this.configuredLimits.maxFilesystemEntries,
+      maxRecursionDepth: this.configuredLimits.maxRecursionDepth
+    };
+  }
+
+  static inAppFiles(
+    context: common.Context,
+    directoryName: string = 'rish-applets',
+    readOnly: boolean = false,
+    user: string = 'rish',
+    hostname: string = 'rish',
+    limits: RishAppletLimits = {
+      maxInputBytes: 1048576,
+      maxOutputBytes: 1048576,
+      maxFilesystemEntries: 10000,
+      maxRecursionDepth: 64
+    }
+  ): RishAppletConfiguration {
+    const appFilesDirectory: string = context.filesDir;
+    if (!appFilesDirectory.startsWith('/') ||
+        appFilesDirectory === '/' ||
+        appFilesDirectory.indexOf('\0') >= 0 ||
+        appFilesDirectory.split('/').some(
+          (item: string): boolean => item === '.' || item === '..'
+        )) {
+      throw new Error('app files directory must be an absolute app-owned path');
+    }
+    const safeName: RegExp = /^[A-Za-z0-9._-]{1,64}$/;
+    if (!safeName.test(directoryName) ||
+        directoryName === '.' || directoryName === '..' ||
+        !safeName.test(user) || !safeName.test(hostname)) {
+      throw new Error('unsafe applet configuration value');
+    }
+    if (!Number.isInteger(limits.maxInputBytes) ||
+        limits.maxInputBytes < 1 || limits.maxInputBytes > 1048576 ||
+        !Number.isInteger(limits.maxOutputBytes) ||
+        limits.maxOutputBytes < 1 || limits.maxOutputBytes > 1048576 ||
+        !Number.isInteger(limits.maxFilesystemEntries) ||
+        limits.maxFilesystemEntries < 1 ||
+        limits.maxFilesystemEntries > 100000 ||
+        !Number.isInteger(limits.maxRecursionDepth) ||
+        limits.maxRecursionDepth < 1 || limits.maxRecursionDepth > 256) {
+      throw new Error('invalid applet limits');
+    }
+    const parent: string = appFilesDirectory.endsWith('/') ?
+      appFilesDirectory.substring(0, appFilesDirectory.length - 1) :
+      appFilesDirectory;
+    const parentStat: fs.Stat = fs.lstatSync(parent);
+    if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) {
+      throw new Error('Context.filesDir must be a real application directory');
+    }
+    const sandboxRoot: string = `${parent}/${directoryName}`;
+    if (fs.accessSync(sandboxRoot)) {
+      const existing: fs.Stat = fs.lstatSync(sandboxRoot);
+      if (!existing.isDirectory() || existing.isSymbolicLink()) {
+        throw new Error('portable applet root must be a real directory');
+      }
+    } else {
+      fs.mkdirSync(sandboxRoot);
+    }
+    const verified: fs.Stat = fs.lstatSync(sandboxRoot);
+    if (!verified.isDirectory() || verified.isSymbolicLink()) {
+      throw new Error('portable applet root verification failed');
+    }
+    return new RishAppletConfiguration(
+      sandboxRoot,
+      readOnly,
+      user,
+      hostname,
+      limits
+    );
+  }
 }
 
 export interface RishCapabilityRequirement {
@@ -71,6 +188,18 @@ interface WireHostReply {
   stdout: number[];
   stderr: number[];
   payload: RishJSONValue;
+}
+
+interface WirePlan {
+  kind: string;
+  name?: string;
+}
+
+interface WirePlanResponse {
+  protocol_version: number;
+  ok: boolean;
+  plan?: WirePlan;
+  error?: string;
 }
 
 function emptyBytes(): Uint8Array {
@@ -255,6 +384,16 @@ export class RishHostCodec {
       payload: reply.payload
     };
     return JSON.stringify(wire);
+  }
+
+  static encodeGuestCommand(command: RishGuestCommand): WireGuestCommand {
+    return {
+      program: command.program,
+      args: command.args,
+      env: command.env,
+      cwd: command.cwd,
+      stdin: bytesForWire(command.stdin)
+    };
   }
 }
 
@@ -584,6 +723,64 @@ export function planJson(request: string): string {
 
 export function protocolVersion(): number {
   return rish.protocolVersion();
+}
+
+/**
+ * Generates its own Harmony/app-sandbox plan and invokes the applet ABI only
+ * for an exact, matching `portable_applet` result.
+ */
+export function executePortableApplet(
+  command: RishGuestCommand,
+  configuration: RishAppletConfiguration
+): string {
+  if (!(configuration instanceof RishAppletConfiguration)) {
+    throw new Error('portable applet configuration is not host-bound');
+  }
+  if (command.stdin.length > configuration.limits.maxInputBytes) {
+    throw new Error('portable applet stdin exceeds configured limit');
+  }
+  const commandWire: WireGuestCommand =
+    RishHostCodec.encodeGuestCommand(command);
+  const planRequest: string = JSON.stringify({
+    platform: 'harmony',
+    privilege: 'app_sandbox',
+    command: commandWire
+  });
+  const planned: WirePlanResponse =
+    JSON.parse(rish.planJson(planRequest)) as WirePlanResponse;
+  if (planned.protocol_version !== protocolVersion() || planned.ok !== true) {
+    throw new Error(planned.error ?? 'planner rejected command');
+  }
+  const name: string = basename(command.program);
+  if (planned.plan === undefined ||
+      planned.plan.kind !== 'portable_applet' ||
+      planned.plan.name !== name) {
+    throw new Error('plan is not the matching portable applet');
+  }
+
+  const request: string = JSON.stringify({
+    protocol_version: protocolVersion(),
+    sandbox_root: configuration.sandboxRoot,
+    read_only: configuration.readOnly,
+    user: configuration.user,
+    hostname: configuration.hostname,
+    limits: {
+      max_input_bytes: configuration.limits.maxInputBytes,
+      max_output_bytes: configuration.limits.maxOutputBytes,
+      max_filesystem_entries:
+        configuration.limits.maxFilesystemEntries,
+      max_recursion_depth: configuration.limits.maxRecursionDepth
+    },
+    command: commandWire
+  });
+  if (request.length > 8 * 1024 * 1024) {
+    throw new Error('portable applet request exceeds platform bridge limit');
+  }
+  const response: string = rish.executeAppletJson(request);
+  if (response.length > 8 * 1024 * 1024) {
+    throw new Error('portable applet response exceeds platform bridge limit');
+  }
+  return response;
 }
 
 export async function dispatchHostCall(

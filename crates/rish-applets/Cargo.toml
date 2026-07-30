@@ -1,0 +1,19 @@
+[package]
+name = "rish-applets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+
+[dependencies]
+base64 = "0.22"
+regex = "1.11"
+rish-core.workspace = true
+serde.workspace = true
+sha2 = "0.10"
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3.20"

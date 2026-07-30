@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "crates/rish-applets",
   "crates/rish-cli",
   "crates/rish-content",
   "crates/rish-core",
@@ -24,6 +25,7 @@ license = "MIT"
 repository = "https://github.com/ZSeven-W/rish"
 
 [workspace.dependencies]
+rish-applets = { path = "crates/rish-applets" }
 rish-content = { path = "crates/rish-content" }
 rish-core = { path = "crates/rish-core" }
 rish-guest-protocol = { path = "crates/rish-guest-protocol" }

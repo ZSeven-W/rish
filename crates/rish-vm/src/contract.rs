@@ -32,12 +32,14 @@ impl GuestKernelContract {
         Self::new(
             [
                 "CONFIG_NAMESPACES",
+                "CONFIG_BINFMT_ELF",
                 "CONFIG_PID_NS",
                 "CONFIG_USER_NS",
                 "CONFIG_UTS_NS",
                 "CONFIG_IPC_NS",
                 "CONFIG_NET_NS",
                 "CONFIG_CGROUPS",
+                "CONFIG_TIME_NS",
                 "CONFIG_CGROUP_BPF",
                 "CONFIG_CGROUP_CPUACCT",
                 "CONFIG_CGROUP_DEVICE",
@@ -60,12 +62,15 @@ impl GuestKernelContract {
             ],
             [
                 Capability::LinuxElf,
+                Capability::OciImages,
                 Capability::ProcessNamespace,
                 Capability::UserNamespace,
                 Capability::MountNamespace,
                 Capability::NetworkNamespace,
                 Capability::UtsNamespace,
                 Capability::IpcNamespace,
+                Capability::CgroupNamespace,
+                Capability::TimeNamespace,
                 Capability::CgroupsV2,
                 Capability::PrivilegedContainers,
                 Capability::KernelModules,
@@ -283,6 +288,23 @@ mod tests {
         assert_eq!(
             report.missing(),
             &BTreeSet::from(["CONFIG_CGROUPS".to_owned()])
+        );
+    }
+
+    #[test]
+    fn container_host_contract_includes_exec_and_oci_evidence() {
+        let contract = GuestKernelContract::container_host();
+
+        assert!(contract.required_kconfig().contains("CONFIG_BINFMT_ELF"));
+        assert!(
+            contract
+                .required_capabilities()
+                .contains(&Capability::LinuxElf)
+        );
+        assert!(
+            contract
+                .required_capabilities()
+                .contains(&Capability::OciImages)
         );
     }
 }

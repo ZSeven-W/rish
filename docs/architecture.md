@@ -25,9 +25,40 @@ OCI/command request
 
 要求“真实内核语义”的操作只接受 `native` 或 `virtualized`。
 
+## Command routing
+
+```text
+command
+  → verified Full VM?      → vm.exec (distribution command)
+  → probed Native Linux?   → linux.exec (host Linux command)
+  → bounded Rust applet?   → portable_applet
+  → typed product handler? → native offload
+  → reject
+```
+
+Full VM/Native Linux 必须优先于同名 portable applet，使 Guest 中的 GNU/
+BusyBox flags 和发行版行为保持完整。Stock 移动端只执行固定 applet catalog；
+未知名字和未知 flag 都失败关闭。文件 applet 只能访问 app-owned sandbox root，
+并受输入、输出、递归深度和文件数配额限制。
+
+只有显式 bare name 可以进入 applet/typed-offload；`/image/bin/rm`、`./rm`
+等带路径 Guest 程序不能靠 basename 获得原生命令身份。通用 `HostBridge`
+禁止执行或标记 `linux.exec`/`vm.exec`，这两条路径必须持有仍存活的
+Verified Native/Booted VM executor，并在执行点重新核验后端证据。
+当前 `VerifiedVmRuntime` 已直接借用 live `BootedVm` 完成这条绑定；Native
+Linux 在 OEM executor 完成前只允许探测/规划，不允许通用 bridge 执行。
+
+`systemctl`、`mount`、`ip`、`unshare` 等标准 Linux CLI 默认要求真实内核
+语义。平台仍可显式调用 `service.systemctl` 之类的产品语义 handler，但该
+operation 必须标记为 bridged/emulated，不能由普通 `systemctl` 命令暗中降级。
+
 ## Native offload
 
 Guest 命令不会直接调用平台语言。Rust 首先产生版本化调用：
+
+OCI label 只能请求 handler；它不能证明 handler 存在。镜像计划必须同时
+持有 evidence-gated backend candidate 和宿主从 live dispatcher 构造的
+handler allow-list，未绑定名字失败关闭。
 
 ```json
 {

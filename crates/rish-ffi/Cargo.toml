@@ -10,7 +10,11 @@ repository.workspace = true
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
+rish-applets.workspace = true
 rish-core.workspace = true
 rish-runtime.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3.20"

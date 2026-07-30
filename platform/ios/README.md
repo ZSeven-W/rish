@@ -41,6 +41,37 @@ let replyJSON = try RishBridge.encodeHostReply(reply)
 Production code should replace the forced casts in this compact example with
 normal error handling.
 
+## Portable Rust applets
+
+For applets, use the typed high-level entry point instead of accepting a plan
+or root path from guest JSON. It creates an iOS/app-sandbox plan internally,
+requires `{ "kind": "portable_applet", "name": ... }` to match the command,
+then constructs the versioned `rish_execute_applet_json` envelope itself:
+
+```swift
+let container = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+let configuration = try RishAppletConfiguration(
+    sandboxRoot: container.appendingPathComponent("rish-applets"),
+    appContainerRoot: container
+)
+let responseJSON = try RishBridge.executePortableApplet(
+    command: RishGuestCommand(program: "sha256sum", stdin: [0, 255]),
+    configuration: configuration
+)
+```
+
+The configured root must be a real, direct child of an app-owned container.
+The initializer creates that child without following symbolic links. For App
+Groups, pass the URL returned by
+`FileManager.containerURL(forSecurityApplicationGroupIdentifier:)` as
+`appContainerRoot`. Never derive either URL from the guest command. Applet
+execution is synchronous and bounded; run filesystem-heavy calls away from the
+main actor. Response stdout/stderr remain JSON byte arrays.
+
+The raw C symbols are trusted app implementation details. Do not export them
+to a WebView, downloaded script, Guest process, or other untrusted JSON source;
+Guest-facing code should call only the typed high-level entry point.
+
 ## Implemented operations
 
 - `service.systemctl` is an actor-backed, in-memory state machine. It supports
