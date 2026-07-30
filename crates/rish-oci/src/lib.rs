@@ -8,6 +8,7 @@ use thiserror::Error;
 pub const HANDLER_LABEL: &str = "io.rish.offload.handler";
 pub const REQUIRES_LABEL: &str = "io.rish.requires";
 pub const REQUIRES_KERNEL_LABEL: &str = "io.rish.requires-kernel";
+const MAX_HANDLER_LENGTH: usize = 128;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -42,6 +43,49 @@ pub struct ImageConfiguration {
     pub rootfs: RootFilesystem,
 }
 
+impl ImageConfiguration {
+    pub fn validate(&self) -> Result<(), OciError> {
+        if self.os != "linux" {
+            return Err(OciError::UnsupportedPlatform {
+                os: self.os.clone(),
+                architecture: self.architecture.clone(),
+            });
+        }
+        if self.architecture != "arm64" {
+            return Err(OciError::UnsupportedPlatform {
+                os: self.os.clone(),
+                architecture: self.architecture.clone(),
+            });
+        }
+        if self.rootfs.kind != "layers" {
+            return Err(OciError::InvalidRootFilesystem(format!(
+                "rootfs type must be layers, got {}",
+                self.rootfs.kind
+            )));
+        }
+        for diff_id in &self.rootfs.diff_ids {
+            validate_sha256_diff_id(diff_id)?;
+        }
+        if !self.config.working_dir.is_empty() && !self.config.working_dir.starts_with('/') {
+            return Err(OciError::InvalidWorkingDirectory(
+                self.config.working_dir.clone(),
+            ));
+        }
+        if self
+            .config
+            .env
+            .iter()
+            .any(|entry| !valid_environment_entry(entry))
+        {
+            return Err(OciError::InvalidEnvironment);
+        }
+        if self.config.entrypoint.is_empty() && self.config.cmd.is_empty() {
+            return Err(OciError::MissingCommand);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OffloadContract {
     pub handler: String,
@@ -54,9 +98,11 @@ impl OffloadContract {
         let Some(handler) = image.config.labels.get(HANDLER_LABEL) else {
             return Ok(None);
         };
-        if handler.trim().is_empty() {
+        if !valid_handler(handler) {
             return Err(OciError::InvalidContract(
-                "offload handler must not be empty".to_owned(),
+                "offload handler must be a 1-128 byte ASCII identifier beginning with an \
+                 alphanumeric and containing only letters, digits, '.', '_' or '-'"
+                    .to_owned(),
             ));
         }
 
@@ -93,9 +139,9 @@ pub enum ImageExecutionPlan {
 
 #[must_use]
 pub fn plan_image(image: &ImageConfiguration, profile: &CapabilityProfile) -> ImageExecutionPlan {
-    if image.os != "linux" {
+    if let Err(error) = image.validate() {
         return ImageExecutionPlan::Rejected {
-            reason: format!("unsupported OCI operating system: {}", image.os),
+            reason: error.to_string(),
         };
     }
 
@@ -158,6 +204,42 @@ fn image_command(image: &ImageConfiguration) -> GuestCommand {
     }
 }
 
+fn valid_handler(handler: &str) -> bool {
+    !handler.is_empty()
+        && handler.len() <= MAX_HANDLER_LENGTH
+        && handler
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && handler
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn valid_environment_entry(entry: &str) -> bool {
+    let Some((name, _value)) = entry.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && !name.contains('\0')
+        && !name.contains('=')
+        && name.bytes().all(|byte| !byte.is_ascii_control())
+}
+
+fn validate_sha256_diff_id(diff_id: &str) -> Result<(), OciError> {
+    let Some(encoded) = diff_id.strip_prefix("sha256:") else {
+        return Err(OciError::UnsupportedDiffId(diff_id.to_owned()));
+    };
+    if encoded.len() != 64
+        || !encoded
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(OciError::InvalidDiffId(diff_id.to_owned()));
+    }
+    Ok(())
+}
+
 fn parse_requirements(
     value: Option<&String>,
     kernel_semantics_required: bool,
@@ -185,6 +267,27 @@ pub enum OciError {
 
     #[error("unknown capability in OCI contract: {0}")]
     UnknownCapability(String),
+
+    #[error("unsupported OCI platform: {os}/{architecture}")]
+    UnsupportedPlatform { os: String, architecture: String },
+
+    #[error("invalid OCI root filesystem: {0}")]
+    InvalidRootFilesystem(String),
+
+    #[error("unsupported OCI diff ID algorithm: {0}")]
+    UnsupportedDiffId(String),
+
+    #[error("invalid OCI diff ID: {0}")]
+    InvalidDiffId(String),
+
+    #[error("OCI WorkingDir must be empty or absolute: {0}")]
+    InvalidWorkingDirectory(String),
+
+    #[error("OCI Env entries must have a non-empty NAME=VALUE form")]
+    InvalidEnvironment,
+
+    #[error("OCI image has neither Entrypoint nor Cmd")]
+    MissingCommand,
 }
 
 #[cfg(test)]
@@ -250,5 +353,43 @@ mod tests {
             plan_image(&image(labels), &profile),
             ImageExecutionPlan::Rejected { .. }
         ));
+    }
+
+    #[test]
+    fn rejects_malformed_offload_handler() {
+        let labels = BTreeMap::from([(HANDLER_LABEL.to_owned(), "sample.demo\nforged".to_owned())]);
+        let profile = portable_offload_profile(Platform::Ios, PrivilegeMode::AppSandbox);
+
+        assert!(matches!(
+            plan_image(&image(labels), &profile),
+            ImageExecutionPlan::Rejected { reason } if reason.contains("offload handler")
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_image_process_configuration() {
+        let profile = portable_offload_profile(Platform::Ios, PrivilegeMode::AppSandbox);
+        let mut invalid = image(BTreeMap::new());
+        invalid.config.working_dir = "relative".to_owned();
+
+        assert!(matches!(
+            plan_image(&invalid, &profile),
+            ImageExecutionPlan::Rejected { reason } if reason.contains("WorkingDir")
+        ));
+
+        invalid.config.working_dir = "/".to_owned();
+        invalid.config.env = vec!["MISSING_EQUALS".to_owned()];
+        assert!(matches!(
+            plan_image(&invalid, &profile),
+            ImageExecutionPlan::Rejected { reason } if reason.contains("Env")
+        ));
+    }
+
+    #[test]
+    fn accepts_canonical_sha256_diff_ids() {
+        let mut valid = image(BTreeMap::new());
+        valid.rootfs.diff_ids = vec![format!("sha256:{}", "a".repeat(64))];
+
+        valid.validate().unwrap();
     }
 }

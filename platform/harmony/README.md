@@ -1,0 +1,65 @@
+# HarmonyOS/OpenHarmony native-offload SDK
+
+`RishBridge.ets` exposes the Rust N-API planner and an ArkTS host-call
+dispatcher as separate steps. The N-API module returns a plan; ArkTS must
+extract `plan.call`, decode it with `RishHostCodec`, and pass it through the
+fixed allow-list.
+
+Build `rish_napi.cpp` with the included `CMakeLists.txt`, place the Rust
+`librish_ffi.so` under `libs/<OHOS_ARCH>`, and import the resulting
+`librish_ffi.so` module from the HAP.
+
+## Wire contract
+
+ArkTS uses camel-case in memory and the codec maps it to Rust snake-case JSON.
+`stdin`, `stdout`, and `stderr` are `Uint8Array`; the wire codec converts them
+to unsigned JSON integer arrays compatible with Rust `Vec<u8>`. ArkTS JSON
+numbers cannot safely represent every Rust `u64`, so call ids outside the JSON
+safe-integer range are rejected. `protocolVersion()` exposes the linked Rust
+ABI version for an early startup check.
+
+```typescript
+const planned = JSON.parse(planJson(planRequest));
+const callJson = JSON.stringify(planned.plan.call);
+const cancellation = new RishCancellationToken();
+const dispatcher = new RishHostDispatcher();
+
+const pendingReply = dispatchHostCall(
+  callJson,
+  dispatcher,
+  cancellation
+);
+
+// The owning Ability/Page lifecycle cleanup may call:
+// cancellation.cancel();
+const replyJson = await pendingReply;
+```
+
+## Implemented operations
+
+- `service.systemctl` is a HAP-local in-memory unit state map supporting
+  `start`, `stop`, `restart`, `status`, `is-active`, and `list-units`. It is
+  not systemd, PID 1, a unit-file engine, a process launcher, or cgroup
+  management.
+- `container.docker_api` returns `docker_api_unavailable` by default. The
+  constructor accepts only the dedicated Docker API handler slot, suitable for
+  a separately authorized remote or future VM guest API. No `dockerd` is
+  started by this bridge.
+- Unknown operations and calls requesting Linux-kernel semantics fail closed.
+
+Handlers are Promise-based, use `Uint8Array` for arbitrary output, and receive
+a cooperative cancellation token that long-running platform work must check.
+The example caps wire/input sizes and the in-memory unit table; injected
+transports must impose their own response, timeout, and concurrency limits.
+
+## Permission and kernel boundary
+
+The HAP/system application must independently enforce user consent, network
+permissions, file access, secure credential storage, background lifecycle, and
+device/OEM policy. A host call does not grant any Harmony permission.
+
+This ordinary HAP adapter does not provide Linux namespaces, delegated cgroups,
+kernel modules, arbitrary device nodes, a privileged host container, systemd,
+Docker-in-Docker, or a full network namespace. Use a real Linux guest for those
+semantics, or a separately probed OEM/system backend where policy explicitly
+permits it. Never label guest-only privilege as host privilege.

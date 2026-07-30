@@ -1,10 +1,17 @@
 [workspace]
 members = [
   "crates/rish-cli",
+  "crates/rish-content",
   "crates/rish-core",
   "crates/rish-ffi",
+  "crates/rish-guest-agent",
+  "crates/rish-guest-protocol",
+  "crates/rish-layer",
   "crates/rish-oci",
+  "crates/rish-pull",
+  "crates/rish-registry",
   "crates/rish-runtime",
+  "crates/rish-snapshot",
   "crates/rish-vm",
 ]
 resolver = "3"
@@ -17,9 +24,15 @@ license = "MIT"
 repository = "https://github.com/ZSeven-W/rish"
 
 [workspace.dependencies]
+rish-content = { path = "crates/rish-content" }
 rish-core = { path = "crates/rish-core" }
+rish-guest-protocol = { path = "crates/rish-guest-protocol" }
+rish-layer = { path = "crates/rish-layer" }
 rish-oci = { path = "crates/rish-oci" }
+rish-pull = { path = "crates/rish-pull" }
+rish-registry = { path = "crates/rish-registry" }
 rish-runtime = { path = "crates/rish-runtime" }
+rish-snapshot = { path = "crates/rish-snapshot" }
 rish-vm = { path = "crates/rish-vm" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

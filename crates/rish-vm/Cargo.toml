@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 rish-core.workspace = true
+rish-guest-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

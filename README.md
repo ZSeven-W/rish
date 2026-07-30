@@ -11,9 +11,11 @@
   namespace 必须进入真实 Linux guest 或经过探测的宿主 Linux 后端。
 - 能力不足时失败关闭，不会把“模拟成功”伪装成真实内核隔离。
 
-> 当前状态：P0 架构原型。能力模型、命令规划、OCI offload 契约、VM
-> guest 合同、三端 C ABI 和控制面模型已经可编译测试；完整 VM、镜像拉取、
-> Youki/Docker guest 和平台应用尚未实现。
+> 当前状态：P1 数据面原型。能力模型、三端 native-offload SDK、OCI
+> Registry/CAS、安全解层、事务 rootfs snapshot、Guest RPC 与 bootstrap
+> agent 已可编译测试；VM 候选必须经过 probe、boot、握手、Kconfig 和
+> Guest capability 证据链才能进入调度。平台 HTTP/凭据适配、完整 VM
+> engine、Youki/Docker guest 和移动端应用仍未实现。
 
 ## 架构
 
@@ -66,9 +68,16 @@ KVM、设备和内核配置。
 ```text
 crates/
   rish-core/       公共命令、能力、后端与 host-call 协议
+  rish-content/    SHA-256 CAS、process-local lease、persistent pin 与 GC
+  rish-registry/   OCI 引用、manifest/index、Bearer challenge 与响应校验
+  rish-pull/       有资源上限的 linux/arm64 镜像拉取流水线
+  rish-layer/      tar/gzip、diff-id、whiteout 与防路径逃逸的安全解层
+  rish-snapshot/   私有 staging 和 atomic no-replace rootfs 发布
   rish-runtime/    路由、后端选择、namespace/cgroup/device/service 模型
   rish-oci/        OCI image config 和原生 offload 契约
-  rish-vm/         VM/guest trait、设备配置和容器 guest 内核合同
+  rish-vm/         evidence-gated VM 启动、设备配置和 guest 内核合同
+  rish-guest-protocol/  Host/guest 握手、执行、OCI、端口和 checkpoint RPC
+  rish-guest-agent/     Linux guest 内的失败关闭 bootstrap agent
   rish-ffi/        Swift/JNI/N-API 可调用的稳定 JSON C ABI
   rish-cli/        命令规划调试工具
 platform/
@@ -81,8 +90,9 @@ platform/
 
 ```bash
 cargo test --workspace
-cargo run -p rish-cli -- ios systemctl start demo
-cargo run -p rish-cli -- ios docker ps
+cargo run -p rish-cli -- plan ios systemctl start demo
+cargo run -p rish-cli -- plan ios docker ps
+cargo run -p rish-cli -- image-ref alpine
 ```
 
 第一条命令会输出 `service.systemctl` host call；第二条会输出
@@ -90,8 +100,16 @@ cargo run -p rish-cli -- ios docker ps
 guest/native kernel 后端而被拒绝：
 
 ```bash
-cargo run -p rish-cli -- ios dockerd
+cargo run -p rish-cli -- plan ios dockerd
 ```
+
+Swift、Kotlin/Java 和 ArkTS 侧现已包含二进制安全 HostCall/HostReply codec、
+固定 allow-list dispatcher、协作式取消，以及明确标记为“非真实 systemd”
+的 App 内 service supervisor。未知 operation 和真实内核语义均失败关闭。
+
+Guest bootstrap exec 使用有界非阻塞监督器：长进程不会阻塞 Ping，Cancel、
+timeout、进程组清理、stdout/stderr 限额和定期 poll 均已接入。当前仍不提供
+TTY 或 streaming stdin。
 
 ## OCI 原生契约
 
@@ -126,6 +144,7 @@ cargo run -p rish-cli -- ios dockerd
 | 未知复杂 ELF/syscall | 不支持 | Linux 内核处理 | Linux 内核处理 |
 
 详细设计见 [架构说明](docs/architecture.md)、[平台能力矩阵](docs/platform-matrix.md)、
+[OCI 数据面](docs/oci-pipeline.md)、
 [offload-first 决策](docs/decisions/0001-offload-first.md) 和
 [路线图](docs/roadmap.md)。
 

@@ -8,5 +8,9 @@ repository.workspace = true
 
 [dependencies]
 rish-core.workspace = true
+rish-vm.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+rish-guest-protocol.workspace = true

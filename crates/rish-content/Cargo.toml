@@ -1,0 +1,12 @@
+[package]
+name = "rish-content"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/ZSeven-W/rish"
+readme = "README.md"
+
+[dependencies]
+libc = "0.2"
+sha2 = "0.10"

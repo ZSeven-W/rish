@@ -119,6 +119,12 @@ Guest kernel 合同位于 `rish-vm::GuestKernelContract`，包括 namespaces、
 cgroup v2、OverlayFS、seccomp、modules、devtmpfs、TUN/veth/bridge 和
 netfilter/nftables。
 
+Full VM 不能仅凭配置被加入 backend selector。唯一受控路径依次要求
+`VmEngine::probe`、配置校验、成功 boot、版本化 Guest `HelloAck`、与同一
+session 和 kernel release 绑定的 Kconfig evidence，以及 contract 所需的
+`Available + version=1` capability。只有这条链路能产生
+`VerifiedVmProfile`；Guest 多报、缺失、受限或未知版本的能力都不会升级。
+
 Full VM 的设备范围：
 
 - guest 内 `/dev` 来自 devtmpfs 和 virtio。
@@ -149,3 +155,4 @@ Android/鸿蒙原生后端启用前必须通过完整探测：
 - guest 对宿主文件系统只获得用户明确授权的目录。
 - 宿主侧端口转发单独授权，默认仅监听 loopback。
 - capability profile 随日志和执行结果持久化，便于审计真实执行路径。
+- Full VM 候选只接受不可反序列化伪造的 verified profile token。

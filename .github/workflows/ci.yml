@@ -9,13 +9,42 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.85.0
         with:
           components: clippy,rustfmt
-          targets: aarch64-apple-ios,aarch64-linux-android,aarch64-unknown-linux-ohos
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
-      - run: cargo check -p rish-ffi --target aarch64-apple-ios
-      - run: cargo check -p rish-ffi --target aarch64-linux-android
-      - run: cargo check -p rish-ffi --target aarch64-unknown-linux-ohos
+      - name: Type-check Swift bridge
+        run: >-
+          swiftc -parse-as-library -typecheck -warnings-as-errors
+          -import-objc-header platform/rish.h
+          platform/ios/RishBridge.swift
+
+  mobile-cross-check:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-apple-ios
+          - aarch64-linux-android
+          - aarch64-unknown-linux-ohos
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          targets: ${{ matrix.target }}
+      - name: Check portable runtime crates
+        run: >-
+          cargo check --target ${{ matrix.target }}
+          -p rish-ffi
+          -p rish-content
+          -p rish-layer
+          -p rish-oci
+          -p rish-registry
+          -p rish-pull
+          -p rish-runtime
+          -p rish-snapshot
+          -p rish-guest-protocol
+          -p rish-vm

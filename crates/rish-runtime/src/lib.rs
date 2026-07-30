@@ -12,6 +12,7 @@ pub use namespace::{NamespaceId, NamespaceKind, NamespaceSet, NamespaceStore};
 pub use planner::{CommandPlan, OffloadRegistry, OffloadSpec, Planner, Runtime};
 pub use profile::{KernelProbe, native_linux_profile, portable_offload_profile};
 pub use selector::{
-    BackendCandidate, BackendClass, BackendSelectionError, SelectionPolicy, select_backend,
+    BackendCandidate, BackendCandidateError, BackendClass, BackendSelectionError, SelectionPolicy,
+    select_backend,
 };
 pub use service::{ServiceManager, ServiceState, ServiceUnit};

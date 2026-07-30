@@ -1,0 +1,23 @@
+[package]
+name = "rish-pull"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Synchronous transport-agnostic OCI image pull pipeline for rish"
+
+[dependencies]
+rish-content.workspace = true
+rish-oci.workspace = true
+rish-registry.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+rish-snapshot.workspace = true
+sha2 = "0.10"
+tar = "0.4"
+tempfile = "3.20"

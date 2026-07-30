@@ -11,8 +11,10 @@
 - [x] OCI native-offload labels
 - [x] VM trait、virtio 设备配置与 guest kernel contract
 - [x] Swift/JNI/N-API 共用 JSON C ABI
+- [x] Swift/Kotlin/ArkTS HostCall codec 与固定 allow-list dispatcher
 - [x] stock 平台失败关闭测试
-- [ ] 可执行的 JNI 和 Harmony N-API shim
+- [x] JNI 和 Harmony N-API shim 源码
+- [ ] 在真实 SDK 工程中编译并运行 JNI/Harmony N-API shim
 - [ ] iOS XCFramework、Android AAR、Harmony HAR 打包
 
 验收：三端能规划相同命令，产生一致 host call；真实内核要求不能进入
@@ -20,23 +22,28 @@ portable backend。
 
 ## P1：OCI content pipeline
 
-- Registry v2/OAuth/token authentication
-- `linux/arm64` index/manifest 选择
-- digest CAS、lease 和 garbage collection
-- 安全 layer 解包及 whiteout
-- 签名/attestation hook
-- Keychain/Keystore/安全存储凭据适配
+- [x] OCI/Docker 引用、Registry 请求和 Bearer challenge 解析
+- [x] descriptor/header/body digest、size 和 media type 校验
+- [x] `linux/arm64` index/manifest 选择
+- [x] digest CAS、lease、persistent pin 和 garbage collection
+- [x] 安全 tar/gzip layer 解包、diff-id 及 whiteout
+- [x] 私有 staging 与 atomic no-replace rootfs snapshot
+- [x] manifest/config/layer count/单层/总下载资源上限
+- [ ] URLSession、OkHttp、ArkTS HTTP transport 与 token 获取
+- [ ] 签名/attestation hook
+- [ ] Keychain/Keystore/安全存储凭据适配
 
 验收：能拉取并验证 Alpine/BusyBox OCI layout，但尚不执行未知 ELF。
 
 ## P2：Native offload SDK
 
-- 版本化 handler schema
-- 生成 Swift/Kotlin/ArkTS 类型
-- permission broker
-- streaming stdin/stdout/stderr
-- cancellation、deadline、backpressure
-- platform handler conformance suite
+- [x] 版本化 HostCall/HostReply schema
+- [x] Swift/Kotlin/ArkTS 二进制安全类型与 codec
+- [x] 固定 allow-list、未知 operation 失败关闭
+- [x] 协作式 cancellation contract
+- [ ] permission broker
+- [ ] streaming stdin/stdout/stderr、deadline 与 backpressure
+- [ ] platform handler conformance suite
 
 验收：同一个带 `io.rish.offload.handler` 的镜像可在三端运行，输出一致。
 
@@ -46,7 +53,11 @@ portable backend。
 - GICv3、timer 和 PSCI
 - virtio-blk、console、rng、net、vsock
 - Linux kernel/initramfs/ext4 可复现构建
-- guest Rust agent
+- [x] 版本化 Guest RPC 协议
+- [x] evidence-gated VM probe/boot/HelloAck/Kconfig/capability profile
+- [x] bootstrap Rust guest agent、严格握手和 capability gate
+- [x] 非阻塞 exec 监督、Cancel、timeout、进程组清理和有界输出
+- [ ] Youki/systemd capability probe 与完整 guest agent handler
 - 用户态 NAT、DNS、TCP/UDP 端口转发
 - suspend/checkpoint/restore
 
