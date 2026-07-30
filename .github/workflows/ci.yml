@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+          targets: aarch64-apple-ios,aarch64-linux-android,aarch64-unknown-linux-ohos
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo check -p rish-ffi --target aarch64-apple-ios
+      - run: cargo check -p rish-ffi --target aarch64-linux-android
+      - run: cargo check -p rish-ffi --target aarch64-unknown-linux-ohos
