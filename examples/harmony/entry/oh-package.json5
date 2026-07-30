@@ -1,0 +1,10 @@
+{
+  "modelVersion": "5.0.0",
+  "name": "entry",
+  "version": "1.0.0",
+  "description": "Rish portable applet demo entry module",
+  "main": "",
+  "author": "",
+  "license": "MIT",
+  "dependencies": {}
+}

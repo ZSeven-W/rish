@@ -1,0 +1,10 @@
+{
+  "modelVersion": "5.0.0",
+  "name": "rish-harmony-demo",
+  "version": "1.0.0",
+  "description": "Rish portable applet HarmonyOS demo",
+  "dependencies": {},
+  "devDependencies": {
+    "@ohos/hvigor-ohos-plugin": "5.0.0"
+  }
+}

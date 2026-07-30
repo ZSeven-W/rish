@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "Rish HarmonyOS portable applet demo"
+    },
+    {
+      "name": "ability_desc",
+      "value": "Runs a bounded Rust applet smoke test"
+    },
+    {
+      "name": "ability_label",
+      "value": "Rish Demo"
+    }
+  ]
+}

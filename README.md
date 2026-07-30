@@ -15,8 +15,9 @@
 > 当前状态：P1 数据面原型。能力模型、三端 native-offload SDK、OCI
 > Registry/CAS、安全解层、事务 rootfs snapshot、Guest RPC 与 bootstrap
 > agent 已可编译测试；VM 候选必须经过 probe、boot、握手、Kconfig 和
-> Guest capability 证据链才能进入调度。平台 HTTP/凭据适配、完整 VM
-> engine、Youki/Docker guest 和移动端应用仍未实现。
+> Guest capability 证据链才能进入调度。三端最小 Demo 已接入；平台
+> HTTP/凭据适配、完整 VM engine、Youki/Docker guest 和产品级移动端应用
+> 仍未实现。
 
 ## 架构
 
@@ -85,6 +86,10 @@ platform/
   ios/             Swift 接入示例
   android/         Kotlin/JNI 接入契约
   harmony/         ArkTS/N-API 接入契约
+examples/
+  ios/             可直接构建并启动的 iOS Simulator App
+  android/         可直接构建、安装并启动的 Android APK
+  harmony/         HarmonyOS Stage/HAP 工程与受限宿主烟测
 ```
 
 ## 快速验证
@@ -105,6 +110,30 @@ handler，因此第二条失败关闭；后续 dispatcher-bound capability token
 cargo run -p rish-cli -- plan ios systemctl status demo
 cargo run -p rish-cli -- plan ios dockerd
 ```
+
+## 三端 Demo
+
+三个 Demo 都使用正式平台桥接和同一个 Rust `rish-ffi` ABI，合计验证
+`grep` 规划、`echo` 与 `sha256sum` 等 portable applet：
+
+```bash
+# iOS：构建、签名、安装并启动 iPhone Simulator App
+examples/ios/run-simulator.sh
+
+# Android：构建、签名、安装并启动 arm64 APK（存在 adb 设备时）
+examples/android/run-demo.sh
+
+# 鸿蒙：准备 Stage/HAP 工程；需 DevEco、HarmonyOS SDK 和设备才能真机运行
+examples/harmony/prepare_hap.sh
+RISH_OHOS_NATIVE_SDK=/path/to/native examples/harmony/build_rust_ohos.sh
+
+# 没有鸿蒙 SDK 时，只验证相同 Rust C ABI，不冒充 HAP/设备运行
+examples/harmony/run_host_smoke.sh
+```
+
+具体依赖、输出和能力边界见各目录 README。这里演示的是移动应用沙箱内的
+Rust 原生命令语义，不代表宿主拥有 Linux namespaces、cgroups、systemd、
+内核模块、privileged container 或 Docker-in-Docker。
 
 Swift、Kotlin/Java 和 ArkTS 侧现已包含二进制安全 HostCall/HostReply codec、
 固定 allow-list dispatcher、协作式取消，以及明确标记为“非真实 systemd”

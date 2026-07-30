@@ -1,0 +1,10 @@
+/.hvigor/
+/.idea/
+/local.properties
+/oh_modules/
+/entry/.cxx/
+/entry/build/
+/entry/libs/
+/entry/oh_modules/
+/entry/src/main/ets/rish/RishBridge.ets
+/entry/src/main/ets/rish/rish_ffi.d.ts
