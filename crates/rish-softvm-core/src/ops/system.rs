@@ -879,11 +879,11 @@ mod tests {
             .unwrap();
         cpu.regs.gdt_base = 0x10000;
         cpu.regs.gdt_limit = 0x2F;
-        cpu.regs.set_gpr(index::RCX, 0x0000_0040_0010_00);
+        cpu.regs.set_gpr(index::RCX, 0x0000_0000_4000_1000);
         cpu.regs.set_gpr(index::R11, 0x2 | (1 << 9)); // IF set
         cpu.msr_star = 0x23_u64 << 48;
         run(&mut cpu, 64, &[0x48, 0x0F, 0x07]).unwrap(); // sysretq
-        assert_eq!(cpu.regs.rip, 0x0000_0040_0010_00);
+        assert_eq!(cpu.regs.rip, 0x0000_0000_4000_1000);
         assert_eq!(cpu.regs.cs.selector.0, 0x33);
         assert_eq!(cpu.regs.ss.selector.0, 0x2B);
         assert!(cpu.regs.rflags.contains(crate::arch::registers::RFlags::IF));
