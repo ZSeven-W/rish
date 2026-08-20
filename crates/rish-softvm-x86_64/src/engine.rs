@@ -11,8 +11,12 @@ use crate::{
 };
 
 /// Pinned guest default when the config carries no kernel command line.
-pub const DEFAULT_GUEST_COMMAND_LINE: &str =
-    "console=ttyS0,115200n8 rdinit=/init panic=-1 oops=panic nokaslr cgroup_no_v1=all";
+/// nolapic_timer keeps the clockevent on the legacy PIT until the LAPIC
+/// timer model is calibration-verified; earlyprintk streams kernel boot
+/// diagnostics over the console serial.
+pub const DEFAULT_GUEST_COMMAND_LINE: &str = "console=ttyS0,115200n8 rdinit=/init \
+     panic=-1 oops=panic nokaslr cgroup_no_v1=all nolapic_timer \
+     earlyprintk=serial,ttyS0,115200";
 
 /// x86-64 software VM engine backed by a reviewed provider.
 ///
