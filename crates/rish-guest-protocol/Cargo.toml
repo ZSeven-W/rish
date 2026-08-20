@@ -8,5 +8,6 @@ repository = "https://github.com/ZSeven-W/rish"
 description = "Versioned host-to-guest protocol for the rish Linux VM runtime"
 
 [dependencies]
+base64 = "0.22"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
