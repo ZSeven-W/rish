@@ -368,8 +368,11 @@ pub fn extra_op(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError
         | Mnemonic::Prefetcht1
         | Mnemonic::Prefetcht2
         | Mnemonic::Prefetchnta
+        | Mnemonic::Prefetchw
         | Mnemonic::Clflush
         | Mnemonic::Clflushopt
+        | Mnemonic::Clac
+        | Mnemonic::Stac
         | Mnemonic::Endbr64
         | Mnemonic::Endbr32 => {}
         Mnemonic::Fxsave => {
@@ -441,6 +444,8 @@ pub fn extra_op(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError
                 cpu.xcr0 = value & 0x7;
             }
         }
+        Mnemonic::Syscall => syscall(cpu)?,
+        Mnemonic::Sysret | Mnemonic::Sysretq => sysret(cpu)?,
         _ => return Err(bad_op(cpu, instruction)),
     }
     Ok(())
@@ -478,6 +483,34 @@ fn shld_shrd(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
             .set(crate::arch::registers::RFlags::OF, msb != new_msb);
     }
     write_operand0(cpu, instruction, result)?;
+    Ok(())
+}
+
+fn syscall(cpu: &mut Cpu) -> Result<(), CpuError> {
+    use crate::arch::registers::index;
+    // RCX := next RIP, R11 := RFLAGS, switch to the kernel segments from
+    // IA32_STAR, mask RFLAGS with IA32_FMASK, and jump to IA32_LSTAR.
+    cpu.regs.set_gpr(index::RCX, cpu.regs.rip);
+    cpu.regs.set_gpr(index::R11, cpu.regs.rflags.bits());
+    let kernel_cs = ((cpu.msr_star >> 32) & 0xFFFC) as u16;
+    cpu.regs.cs = cpu.load_segment_from_table(SegmentSelector(kernel_cs))?;
+    cpu.regs.ss = cpu.load_segment_from_table(SegmentSelector(kernel_cs + 8))?;
+    cpu.regs.rflags =
+        crate::arch::registers::RFlags::from_bits_retain(cpu.regs.rflags.bits() & !cpu.msr_fmask);
+    cpu.regs.rip = cpu.msr_lstar;
+    Ok(())
+}
+
+fn sysret(cpu: &mut Cpu) -> Result<(), CpuError> {
+    use crate::arch::registers::index;
+    // RIP := RCX, RFLAGS := R11 (reserved bits cleared, bit 1 set), switch
+    // back to the user segments derived from IA32_STAR[63:48].
+    cpu.regs.rip = cpu.regs.gpr(index::RCX);
+    let flags = cpu.regs.gpr(index::R11);
+    cpu.regs.rflags = crate::arch::registers::RFlags::from_bits_retain((flags & 0x3C7FD7) | 2);
+    let user_base = (cpu.msr_star >> 48) as u16;
+    cpu.regs.cs = cpu.load_segment_from_table(SegmentSelector(user_base.wrapping_add(16) | 3))?;
+    cpu.regs.ss = cpu.load_segment_from_table(SegmentSelector(user_base.wrapping_add(8) | 3))?;
     Ok(())
 }
 
@@ -534,6 +567,19 @@ const MSR_STAR: u32 = 0xC000_0081;
 const MSR_LSTAR: u32 = 0xC000_0082;
 const MSR_CSTAR: u32 = 0xC000_0083;
 const MSR_FMASK: u32 = 0xC000_0084;
+const MSR_IA32_TSC_ADJUST: u32 = 0x3B;
+const MSR_IA32_MTRRCAP: u32 = 0xFE;
+const MSR_IA32_MCG_CAP: u32 = 0x179;
+const MSR_IA32_MCG_STATUS: u32 = 0x17A;
+const MSR_IA32_MCG_CTL: u32 = 0x17B;
+const MSR_IA32_THERM_INTERRUPT: u32 = 0x19B;
+const MSR_IA32_THERM_STATUS: u32 = 0x19C;
+const MSR_MTRR_PHYS_BASE_FIRST: u32 = 0x200;
+const MSR_MTRR_PHYS_BASE_LAST: u32 = 0x20F;
+const MSR_MTRR_FIX_FIRST: u32 = 0x250;
+const MSR_MTRR_FIX_LAST: u32 = 0x25F;
+const MSR_IA32_MC_FIRST: u32 = 0x400;
+const MSR_IA32_MC_LAST: u32 = 0x403;
 
 fn msr_read(cpu: &Cpu, address: u32) -> Result<u64, CpuError> {
     match address {
@@ -541,18 +587,28 @@ fn msr_read(cpu: &Cpu, address: u32) -> Result<u64, CpuError> {
         MSR_IA32_APIC_BASE => Ok(0xFEE0_0000 | (1 << 11) | (1 << 8)),
         MSR_IA32_TSC => Ok(cpu.tsc),
         MSR_IA32_MTRR_DEF_TYPE => Ok(0x6),
+        MSR_IA32_MTRRCAP => Ok(0x508),
+        MSR_IA32_MCG_CAP => Ok(0x100),
         MSR_IA32_MISC_ENABLE => Ok(0),
         MSR_IA32_PAT => Ok(0x0007_0406_0007_0406),
         MSR_FS_BASE => Ok(cpu.regs.fs.base),
         MSR_GS_BASE => Ok(cpu.regs.gs.base),
-        MSR_KERNEL_GS_BASE
-        | MSR_STAR
-        | MSR_LSTAR
-        | MSR_CSTAR
-        | MSR_FMASK
+        MSR_KERNEL_GS_BASE => Ok(cpu.kernel_gs_base),
+        MSR_STAR => Ok(cpu.msr_star),
+        MSR_LSTAR => Ok(cpu.msr_lstar),
+        MSR_CSTAR => Ok(cpu.msr_cstar),
+        MSR_FMASK => Ok(cpu.msr_fmask),
+        MSR_IA32_TSC_ADJUST
+        | MSR_IA32_MCG_STATUS
+        | MSR_IA32_MCG_CTL
+        | MSR_IA32_THERM_INTERRUPT
+        | MSR_IA32_THERM_STATUS
         | MSR_IA32_SYSENTER_CS
         | MSR_IA32_SYSENTER_ESP
-        | MSR_IA32_SYSENTER_EIP => Ok(0),
+        | MSR_IA32_SYSENTER_EIP
+        | MSR_MTRR_PHYS_BASE_FIRST..=MSR_MTRR_PHYS_BASE_LAST
+        | MSR_MTRR_FIX_FIRST..=MSR_MTRR_FIX_LAST
+        | MSR_IA32_MC_FIRST..=MSR_IA32_MC_LAST => Ok(0),
         _ => Err(CpuError::GuestFault(format!(
             "unimplemented MSR read {address:#x}"
         ))),
@@ -566,20 +622,30 @@ fn msr_write(cpu: &mut Cpu, address: u32, value: u64) -> Result<(), CpuError> {
         }
         MSR_FS_BASE => cpu.regs.fs.base = value,
         MSR_GS_BASE => cpu.regs.gs.base = value,
+        MSR_KERNEL_GS_BASE => cpu.kernel_gs_base = value,
+        MSR_STAR => cpu.msr_star = value,
+        MSR_LSTAR => cpu.msr_lstar = value,
+        MSR_CSTAR => cpu.msr_cstar = value,
+        MSR_FMASK => cpu.msr_fmask = value,
         MSR_IA32_APIC_BASE => {
             // BSP bit and enable bit only; relocation ignored for now.
         }
-        MSR_IA32_MTRR_DEF_TYPE
+        MSR_IA32_TSC_ADJUST
+        | MSR_IA32_MTRR_DEF_TYPE
+        | MSR_IA32_MTRRCAP
+        | MSR_IA32_MCG_CAP
+        | MSR_IA32_MCG_STATUS
+        | MSR_IA32_MCG_CTL
+        | MSR_IA32_THERM_INTERRUPT
+        | MSR_IA32_THERM_STATUS
         | MSR_IA32_PAT
         | MSR_IA32_MISC_ENABLE
-        | MSR_STAR
-        | MSR_LSTAR
-        | MSR_CSTAR
-        | MSR_FMASK
         | MSR_IA32_SYSENTER_CS
         | MSR_IA32_SYSENTER_ESP
         | MSR_IA32_SYSENTER_EIP
-        | MSR_KERNEL_GS_BASE => {}
+        | MSR_MTRR_PHYS_BASE_FIRST..=MSR_MTRR_PHYS_BASE_LAST
+        | MSR_MTRR_FIX_FIRST..=MSR_MTRR_FIX_LAST
+        | MSR_IA32_MC_FIRST..=MSR_IA32_MC_LAST => {}
         _ => {
             return Err(CpuError::GuestFault(format!(
                 "unimplemented MSR write {address:#x}"
@@ -607,6 +673,49 @@ mod tests {
         let mut decoder =
             iced_x86::Decoder::with_ip(bitness, bytes, ip, iced_x86::DecoderOptions::NONE);
         decoder.decode()
+    }
+
+    fn encode_descriptor(descriptor: &crate::arch::segments::Descriptor) -> u64 {
+        let mut entry = 0_u64;
+        entry |= (descriptor.base & 0xFF00_0000) << 32;
+        entry |= (descriptor.base & 0x00FF_0000) << 16;
+        entry |= (descriptor.base & 0xFFFF) << 16;
+        let mut limit = descriptor.limit;
+        if descriptor.granularity {
+            limit >>= 12;
+        }
+        entry |= u64::from(limit & 0xF) << 48;
+        entry |= u64::from(limit & 0xFFFF);
+        if descriptor.granularity {
+            entry |= 1 << 55;
+        }
+        if descriptor.default_32 {
+            entry |= 1 << 54;
+        }
+        if descriptor.long_mode {
+            entry |= 1 << 53;
+        }
+        if descriptor.present {
+            entry |= 1 << 47;
+        }
+        entry |= u64::from(descriptor.dpl & 0b11) << 45;
+        entry |= u64::from(descriptor.descriptor_type & 0xF) << 40;
+        if descriptor.code {
+            entry |= 1 << 43;
+        }
+        if descriptor.conforming {
+            entry |= 1 << 42;
+        }
+        if descriptor.expand_down {
+            entry |= 1 << 42;
+        }
+        if descriptor.writable_or_readable {
+            entry |= 1 << 41;
+        }
+        if descriptor.accessed {
+            entry |= 1 << 40;
+        }
+        entry
     }
 
     fn run(cpu: &mut Cpu, bitness: u32, bytes: &[u8]) -> Result<(), CpuError> {
@@ -666,6 +775,118 @@ mod tests {
         assert_ne!(edx & (1 << 26), 0); // SSE2
         assert_ne!(edx & (1 << 15), 0); // CMOV
         assert_ne!(edx & (1 << 9), 0); // APIC
+    }
+
+    #[test]
+    fn syscall_switches_to_lstar_and_records_rip_rflags() {
+        let mut cpu = cpu();
+        // GDT entries for kernel CS/SS: install flat code at 0x10 and data
+        // at 0x18 before the syscall segment loads.
+        let cs = crate::arch::segments::Descriptor {
+            base: 0,
+            limit: 0xFFFFF,
+            granularity: true,
+            default_32: false,
+            long_mode: true,
+            present: true,
+            dpl: 0,
+            system: false,
+            descriptor_type: 0b1010,
+            code: true,
+            conforming: false,
+            expand_down: false,
+            writable_or_readable: true,
+            accessed: false,
+        };
+        let ds = crate::arch::segments::Descriptor {
+            base: 0,
+            limit: 0xFFFFF,
+            granularity: true,
+            default_32: false,
+            long_mode: false,
+            present: true,
+            dpl: 0,
+            system: false,
+            descriptor_type: 0b0010,
+            code: false,
+            conforming: false,
+            expand_down: false,
+            writable_or_readable: true,
+            accessed: false,
+        };
+        cpu.memory
+            .write_u64(0x10000, encode_descriptor(&cs))
+            .unwrap();
+        cpu.memory
+            .write_u64(0x10008, encode_descriptor(&ds))
+            .unwrap();
+        cpu.regs.gdt_base = 0x10000;
+        cpu.regs.gdt_limit = 0x27;
+        cpu.regs.rip = 0x2000;
+        cpu.regs.rflags = crate::arch::registers::RFlags::IF | crate::arch::registers::RFlags::CF;
+        cpu.msr_star = (0x23_u64 << 48) | (0x10_u64 << 32);
+        cpu.msr_lstar = 0xFFFF_FFFF_8100_0000;
+        cpu.msr_fmask = 0x200; // clears IF
+        run(&mut cpu, 64, &[0x0F, 0x05]).unwrap(); // syscall
+        assert_eq!(cpu.regs.gpr(index::RCX), 0x1002);
+        assert_eq!(cpu.regs.gpr(index::R11) & 0x201, 0x201);
+        assert_eq!(cpu.regs.rip, 0xFFFF_FFFF_8100_0000);
+        assert_eq!(cpu.regs.cs.selector.0, 0x10);
+        assert_eq!(cpu.regs.ss.selector.0, 0x18);
+        assert!(!cpu.regs.rflags.contains(crate::arch::registers::RFlags::IF));
+    }
+
+    #[test]
+    fn sysret_restores_user_segments_and_flags() {
+        let mut cpu = cpu();
+        let cs = crate::arch::segments::Descriptor {
+            base: 0,
+            limit: 0xFFFFF,
+            granularity: true,
+            default_32: false,
+            long_mode: true,
+            present: true,
+            dpl: 3,
+            system: false,
+            descriptor_type: 0b1010,
+            code: true,
+            conforming: false,
+            expand_down: false,
+            writable_or_readable: true,
+            accessed: false,
+        };
+        let ds = crate::arch::segments::Descriptor {
+            base: 0,
+            limit: 0xFFFFF,
+            granularity: true,
+            default_32: false,
+            long_mode: false,
+            present: true,
+            dpl: 3,
+            system: false,
+            descriptor_type: 0b0010,
+            code: false,
+            conforming: false,
+            expand_down: false,
+            writable_or_readable: true,
+            accessed: false,
+        };
+        cpu.memory
+            .write_u64(0x10028, encode_descriptor(&cs))
+            .unwrap();
+        cpu.memory
+            .write_u64(0x10020, encode_descriptor(&ds))
+            .unwrap();
+        cpu.regs.gdt_base = 0x10000;
+        cpu.regs.gdt_limit = 0x2F;
+        cpu.regs.set_gpr(index::RCX, 0x0000_0040_0010_00);
+        cpu.regs.set_gpr(index::R11, 0x2 | (1 << 9)); // IF set
+        cpu.msr_star = 0x23_u64 << 48;
+        run(&mut cpu, 64, &[0x48, 0x0F, 0x07]).unwrap(); // sysretq
+        assert_eq!(cpu.regs.rip, 0x0000_0040_0010_00);
+        assert_eq!(cpu.regs.cs.selector.0, 0x33);
+        assert_eq!(cpu.regs.ss.selector.0, 0x2B);
+        assert!(cpu.regs.rflags.contains(crate::arch::registers::RFlags::IF));
     }
 
     #[test]

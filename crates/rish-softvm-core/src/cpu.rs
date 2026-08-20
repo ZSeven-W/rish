@@ -38,6 +38,10 @@ pub struct Cpu {
     pub boot_ok_seen: bool,
     pub kernel_gs_base: u64,
     pub xcr0: u64,
+    pub msr_star: u64,
+    pub msr_lstar: u64,
+    pub msr_cstar: u64,
+    pub msr_fmask: u64,
     pub fpu_control_word: u16,
     pub fpu_status_word: u16,
     pub mxcsr: u32,
@@ -75,6 +79,10 @@ impl Cpu {
             boot_ok_seen: false,
             kernel_gs_base: 0,
             xcr0: 0x3,
+            msr_star: 0,
+            msr_lstar: 0,
+            msr_cstar: 0,
+            msr_fmask: 0,
             fpu_control_word: 0x037F,
             fpu_status_word: 0,
             mxcsr: 0x1F80,
@@ -452,6 +460,8 @@ impl Cpu {
             | Mnemonic::Lfence
             | Mnemonic::Sfence
             | Mnemonic::Mfence
+            | Mnemonic::Clac
+            | Mnemonic::Stac
             | Mnemonic::Iretd
             | Mnemonic::Iretq
             | Mnemonic::Int
@@ -483,7 +493,11 @@ impl Cpu {
             | Mnemonic::Xgetbv
             | Mnemonic::Xsetbv
             | Mnemonic::Endbr64
-            | Mnemonic::Endbr32 => system::extra_op(self, instruction),
+            | Mnemonic::Endbr32
+            | Mnemonic::Prefetchw
+            | Mnemonic::Syscall
+            | Mnemonic::Sysret
+            | Mnemonic::Sysretq => system::extra_op(self, instruction),
             _ => Err(CpuError::UnimplementedInstruction {
                 code: format!("{mnemonic:?}"),
                 address: self.regs.rip,
