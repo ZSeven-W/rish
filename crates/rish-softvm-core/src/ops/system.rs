@@ -276,7 +276,7 @@ pub fn system_op(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuErro
         Mnemonic::Invlpg => {}
         Mnemonic::Wbinvd | Mnemonic::Invd => {}
         Mnemonic::Lfence | Mnemonic::Sfence | Mnemonic::Mfence => {}
-        Mnemonic::Iret => {
+        Mnemonic::Iret | Mnemonic::Iretq | Mnemonic::Iretd => {
             let target = cpu.pop_native()?;
             let selector = SegmentSelector(cpu.pop_native()? as u16);
             let flags = cpu.pop_native()?;
