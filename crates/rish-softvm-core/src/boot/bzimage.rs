@@ -61,9 +61,12 @@ pub fn load(
     // sections) to EOF: the image contains linked code past payload_length.
     let payload = &kernel_image[setup_bytes..];
     cpu.memory.write(kernel_base, payload)?;
-    // boot_params zero page: boot sector + setup sections.
+    // boot_params zero page: per the 64-bit boot protocol the page is
+    // zeroed and only the setup header (from offset 0x1f1) is loaded. The
+    // real-mode boot sector and setup code must NOT be copied.
+    let header_size = (setup_bytes as u64 - 0x1F1).min(0x100);
     cpu.memory
-        .write(ZERO_PAGE_BASE, &kernel_image[..setup_bytes])?;
+        .write(ZERO_PAGE_BASE + 0x1F1, &kernel_image[0x1F1..0x1F1 + header_size as usize])?;
     // Command line.
     let mut cmdline = params.command_line.as_bytes().to_vec();
     cmdline.push(0);
@@ -392,8 +395,10 @@ mod tests {
             },
         )
         .unwrap();
-        // Setup copied into the zero page.
+        // Setup header copied into the zero page.
         assert_eq!(cpu.memory.read_u8(ZERO_PAGE_BASE + 0x1F1).unwrap(), 2);
+        // The rest of the zero page stays zeroed.
+        assert_eq!(cpu.memory.read_u8(ZERO_PAGE_BASE + 0x10).unwrap(), 0);
         // Kernel payload copied to 1 MiB; marker at the 64-bit entry.
         assert_eq!(
             cpu.memory

@@ -99,6 +99,14 @@ pub fn jump(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
                     cpu.read_operand(instruction, 0, crate::ops::memory_size(instruction))?;
                 return set_rip(cpu, target);
             }
+            OpKind::Register => {
+                let target = read_register(
+                    &cpu.regs,
+                    instruction.op0_register(),
+                    operand_size(instruction, 0),
+                );
+                return set_rip(cpu, target);
+            }
             _ => {
                 return Err(CpuError::UnimplementedInstruction {
                     code: "jmp".to_owned(),

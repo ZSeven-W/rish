@@ -37,7 +37,7 @@ pub struct Cpu {
     pub fpu_control_word: u16,
     pub fpu_status_word: u16,
     pub mxcsr: u32,
-    pub trace: VecDeque<(u64, u64, u64, u64, [u8; 4])>,
+    pub trace: VecDeque<(u64, u64, u64, u64, u64, u64, u64, u64, u64, [u8; 16])>,
     pub lapic_queue: Arc<std::sync::Mutex<VecDeque<u8>>>,
     pending_interrupts: VecDeque<Deliverable>,
     in_exception: bool,
@@ -91,6 +91,11 @@ impl Cpu {
         self.regs.instructions_retired = self.regs.instructions_retired.saturating_add(1);
         self.tsc = self.tsc.saturating_add(1);
         self.memory.lapic_tick();
+        // Advance the PIT deterministically: 10 guest ns per instruction.
+        if self.pit.advance(10) {
+            self.lines.assert(0);
+            self.pic.set_input(self.lines);
+        }
         Ok(())
     }
 
@@ -107,8 +112,8 @@ impl Cpu {
 
     fn execute_one(&mut self) -> Result<(), CpuError> {
         let (instruction, bytes) = self.decode_at_rip()?;
-        let mut head = [0_u8; 4];
-        let count = bytes.len().min(4);
+        let mut head = [0_u8; 16];
+        let count = bytes.len().min(16);
         head[..count].copy_from_slice(&bytes[..count]);
         if self.trace.len() >= 16384 {
             self.trace.pop_front();
@@ -116,6 +121,11 @@ impl Cpu {
         self.trace.push_back((
             self.regs.rip,
             self.regs.gpr(index::RAX),
+            self.regs.gpr(index::RCX),
+            self.regs.gpr(index::RDX),
+            self.regs.gpr(index::RBX),
+            self.regs.gpr(index::RSI),
+            self.regs.gpr(index::RDI),
             self.regs.gpr(index::RBP),
             self.regs.gpr(index::RSP),
             head,
@@ -947,10 +957,10 @@ pub fn register_index(register: Register) -> usize {
         Register::RCX | Register::ECX | Register::CX | Register::CL | Register::CH => index::RCX,
         Register::RDX | Register::EDX | Register::DX | Register::DL | Register::DH => index::RDX,
         Register::RBX | Register::EBX | Register::BX | Register::BL | Register::BH => index::RBX,
-        Register::RSP | Register::ESP | Register::SP => index::RSP,
-        Register::RBP | Register::EBP | Register::BP => index::RBP,
-        Register::RSI | Register::ESI | Register::SI => index::RSI,
-        Register::RDI | Register::EDI | Register::DI => index::RDI,
+        Register::RSP | Register::ESP | Register::SP | Register::SPL => index::RSP,
+        Register::RBP | Register::EBP | Register::BP | Register::BPL => index::RBP,
+        Register::RSI | Register::ESI | Register::SI | Register::SIL => index::RSI,
+        Register::RDI | Register::EDI | Register::DI | Register::DIL => index::RDI,
         Register::R8 | Register::R8D | Register::R8W | Register::R8L => index::R8,
         Register::R9 | Register::R9D | Register::R9W | Register::R9L => index::R9,
         Register::R10 | Register::R10D | Register::R10W | Register::R10L => index::R10,

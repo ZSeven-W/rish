@@ -49,7 +49,7 @@ impl Memory {
     }
 
     fn in_lapic(address: u64) -> bool {
-        address >= LAPIC_BASE && address < LAPIC_BASE + LAPIC_SIZE
+        (LAPIC_BASE..LAPIC_BASE + LAPIC_SIZE).contains(&address)
     }
 
     #[inline]

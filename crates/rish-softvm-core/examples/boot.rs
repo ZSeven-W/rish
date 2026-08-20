@@ -105,7 +105,61 @@ fn run() -> Result<u8, String> {
     let mut console = Vec::new();
     let progress_every = progress_every.max(1);
     let mut last_report = 0_u64;
+    let mut watch_prev = [0_u8; 16];
+    let _ = cpu.memory.read(0x35bd000, &mut watch_prev);
+    let mut watch_addrs: [(&str, u64, [u8; 8]); 5] = [
+        ("top_level_pgt", 0x35e3000, [0; 8]),
+        ("info0", 0x35df020, [0; 8]),
+        ("info8", 0x35df028, [0; 8]),
+        ("heap_loop_start", 0x3601698, [0; 8]),
+        ("pud_page", 0x35bf000, [0; 8]),
+    ];
+    for slot in watch_addrs.iter_mut() {
+        let _ = cpu.memory.read(slot.1, &mut slot.2);
+    }
+    let mut last_region: Option<u64> = None;
     for _ in 0..steps {
+        let mut watch_cur = [0_u8; 16];
+        if cpu.memory.read(0x35bd000, &mut watch_cur).is_ok() && watch_cur != watch_prev {
+            eprintln!(
+                "watch: 0x35bd000 changed to {} at rip={:#x} after {} instructions",
+                hex(&watch_cur),
+                cpu.regs.rip,
+                cpu.regs.instructions_retired
+            );
+            watch_prev = watch_cur;
+        }
+        for slot in watch_addrs.iter_mut() {
+            let mut cur = [0_u8; 8];
+            if cpu.memory.read(slot.1, &mut cur).is_ok() && cur != slot.2 {
+                eprintln!(
+                    "watch: {} ({:#x}) changed to {} at rip={:#x} after {} instructions",
+                    slot.0,
+                    slot.1,
+                    hex(&cur),
+                    cpu.regs.rip,
+                    cpu.regs.instructions_retired
+                );
+                slot.2 = cur;
+            }
+        }
+        let region = if cpu.regs.rip < 0x1c0_0000 {
+            0
+        } else if cpu.regs.rip < 0x300_0000 {
+            1
+        } else if cpu.regs.rip < 0x400_0000 {
+            2
+        } else {
+            3
+        };
+        if last_region != Some(region) {
+            eprintln!(
+                "watch: rip entered region {region} at {:#x} after {} instructions",
+                cpu.regs.rip,
+                cpu.regs.instructions_retired
+            );
+            last_region = Some(region);
+        }
         if let Err(error) = cpu.step() {
             console.extend(cpu.uart_console.drain_output());
             report_gap(&error, &cpu, &console);
@@ -128,9 +182,9 @@ fn run() -> Result<u8, String> {
     }
     println!("budget exhausted after {steps} instructions without a gap");
     let mut trace_text = String::new();
-    for (rip, rax, rbp, rsp, bytes) in &cpu.trace {
+    for (rip, rax, rcx, rdx, rbx, rsi, rdi, rbp, rsp, bytes) in &cpu.trace {
         let line = format!(
-            "  {rip:#x}: rax={rax:#x} rbp={rbp:#x} rsp={rsp:#x} bytes={}",
+            "  {rip:#x}: rax={rax:#x} rcx={rcx:#x} rdx={rdx:#x} rbx={rbx:#x} rsi={rsi:#x} rdi={rdi:#x} rbp={rbp:#x} rsp={rsp:#x} bytes={}",
             hex(bytes)
         );
         trace_text.push_str(&line);
@@ -143,9 +197,9 @@ fn run() -> Result<u8, String> {
 fn report_gap(error: &CpuError, cpu: &Cpu, console: &[u8]) {
     println!("last instructions:");
     let mut trace_text = String::new();
-    for (rip, rax, rbp, rsp, bytes) in &cpu.trace {
+    for (rip, rax, rcx, rdx, rbx, rsi, rdi, rbp, rsp, bytes) in &cpu.trace {
         let line = format!(
-            "  {rip:#x}: rax={rax:#x} rbp={rbp:#x} rsp={rsp:#x} bytes={}",
+            "  {rip:#x}: rax={rax:#x} rcx={rcx:#x} rdx={rdx:#x} rbx={rbx:#x} rsi={rsi:#x} rdi={rdi:#x} rbp={rbp:#x} rsp={rsp:#x} bytes={}",
             hex(bytes)
         );
         println!("{line}");
@@ -179,6 +233,35 @@ fn report_gap(error: &CpuError, cpu: &Cpu, console: &[u8]) {
     dump_region(cpu, 0xa260, 0x40);
     println!("memory at 0xe030:");
     dump_region(cpu, 0xe030, 0x30);
+    println!("memory at 0x1bee000 (buffer start):");
+    dump_region(cpu, 0x1bee000, 0x40);
+    println!("memory at 0x1bee900 (buffer ELF hit):");
+    dump_region(cpu, 0x1bee900, 0x40);
+    println!("memory at 0x35bd000 (image start):");
+    dump_region(cpu, 0x35bd000, 0x40);
+    println!("memory at 0x35bd900 (image ELF hit):");
+    dump_region(cpu, 0x35bd900, 0x40);
+    println!("memory at stack 0x35cd300:");
+    dump_region(cpu, 0x35cd300, 0x100);
+    println!("memory at outer fn 0x35bfde0:");
+    dump_region(cpu, 0x35bfde0, 0x100);
+    println!("gpr dump:");
+    for (i, name) in [
+        "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+        "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+    ]
+    .iter()
+    .enumerate()
+    {
+        println!("  {name} = {:#x}", cpu.regs.gpr[i]);
+    }
+    println!("memory at fault rip - 0x60:");
+    let fr = cpu.regs.rip.wrapping_sub(0x60);
+    dump_region(cpu, fr, 0xc0);
+    println!("memory at 0x35df000:");
+    dump_region(cpu, 0x35df000, 0x80);
+    println!("memory at 0x35e3000:");
+    dump_region(cpu, 0x35e3000, 0x40);
     dump_region(cpu, 0x1000000, 0x80);
     if !console.is_empty() {
         print_console(console);

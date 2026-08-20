@@ -247,4 +247,40 @@ mod tests {
         cpu.memory.read(0x6000, &mut buffer).unwrap();
         assert_eq!(&buffer, b"abcd");
     }
+
+    #[test]
+    fn mov_byte_from_sil_stores_sil_not_al() {
+        // Regression: SPL/BPL/SIL/DIL were missing from register_index and
+        // fell through to RAX, so mov [mem], sil stored AL instead of SIL.
+        let mut cpu = cpu();
+        cpu.regs.set_gpr(index::RAX, 0x6000);
+        cpu.regs.set_gpr(index::RSI, 0x98);
+        cpu.regs.set_gpr(index::RDX, 0x6006);
+        // loop: mov [rax], sil; add rax, 2; mov [rax-1], sil; cmp rax, rdx; jne
+        cpu.memory
+            .write(
+                0x1000,
+                &[0x40, 0x88, 0x30, 0x48, 0x83, 0xC0, 0x02, 0x40, 0x88, 0x70, 0xFF, 0x48, 0x39, 0xD0, 0x75, 0xF0],
+            )
+            .unwrap();
+        cpu.regs.rip = 0x1000;
+        cpu.regs.efer |= crate::arch::registers::Efer::LMA;
+        cpu.regs.cs = crate::arch::segments::SegmentRegister {
+            base: 0,
+            long_mode: true,
+            default_32: false,
+            code: true,
+            limit: u32::MAX,
+            granularity: true,
+            writable_or_readable: true,
+            ..Default::default()
+        };
+        // Run 3 loop iterations (15 instructions).
+        for _ in 0..15 {
+            cpu.step().unwrap();
+        }
+        let mut out = [0_u8; 6];
+        cpu.memory.read(0x6000, &mut out).unwrap();
+        assert_eq!(&out, &[0x98, 0x98, 0x98, 0x98, 0x98, 0x98]);
+    }
 }

@@ -131,7 +131,13 @@ pub fn shift_rotate(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuE
 pub fn bit_scan_test(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
     let mnemonic = instruction.mnemonic();
     let size = operand_size(instruction, 0);
-    let source = read_operand1(cpu, instruction)?;
+    // BSF/BSR take the searched value in operand 1; BTS/BTR/BTC operate
+    // on the destination (operand 0).
+    let source = if matches!(mnemonic, Mnemonic::Bsf | Mnemonic::Bsr) {
+        read_operand1(cpu, instruction)?
+    } else {
+        read_operand0(cpu, instruction)?
+    };
     match mnemonic {
         Mnemonic::Bsf => {
             let index = source.trailing_zeros();
@@ -168,9 +174,9 @@ pub fn bit_scan_test(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), Cpu
                 _ => 0,
             };
             let bit_index = if instruction.op0_kind() == OpKind::Memory {
-                bit
+                bit % 64
             } else {
-                bit % u64::from(size) * 8
+                bit % (u64::from(size) * 8)
             };
             let present = source & (1_u64 << bit_index) != 0;
             set_carry(&mut cpu.regs, present);
@@ -286,5 +292,18 @@ mod tests {
         run(&mut cpu, 64, &[0x48, 0x0F, 0xBC, 0xD8]).unwrap(); // bsf rbx, rax
         assert_eq!(cpu.regs.gpr(crate::arch::registers::index::RBX), 6);
         assert!(!cpu.regs.rflags.contains(RFlags::ZF));
+    }
+
+    #[test]
+    fn bts_imm8_sets_bit_58() {
+        let mut cpu = cpu();
+        cpu.regs.set_gpr(crate::arch::registers::index::RSI, 0x35E_4063);
+        // bts rsi, 0x3a (48 0f ba ee 3a)
+        run(&mut cpu, 64, &[0x48, 0x0F, 0xBA, 0xEE, 0x3A]).unwrap();
+        assert_eq!(
+            cpu.regs.gpr(crate::arch::registers::index::RSI),
+            0x35E_4063 | (1_u64 << 58)
+        );
+        assert!(!cpu.regs.rflags.contains(RFlags::CF));
     }
 }
