@@ -490,6 +490,7 @@ mod tests {
                 root_disk_path: "/app/root.img".to_owned(),
                 acceleration: VmAcceleration::Interpreter,
                 devices: vec![VmDevice::Console],
+                command_line: String::new(),
             },
             GuestKernelContract::new(["CONFIG_BINFMT_ELF"], [Capability::LinuxElf]),
         )

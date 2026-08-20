@@ -19,6 +19,10 @@ const VECTOR_INVALID_OPCODE: u8 = 6;
 const VECTOR_DOUBLE_FAULT: u8 = 8;
 const VECTOR_PAGE_FAULT: u8 = 14;
 
+/// One retired-instruction trace entry: RIP, the eight captured GPRs,
+/// and up to sixteen instruction bytes.
+pub type TraceEntry = (u64, u64, u64, u64, u64, u64, u64, u64, u64, [u8; 16]);
+
 pub struct Cpu {
     pub regs: Registers,
     pub memory: Memory,
@@ -37,7 +41,7 @@ pub struct Cpu {
     pub fpu_control_word: u16,
     pub fpu_status_word: u16,
     pub mxcsr: u32,
-    pub trace: VecDeque<(u64, u64, u64, u64, u64, u64, u64, u64, u64, [u8; 16])>,
+    pub trace: VecDeque<TraceEntry>,
     pub lapic_queue: Arc<std::sync::Mutex<VecDeque<u8>>>,
     pending_interrupts: VecDeque<Deliverable>,
     in_exception: bool,
@@ -94,8 +98,21 @@ impl Cpu {
         // Advance the PIT deterministically: 10 guest ns per instruction.
         if self.pit.advance(10) {
             self.lines.assert(0);
-            self.pic.set_input(self.lines);
         }
+        // 16550 receive interrupts follow the buffered input state. Assert
+        // the line while the receive interrupt is enabled and data is
+        // pending, so the guest control protocol can run IRQ-driven.
+        if self.uart_console.has_pending_interrupt() {
+            self.lines.assert(self.uart_console.irq_line());
+        } else {
+            self.lines.deassert(self.uart_console.irq_line());
+        }
+        if self.uart_control.has_pending_interrupt() {
+            self.lines.assert(self.uart_control.irq_line());
+        } else {
+            self.lines.deassert(self.uart_control.irq_line());
+        }
+        self.pic.set_input(self.lines);
         Ok(())
     }
 

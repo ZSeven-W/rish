@@ -447,6 +447,7 @@ dependencies = [
  "rish-core",
  "rish-guest-agent",
  "rish-guest-protocol",
+ "rish-softvm-core",
  "rish-vm",
  "serde",
  "serde_json",

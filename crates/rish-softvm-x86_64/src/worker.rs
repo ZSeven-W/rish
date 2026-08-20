@@ -60,9 +60,13 @@ pub(crate) fn spawn_worker(
     );
     let worker_cancel = Arc::clone(&cancel);
     let quantum = limits.provider_quantum_units;
+    let thread_name = match build.kind {
+        crate::ProviderKind::QemuTcti => "rish-x86-64-tcti",
+        crate::ProviderKind::ExperimentalPureRust => "rish-x86-64-pure-rust",
+    };
 
     thread::Builder::new()
-        .name("rish-x86-64-tcti".to_owned())
+        .name(thread_name.to_owned())
         .spawn(move || {
             let startup = panic::catch_unwind(AssertUnwindSafe(|| {
                 let mut machine = provider.create(request, provider_io)?;

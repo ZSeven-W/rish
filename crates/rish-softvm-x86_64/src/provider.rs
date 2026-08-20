@@ -9,6 +9,7 @@ use crate::{
         RishTctiRunResultV1, RishTctiSliceV1, RishTctiSnapshotV1,
     },
     config::GUEST_ARCHITECTURE,
+    pure_rust::{PURE_RUST_REQUIRED_FEATURES, PURE_RUST_TARGET},
     serial::ProviderIo,
 };
 
@@ -83,6 +84,68 @@ impl ProviderBuildInfo {
     pub fn supports(&self, feature: u64) -> bool {
         self.compiled_features & feature == feature
     }
+
+    /// Gate used by the engine for any injected provider, dispatching on the
+    /// declared provider kind.
+    pub(crate) fn validate_for_engine(&self) -> Result<(), SoftVmError> {
+        match self.kind {
+            ProviderKind::QemuTcti => self.validate_production(),
+            ProviderKind::ExperimentalPureRust => self.validate_pure_rust(),
+        }
+    }
+
+    /// Contract gate for the in-repository pure-Rust interpreter.
+    ///
+    /// The interpreter must declare the full-system x86_64 feature set,
+    /// exactly one vCPU, sane memory limits, a non-empty build identity, and
+    /// no JIT/hypervisor/private feature bits.
+    pub(crate) fn validate_pure_rust(&self) -> Result<(), SoftVmError> {
+        if self.kind != ProviderKind::ExperimentalPureRust {
+            return Err(contract(
+                "provider kind is not the experimental pure-Rust interpreter",
+            ));
+        }
+        if self.build_id.is_empty() || self.source_revision.is_empty() {
+            return Err(contract(
+                "pure-Rust provider build id and source revision cannot be empty",
+            ));
+        }
+        if self.qemu_version.is_empty() {
+            return Err(contract(
+                "pure-Rust provider interpreter version cannot be empty",
+            ));
+        }
+        require_equal(
+            "guest architecture",
+            &self.guest_architecture,
+            GUEST_ARCHITECTURE,
+        )?;
+        require_equal("pure-Rust target", &self.target_list, PURE_RUST_TARGET)?;
+        let missing = PURE_RUST_REQUIRED_FEATURES & !self.compiled_features;
+        if missing != 0 {
+            return Err(contract(&format!(
+                "pure-Rust provider is missing required feature bits 0x{missing:016x}"
+            )));
+        }
+        let forbidden = abi::FORBIDDEN_FEATURES & self.compiled_features;
+        if forbidden != 0 {
+            return Err(contract(&format!(
+                "pure-Rust provider exposes forbidden JIT/hypervisor/private feature bits 0x{forbidden:016x}"
+            )));
+        }
+        if self.max_vcpus != 1 {
+            return Err(contract(
+                "the pure-Rust interpreter supports exactly one vCPU",
+            ));
+        }
+        if self.min_memory_mib == 0
+            || self.max_memory_mib < self.min_memory_mib
+            || self.max_vcpus == 0
+        {
+            return Err(contract("provider resource limits are invalid"));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -113,6 +176,9 @@ pub struct ProviderRequest {
     pub vcpus: u32,
     pub artifacts: ValidatedArtifacts,
     pub network_mode: u32,
+    /// Linux kernel command line. The TCTI C ABI keeps its own built-in
+    /// default; the pure-Rust provider boots with exactly this text.
+    pub command_line: String,
 }
 
 /// One provider-owned VM. It is created and used exclusively on one worker.
@@ -124,9 +190,11 @@ pub trait ProviderMachine {
 
 /// Pluggable x86-64 interpreter provider boundary.
 ///
-/// The production gate currently accepts only the pinned QEMU TCTI build.
-/// A pure-Rust backend can implement this trait as an experimental provider
-/// without becoming an advertised Full VM backend.
+/// Two providers exist: the pinned QEMU TCTI build (documented fallback
+/// boundary, gated by `validate_production`) and the in-repository
+/// `ExperimentalPureRust` interpreter (the product backend, gated by
+/// `validate_pure_rust`). Both must pass their kind-specific contract gate
+/// before `VmEngine::probe` can report interpreted execution.
 pub trait MachineProvider: Send + Sync {
     fn build_info(&self) -> &ProviderBuildInfo;
     fn create(

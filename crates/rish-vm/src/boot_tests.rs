@@ -121,6 +121,7 @@ fn config() -> VmConfig {
         root_disk_path: "/app/root.img".to_owned(),
         acceleration: VmAcceleration::Interpreter,
         devices: vec![crate::VmDevice::Console],
+        command_line: String::new(),
     }
 }
 

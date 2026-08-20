@@ -235,6 +235,7 @@ fn config(kernel: &std::path::Path, root: &std::path::Path) -> VmConfig {
         root_disk_path: root.to_string_lossy().into_owned(),
         acceleration: VmAcceleration::Interpreter,
         devices: vec![VmDevice::Console],
+        command_line: String::new(),
     }
 }
 

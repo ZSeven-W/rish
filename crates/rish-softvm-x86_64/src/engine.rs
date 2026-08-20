@@ -10,6 +10,10 @@ use crate::{
     worker::spawn_worker,
 };
 
+/// Pinned guest default when the config carries no kernel command line.
+pub const DEFAULT_GUEST_COMMAND_LINE: &str =
+    "console=ttyS0,115200n8 rdinit=/init panic=-1 oops=panic nokaslr cgroup_no_v1=all";
+
 /// x86-64 software VM engine backed by a reviewed provider.
 ///
 /// [`Default`] is intentionally unavailable. A platform adapter must inject a
@@ -26,7 +30,7 @@ impl X86_64SoftwareEngine {
         limits: EngineLimits,
     ) -> Result<Self, SoftVmError> {
         limits.validate()?;
-        provider.build_info().validate_production()?;
+        provider.build_info().validate_for_engine()?;
         Ok(Self {
             provider: Some(provider),
             limits,
@@ -51,17 +55,17 @@ impl X86_64SoftwareEngine {
             .as_ref()
             .ok_or_else(|| {
                 SoftVmError::ProviderUnavailable(
-                    "no pinned x86_64 TCTI provider was linked".to_owned(),
+                    "no x86_64 software VM provider was linked".to_owned(),
                 )
             })?
             .clone();
         let build = provider.build_info();
-        build.validate_production()?;
+        build.validate_for_engine()?;
         let network_mode = validate_engine_config(config, build)?;
         let artifacts = ValidatedArtifacts::load(config, &self.limits)?;
         if artifacts.kernel_format != KernelFormat::LinuxBzImage {
             return Err(SoftVmError::InvalidKernel(
-                "the production TCTI provider requires a 64-bit Linux bzImage".to_owned(),
+                "the x86_64 software VM requires a 64-bit Linux bzImage".to_owned(),
             ));
         }
         if artifacts.initrd.is_some() && !build.supports(abi::FEATURE_INITRD) {
@@ -69,11 +73,17 @@ impl X86_64SoftwareEngine {
                 "the linked provider does not declare initrd support".to_owned(),
             ));
         }
+        let command_line = if config.command_line.is_empty() {
+            DEFAULT_GUEST_COMMAND_LINE.to_owned()
+        } else {
+            config.command_line.clone()
+        };
         let request = ProviderRequest {
             memory_mib: config.memory_mib,
             vcpus: u32::from(config.vcpus),
             artifacts,
             network_mode,
+            command_line,
         };
         let worker = spawn_worker(provider, request, &self.limits)?;
         Ok(X86_64Machine::new(worker, self.limits.clone()))
@@ -96,9 +106,9 @@ impl fmt::Debug for X86_64SoftwareEngine {
 impl VmEngine for X86_64SoftwareEngine {
     fn probe(&self) -> VmProbe {
         let Some(provider) = &self.provider else {
-            return VmProbe::unavailable("no pinned x86_64 TCTI provider was linked");
+            return VmProbe::unavailable("no x86_64 software VM provider was linked");
         };
-        match provider.build_info().validate_production() {
+        match provider.build_info().validate_for_engine() {
             Ok(()) => VmProbe::available([VmAcceleration::Interpreter]),
             Err(error) => VmProbe::unavailable(error.to_string()),
         }

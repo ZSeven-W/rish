@@ -13,18 +13,22 @@ mod engine;
 mod error;
 mod machine;
 mod provider;
+mod pure_rust;
 mod serial;
 mod transport;
 mod worker;
 
 pub use artifacts::{ArtifactFile, KernelFormat, ValidatedArtifacts};
 pub use config::{EngineLimits, TctiSourceLock};
-pub use engine::X86_64SoftwareEngine;
+pub use engine::{DEFAULT_GUEST_COMMAND_LINE, X86_64SoftwareEngine};
 pub use error::SoftVmError;
 pub use machine::{BootSnapshot, RunReport, X86_64Machine};
 pub use provider::{
     MachineProvider, MachineState, ProviderBuildInfo, ProviderKind, ProviderMachine,
     ProviderRequest, ProviderRun, ProviderSnapshot, TctiProvider,
+};
+pub use pure_rust::{
+    PURE_RUST_MAX_MEMORY_MIB, PURE_RUST_MIN_MEMORY_MIB, PURE_RUST_TARGET, PureRustProvider,
 };
 pub use serial::{ControlChannel, ProviderIo};
 pub use transport::SerialGuestTransport;

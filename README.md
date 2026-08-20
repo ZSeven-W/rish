@@ -19,9 +19,11 @@
 > 的 `alpine:latest` `linux/amd64` 图。方向（ADR-0003）：iOS/Android 通过
 > 仓库自研的纯 Rust 无 JIT x86_64 全系统解释器（rish-softvm-core）运行
 > docker，不使用 UTM/QEMU。解释器核心（CPU/分页/中断/8259/8254/CMOS/16550
-> 与首批指令子集）已落地并有 59 项测试；docker 诊断 guest（pinned kernel +
-> 模块树 + 静态 Docker 工具链 + agent PID 1）已可复现构建。待办：SSE2/LAPIC
-> /bzImage 装载与 Linux boot 调试。
+> 与首批指令子集）已落地并有 59 项测试；SSE2、bzImage 装载与真实 pinned
+> 内核的解压路径已在解释器内跑通（解压完成并进入 ELF 段搬运阶段）。
+> ExperimentalPureRust MachineProvider 已接入同一证据链（引擎门、有界量子、
+> 取消、双 16550 泵送与合同测试），待办：内核 ELF 段搬运的 malloc 堆状态
+> 调试、LAPIC boot 路径验证与到达 `RISH_X86_64_BOOT_OK`。
 
 ## 架构
 
@@ -85,7 +87,7 @@ crates/
   rish-guest-protocol/  Host/guest 握手、执行、OCI、端口和 checkpoint RPC
   rish-guest-agent/     Linux guest 内的失败关闭 bootstrap agent
   rish-guest-importer/  Guest 内流式校验、解层和 Linux 元数据发布
-  rish-softvm-x86_64/   无 JIT x86_64 TCTI provider 的 Rust 安全边界
+  rish-softvm-x86_64/   无 JIT x86_64 解释器控制面（ExperimentalPureRust 主后端 + QEMU TCTI 备用边界）
   rish-ffi/        Swift/JNI/N-API 可调用的稳定 JSON C ABI
   rish-cli/        命令规划调试工具
 platform/

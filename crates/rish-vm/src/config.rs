@@ -52,6 +52,10 @@ pub struct VmConfig {
     pub root_disk_path: String,
     pub acceleration: VmAcceleration,
     pub devices: Vec<VmDevice>,
+    /// Linux kernel command line. An empty value lets the engine fall back
+    /// to its pinned guest default (e.g. the docker diagnostic cmdline).
+    #[serde(default)]
+    pub command_line: String,
 }
 
 impl VmConfig {
@@ -122,6 +126,7 @@ mod tests {
             root_disk_path: "/root.img".to_owned(),
             acceleration,
             devices: vec![VmDevice::Console],
+            command_line: String::new(),
         }
     }
 

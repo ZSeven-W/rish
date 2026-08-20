@@ -68,9 +68,10 @@ UTM/QEMU TCTI 不再作为产品路径，其 adapter 仅作文档化的备选 pr
 - [x] docker 诊断 guest：pinned kernel/modloop/静态 Docker 工具链 + agent PID 1
 - [x] 纯 Rust 解释器核心：实模式/保护/长模式、段与描述符、4/5 级分页、异常与中断、
   8259/8254/CMOS/16550 芯片组、首批指令子集与 59 项 ISA/分页/设备测试
-- [ ] SSE2/MMX 指令、CPUID 微调与内核解压路径所需指令补齐
-- [ ] 局部 APIC（LAPIC timer/EOI）、I/O APIC 与 ACPI 表
-- [ ] Linux bzImage 装载（boot_params、E820、initramfs 放置）
+- [x] SSE2/MMX 指令、CPUID 微调与内核解压路径所需指令补齐（真实内核已完成解压并进入 ELF 段搬运）
+- [x] Linux bzImage 装载（boot_params、E820、initramfs 放置）
+- [x] 解释器作为 ExperimentalPureRust MachineProvider 接入同一证据链（引擎门、有界量子、取消、双 16550 泵送与合同测试）
+- [ ] 局部 APIC（LAPIC timer/EOI）boot 路径验证与 I/O APIC、ACPI 表
 - [ ] x86_64 Linux kernel/initramfs 可复现构建
 - [ ] Youki/systemd capability probe 与完整 guest agent handler
 - [ ] Native Linux OEM executor 与执行时主动 syscall 重验

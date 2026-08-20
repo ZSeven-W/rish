@@ -123,6 +123,7 @@ fn booted_vm_for_architecture(architecture: &str) -> BootedVm {
             root_disk_path: "/app/root.img".to_owned(),
             acceleration: VmAcceleration::Interpreter,
             devices: vec![VmDevice::Console],
+            command_line: String::new(),
         },
         GuestKernelContract::new(
             ["CONFIG_NAMESPACES", "CONFIG_BINFMT_ELF"],
@@ -145,6 +146,7 @@ fn booted_vm_without_exec_contract() -> BootedVm {
             root_disk_path: "/app/root.img".to_owned(),
             acceleration: VmAcceleration::Interpreter,
             devices: vec![VmDevice::Console],
+            command_line: String::new(),
         },
         GuestKernelContract::new(["CONFIG_NAMESPACES"], [Capability::NestedContainers]),
     )

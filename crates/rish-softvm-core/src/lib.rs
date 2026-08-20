@@ -18,3 +18,6 @@ pub use boot::bzimage;
 pub use cpu::{Cpu, register_index};
 pub use error::CpuError;
 pub use memory::Memory;
+
+/// Interpreter crate version, recorded in the provider build identity.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");

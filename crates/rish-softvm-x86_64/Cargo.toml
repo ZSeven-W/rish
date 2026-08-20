@@ -10,6 +10,7 @@ repository.workspace = true
 base64 = "0.22"
 rish-core.workspace = true
 rish-guest-protocol.workspace = true
+rish-softvm-core.workspace = true
 rish-vm.workspace = true
 serde.workspace = true
 serde_json.workspace = true
