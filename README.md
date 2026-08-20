@@ -19,11 +19,15 @@
 > 的 `alpine:latest` `linux/amd64` 图。方向（ADR-0003）：iOS/Android 通过
 > 仓库自研的纯 Rust 无 JIT x86_64 全系统解释器（rish-softvm-core）运行
 > docker，不使用 UTM/QEMU。解释器核心（CPU/分页/中断/8259/8254/CMOS/16550
-> 与首批指令子集）已落地并有 59 项测试；SSE2、bzImage 装载与真实 pinned
-> 内核的解压路径已在解释器内跑通（解压完成并进入 ELF 段搬运阶段）。
-> ExperimentalPureRust MachineProvider 已接入同一证据链（引擎门、有界量子、
-> 取消、双 16550 泵送与合同测试），待办：内核 ELF 段搬运的 malloc 堆状态
-> 调试、LAPIC boot 路径验证与到达 `RISH_X86_64_BOOT_OK`。
+> 与首批指令子集）已落地并有 81 项测试；SSE2、syscall/sysret、MTRR/MCE
+> MSR、跨页取指与 IDT/GDT 页表翻译均已补齐。真实 pinned 内核已在解释器内
+> 完成解压、ELF 段搬运并进入 startup_64：修复了 imul 立即数、boot_params
+> 零页偏移（cmdline/E820/ramdisk）等关键 bug。ExperimentalPureRust
+> MachineProvider 已接入同一证据链（引擎门、有界量子、取消、双 16550 泵送
+> 与合同测试），并有宿主侧 checkpoint/resume 诊断工具跳过 6 亿指令的解压
+> 阶段。当前待办：带 docker initramfs 的完整 guest 到达
+> `RISH_X86_64_BOOT_OK`，然后通过 VmCandidate 证据链在 guest 内执行
+> docker 命令。
 
 ## 架构
 
