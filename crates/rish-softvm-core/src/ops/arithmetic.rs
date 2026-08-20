@@ -1,6 +1,6 @@
 //! Integer arithmetic: add/sub/cmp/adc/sbb/inc/dec/neg/mul/imul/div/idiv.
 
-use iced_x86::{Instruction, Mnemonic, OpKind, Register};
+use iced_x86::{Instruction, Mnemonic, Register};
 
 use crate::ops::{
     AddResult, carry, operand_size, read_operand0, read_operand1, read_register, set_adjust,
@@ -153,11 +153,11 @@ fn mul(cpu: &mut Cpu, instruction: &Instruction, signed: bool) -> Result<(), Cpu
 fn imul_two_three(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
     let size = operand_size(instruction, 0);
     let left = read_operand0(cpu, instruction)?;
-    let right = if instruction.op1_kind() == OpKind::Immediate8
-        || instruction.op1_kind() == OpKind::Immediate16
-        || instruction.op1_kind() == OpKind::Immediate32
-    {
-        instruction.immediate(1)
+    // iced-x86 decodes both `imul r, r/m` (two operands) and the three
+    // operand forms `imul r, r/m, imm` and `imul r, imm` (the assembler
+    // two-operand immediate form repeats the destination register as op1).
+    let right = if instruction.op_count() >= 3 {
+        instruction.immediate(2)
     } else {
         read_operand1(cpu, instruction)?
     };
@@ -403,6 +403,35 @@ mod tests {
         run(&mut cpu, 64, &[0x48, 0xFF, 0xC0]).unwrap(); // inc rax
         assert_eq!(cpu.regs.gpr(crate::arch::registers::index::RAX), 6);
         assert!(cpu.regs.rflags.contains(RFlags::CF));
+    }
+
+    #[test]
+    fn imul_two_operand_immediate_form_uses_the_immediate() {
+        let mut cpu = cpu();
+        cpu.regs.set_gpr(crate::arch::registers::index::RDI, 3);
+        // imul edi, 0x38 (6b ff 38): iced-x86 decodes this as three
+        // operands (edi, edi, imm8); the handler must multiply by the
+        // immediate, not by the repeated destination register.
+        run(&mut cpu, 64, &[0x6B, 0xFF, 0x38]).unwrap();
+        assert_eq!(
+            cpu.regs.gpr(crate::arch::registers::index::RDI) & 0xFFFF_FFFF,
+            0xA8
+        );
+    }
+
+    #[test]
+    fn imul_register_form_reads_the_register() {
+        let mut cpu = cpu();
+        cpu.regs
+            .set_gpr(crate::arch::registers::index::RAX, 0x10000);
+        cpu.regs
+            .set_gpr(crate::arch::registers::index::RBX, 0x10);
+        // imul rax, rbx (48 0f af c3)
+        run(&mut cpu, 64, &[0x48, 0x0F, 0xAF, 0xC3]).unwrap();
+        assert_eq!(
+            cpu.regs.gpr(crate::arch::registers::index::RAX),
+            0x10_0000
+        );
     }
 
     #[test]
