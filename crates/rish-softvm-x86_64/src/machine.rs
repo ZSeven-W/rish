@@ -3,9 +3,6 @@ use std::sync::{
     mpsc::{self, TrySendError},
 };
 
-use rish_core::{GuestCommand, HostReply};
-use rish_guest_protocol::Envelope;
-use rish_vm::{GuestChannel, GuestKernelEvidence, GuestSession, VmError};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -130,32 +127,31 @@ impl X86_64Machine {
         self.worker.serial.drain(self.limits.max_console_bytes)
     }
 
+    /// Queues bounded guest control channel bytes and returns accepted count.
+    pub fn write_control(&self, bytes: &[u8]) -> usize {
+        self.worker.control.write_input(bytes)
+    }
+
+    /// Drains currently buffered guest control channel bytes.
+    #[must_use]
+    pub fn take_control(&self) -> Vec<u8> {
+        self.worker
+            .control
+            .drain_output(self.limits.max_control_bytes)
+    }
+
+    /// Bytes the guest dropped because the host control queue was full.
+    #[must_use]
+    pub fn dropped_control_output(&self) -> u64 {
+        self.worker.control.dropped_output()
+    }
+
     fn send_command(&self, command: WorkerCommand) -> Result<(), SoftVmError> {
         match self.worker.commands.try_send(command) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => Err(SoftVmError::WorkerBusy),
             Err(TrySendError::Disconnected(_)) => Err(SoftVmError::WorkerStopped),
         }
-    }
-}
-
-impl GuestChannel for X86_64Machine {
-    fn bootstrap(&self, _hello: &Envelope) -> Result<Envelope, VmError> {
-        Err(VmError::Protocol(
-            SoftVmError::ControlTransportUnavailable.to_string(),
-        ))
-    }
-
-    fn kernel_config(&self, _session: &GuestSession) -> Result<GuestKernelEvidence, VmError> {
-        Err(VmError::Guest(
-            SoftVmError::ControlTransportUnavailable.to_string(),
-        ))
-    }
-
-    fn execute(&self, _command: &GuestCommand) -> Result<HostReply, VmError> {
-        Err(VmError::Guest(
-            SoftVmError::ControlTransportUnavailable.to_string(),
-        ))
     }
 }
 

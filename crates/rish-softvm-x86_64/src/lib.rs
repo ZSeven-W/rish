@@ -14,6 +14,7 @@ mod error;
 mod machine;
 mod provider;
 mod serial;
+mod transport;
 mod worker;
 
 pub use artifacts::{ArtifactFile, KernelFormat, ValidatedArtifacts};
@@ -25,7 +26,8 @@ pub use provider::{
     MachineProvider, MachineState, ProviderBuildInfo, ProviderKind, ProviderMachine,
     ProviderRequest, ProviderRun, ProviderSnapshot, TctiProvider,
 };
-pub use serial::ProviderIo;
+pub use serial::{ControlChannel, ProviderIo};
+pub use transport::SerialGuestTransport;
 
 /// Result type used by the AMD64 software VM adapter.
 pub type Result<T> = std::result::Result<T, SoftVmError>;

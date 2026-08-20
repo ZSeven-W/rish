@@ -215,6 +215,8 @@ impl MachineProvider for TctiProvider {
             context: (&mut *io as *mut ProviderIo).cast::<c_void>(),
             serial_write: Some(serial_write),
             serial_read: Some(serial_read),
+            control_write: Some(control_write),
+            control_read: Some(control_read),
             should_cancel: Some(should_cancel),
         };
         let mut raw_handle = std::ptr::null_mut();
@@ -440,7 +442,7 @@ unsafe extern "C" fn serial_write(context: *mut c_void, data: *const u8, len: us
     let io = unsafe { &*context.cast::<ProviderIo>() };
     // SAFETY: The provider contract supplies a readable `len` byte slice.
     let bytes = unsafe { std::slice::from_raw_parts(data, len) };
-    io.write_serial(bytes)
+    io.write_console(bytes)
 }
 
 unsafe extern "C" fn serial_read(context: *mut c_void, data: *mut u8, capacity: usize) -> usize {
@@ -451,7 +453,29 @@ unsafe extern "C" fn serial_read(context: *mut c_void, data: *mut u8, capacity: 
     let io = unsafe { &*context.cast::<ProviderIo>() };
     // SAFETY: The provider contract supplies a writable `capacity` byte slice.
     let output = unsafe { std::slice::from_raw_parts_mut(data, capacity) };
-    io.read_serial(output)
+    io.read_console(output)
+}
+
+unsafe extern "C" fn control_write(context: *mut c_void, data: *const u8, len: usize) -> usize {
+    if context.is_null() || (data.is_null() && len != 0) {
+        return 0;
+    }
+    // SAFETY: The provider contract keeps both pointers valid for this call.
+    let io = unsafe { &*context.cast::<ProviderIo>() };
+    // SAFETY: The provider contract supplies a readable len byte slice.
+    let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+    io.control.write_output(bytes)
+}
+
+unsafe extern "C" fn control_read(context: *mut c_void, data: *mut u8, capacity: usize) -> usize {
+    if context.is_null() || (data.is_null() && capacity != 0) {
+        return 0;
+    }
+    // SAFETY: The provider contract keeps both pointers valid for this call.
+    let io = unsafe { &*context.cast::<ProviderIo>() };
+    // SAFETY: The provider contract supplies a writable capacity byte slice.
+    let output = unsafe { std::slice::from_raw_parts_mut(data, capacity) };
+    io.control.read_input(output)
 }
 
 unsafe extern "C" fn should_cancel(context: *mut c_void) -> u8 {

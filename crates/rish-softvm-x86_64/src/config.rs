@@ -48,7 +48,9 @@ pub struct EngineLimits {
     pub max_initrd_bytes: u64,
     pub max_root_disk_bytes: u64,
     pub max_console_bytes: usize,
+    pub max_control_bytes: usize,
     pub max_units_per_run: u64,
+    pub max_units_per_request: u64,
     pub provider_quantum_units: u64,
     pub startup_timeout: Duration,
 }
@@ -60,7 +62,9 @@ impl Default for EngineLimits {
             max_initrd_bytes: 512 * 1024 * 1024,
             max_root_disk_bytes: 16 * 1024 * 1024 * 1024,
             max_console_bytes: 1024 * 1024,
+            max_control_bytes: 16 * 1024 * 1024,
             max_units_per_run: 10_000_000,
+            max_units_per_request: 2_000_000_000,
             provider_quantum_units: 50_000,
             startup_timeout: Duration::from_secs(20),
         }
@@ -73,7 +77,9 @@ impl EngineLimits {
             || self.max_initrd_bytes == 0
             || self.max_root_disk_bytes == 0
             || self.max_console_bytes == 0
+            || self.max_control_bytes == 0
             || self.max_units_per_run == 0
+            || self.max_units_per_request == 0
             || self.provider_quantum_units == 0
             || self.startup_timeout.is_zero()
         {
@@ -84,6 +90,11 @@ impl EngineLimits {
         if self.provider_quantum_units > self.max_units_per_run {
             return Err(SoftVmError::InvalidConfig(
                 "provider quantum cannot exceed the per-run unit limit".to_owned(),
+            ));
+        }
+        if self.max_units_per_request < self.max_units_per_run {
+            return Err(SoftVmError::InvalidConfig(
+                "request unit budget cannot be smaller than one full run".to_owned(),
             ));
         }
         Ok(())

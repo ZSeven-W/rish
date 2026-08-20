@@ -7,11 +7,14 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+base64 = "0.22"
 rish-core.workspace = true
 rish-guest-protocol.workspace = true
 rish-vm.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+rish-guest-agent.workspace = true
 tempfile = "3.8"

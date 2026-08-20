@@ -22,6 +22,7 @@ pub const FEATURE_SERIAL_16550: u64 = 1 << 5;
 pub const FEATURE_VIRTIO_BLOCK: u64 = 1 << 6;
 pub const FEATURE_INITRD: u64 = 1 << 7;
 pub const FEATURE_USER_NETWORK: u64 = 1 << 8;
+pub const FEATURE_CONTROL_SERIAL: u64 = 1 << 9;
 
 pub const FEATURE_JIT: u64 = 1 << 48;
 pub const FEATURE_HVF: u64 = 1 << 49;
@@ -35,7 +36,8 @@ pub const REQUIRED_FEATURES: u64 = FEATURE_TCTI
     | FEATURE_BOUNDED_RUN
     | FEATURE_CANCEL_POLL
     | FEATURE_SERIAL_16550
-    | FEATURE_VIRTIO_BLOCK;
+    | FEATURE_VIRTIO_BLOCK
+    | FEATURE_CONTROL_SERIAL;
 
 pub const FORBIDDEN_FEATURES: u64 =
     FEATURE_JIT | FEATURE_HVF | FEATURE_KVM | FEATURE_PRIVATE_API | FEATURE_EXECUTABLE_MEMORY;
@@ -128,6 +130,8 @@ pub struct RishTctiHostCallbacksV1 {
     pub context: *mut c_void,
     pub serial_write: Option<SerialWriteFn>,
     pub serial_read: Option<SerialReadFn>,
+    pub control_write: Option<SerialWriteFn>,
+    pub control_read: Option<SerialReadFn>,
     pub should_cancel: Option<ShouldCancelFn>,
 }
 

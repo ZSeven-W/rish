@@ -5,8 +5,9 @@ use rish_vm::{
 };
 
 use crate::{
-    EngineLimits, KernelFormat, MachineProvider, ProviderRequest, SoftVmError, ValidatedArtifacts,
-    X86_64Machine, abi, config::GUEST_ARCHITECTURE, worker::spawn_worker,
+    EngineLimits, KernelFormat, MachineProvider, ProviderRequest, SerialGuestTransport,
+    SoftVmError, ValidatedArtifacts, X86_64Machine, abi, config::GUEST_ARCHITECTURE,
+    worker::spawn_worker,
 };
 
 /// x86-64 software VM engine backed by a reviewed provider.
@@ -104,9 +105,12 @@ impl VmEngine for X86_64SoftwareEngine {
     }
 
     fn boot(&self, config: &VmConfig) -> Result<Box<dyn GuestChannel>, VmError> {
-        self.launch(config)
-            .map(|machine| Box::new(machine) as Box<dyn GuestChannel>)
-            .map_err(|error| VmError::Boot(error.to_string()))
+        let machine = self
+            .launch(config)
+            .map_err(|error| VmError::Boot(error.to_string()))?;
+        let transport = SerialGuestTransport::new(machine, self.limits.clone())
+            .map_err(|error| VmError::Boot(error.to_string()))?;
+        Ok(Box::new(transport))
     }
 }
 

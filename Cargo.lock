@@ -408,10 +408,13 @@ dependencies = [
 name = "rish-softvm-x86_64"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "rish-core",
+ "rish-guest-agent",
  "rish-guest-protocol",
  "rish-vm",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
 ]

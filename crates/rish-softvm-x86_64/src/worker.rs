@@ -13,7 +13,7 @@ use crate::{
     BootSnapshot, EngineLimits, MachineProvider, MachineState, ProviderBuildInfo, ProviderRequest,
     SoftVmError, ValidatedArtifacts,
     provider::{ProviderMachine, ProviderSnapshot},
-    serial::{HostSerial, serial_pair},
+    serial::{ControlChannel, HostSerial, io_pair},
 };
 
 pub(crate) enum WorkerCommand {
@@ -36,6 +36,7 @@ pub(crate) struct StepOutcome {
 pub(crate) struct WorkerHandle {
     pub commands: SyncSender<WorkerCommand>,
     pub serial: HostSerial,
+    pub control: Arc<ControlChannel>,
     pub cancel: Arc<AtomicBool>,
     pub initial_snapshot: BootSnapshot,
 }
@@ -52,7 +53,11 @@ pub(crate) fn spawn_worker(
     let (command_tx, command_rx) = mpsc::sync_channel(4);
     let (startup_tx, startup_rx) = mpsc::sync_channel(1);
     let cancel = Arc::new(AtomicBool::new(false));
-    let (serial, provider_io) = serial_pair(limits.max_console_bytes, Arc::clone(&cancel));
+    let (serial, control, provider_io) = io_pair(
+        limits.max_console_bytes,
+        limits.max_control_bytes,
+        Arc::clone(&cancel),
+    );
     let worker_cancel = Arc::clone(&cancel);
     let quantum = limits.provider_quantum_units;
 
@@ -101,6 +106,7 @@ pub(crate) fn spawn_worker(
     Ok(WorkerHandle {
         commands: command_tx,
         serial,
+        control,
         cancel,
         initial_snapshot,
     })

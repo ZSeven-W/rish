@@ -16,6 +16,7 @@
 #define RISH_TCTI_FEATURE_VIRTIO_BLOCK (UINT64_C(1) << 6)
 #define RISH_TCTI_FEATURE_INITRD (UINT64_C(1) << 7)
 #define RISH_TCTI_FEATURE_USER_NETWORK (UINT64_C(1) << 8)
+#define RISH_TCTI_FEATURE_CONTROL_SERIAL (UINT64_C(1) << 9)
 
 #define RISH_TCTI_FEATURE_JIT (UINT64_C(1) << 48)
 #define RISH_TCTI_FEATURE_HVF (UINT64_C(1) << 49)
@@ -76,6 +77,8 @@ typedef struct {
     void *context;
     RishTctiSerialWriteV1 serial_write;
     RishTctiSerialReadV1 serial_read;
+    RishTctiSerialWriteV1 control_write;
+    RishTctiSerialReadV1 control_read;
     RishTctiShouldCancelV1 should_cancel;
 } RishTctiHostCallbacksV1;
 
@@ -112,6 +115,11 @@ typedef struct {
 } RishTctiApiV1;
 
 /*
+ * serial_* carries the 16550A console (ttyS0). control_* carries a second
+ * 16550A (ttyS1) used exclusively for versioned rish guest protocol frames;
+ * a provider that drops control bytes must surface the drop to the host so
+ * the adapter can fail closed.
+ *
  * The provider must copy config paths during create(). The callback table and
  * context remain valid until destroy(). run_quantum() must be bounded and poll
  * should_cancel(). The reviewed build is:

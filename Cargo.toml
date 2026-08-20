@@ -30,6 +30,7 @@ repository = "https://github.com/ZSeven-W/rish"
 rish-applets = { path = "crates/rish-applets" }
 rish-content = { path = "crates/rish-content" }
 rish-core = { path = "crates/rish-core" }
+rish-guest-agent = { path = "crates/rish-guest-agent" }
 rish-guest-importer = { path = "crates/rish-guest-importer" }
 rish-guest-protocol = { path = "crates/rish-guest-protocol" }
 rish-layer = { path = "crates/rish-layer" }

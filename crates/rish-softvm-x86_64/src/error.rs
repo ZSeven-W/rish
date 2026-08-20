@@ -50,6 +50,12 @@ pub enum SoftVmError {
     #[error("requested {requested} units, per-run limit is {limit}")]
     UnitLimit { requested: u64, limit: u64 },
 
+    #[error("guest control request exceeded the {units} execution unit budget")]
+    RequestDeadline { units: u64 },
+
+    #[error("guest control channel error: {0}")]
+    ControlChannel(String),
+
     #[error(
         "TCTI UART is available, but the versioned rish guest control transport is not connected"
     )]
