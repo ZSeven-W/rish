@@ -56,24 +56,27 @@ portable backend。
 
 ## P3：AMD64 Full VM boot
 
-- [ ] 无 JIT 的 x86_64 全系统软件解释器
-- [ ] long mode、四级页表、APIC/PIC/PIT/RTC 与 PCI
-- [ ] virtio-blk、16550 console、rng、net 与独立 guest control channel
-- [ ] x86_64 Linux kernel/initramfs/ext4 可复现构建
+方向（ADR-0003）：以纯 Rust 无 JIT 解释器（rish-softvm-core）为主路径；
+UTM/QEMU TCTI 不再作为产品路径，其 adapter 仅作文档化的备选 provider 边界。
+
 - [x] 版本化 Guest RPC 协议
 - [x] evidence-gated VM probe/boot/HelloAck/Kconfig/capability profile
 - [x] bootstrap Rust guest agent、严格握手和 capability gate
 - [x] 非阻塞 exec、Cancel、timeout、进程组清理、streaming 与 Linux PTY
-- [x] 固定 `linux/amd64` 镜像平台贯穿 pull、记录、FFI 与 Full VM 规划
+- [x] 固定 linux/amd64 镜像平台贯穿 pull、记录、FFI 与 Full VM 规划
+- [x] 16550 console 与独立 guest control channel（ttyS1 帧协议，含宿主/guest 集成测试）
+- [x] docker 诊断 guest：pinned kernel/modloop/静态 Docker 工具链 + agent PID 1
+- [x] 纯 Rust 解释器核心：实模式/保护/长模式、段与描述符、4/5 级分页、异常与中断、
+  8259/8254/CMOS/16550 芯片组、首批指令子集与 59 项 ISA/分页/设备测试
+- [ ] SSE2/MMX 指令、CPUID 微调与内核解压路径所需指令补齐
+- [ ] 局部 APIC（LAPIC timer/EOI）、I/O APIC 与 ACPI 表
+- [ ] Linux bzImage 装载（boot_params、E820、initramfs 放置）
+- [ ] x86_64 Linux kernel/initramfs 可复现构建
 - [ ] Youki/systemd capability probe 与完整 guest agent handler
 - [ ] Native Linux OEM executor 与执行时主动 syscall 重验
 - [ ] 用户态 NAT、DNS、TCP/UDP 端口转发
 - [ ] suspend/checkpoint/restore
 
-现实工程策略：Rust 负责 OCI、生命周期、安全门和 provider ABI；首个可用
-provider 采用 UTM QEMU TCTI 的 no-JIT x86_64 full-system 路径。纯 Rust
-provider 可并行实验，但必须通过同一真实 boot/handshake gate。QEMU 链接和
-发行必须单独完成 GPL 合规评审。
 
 验收：三端 stock 设备能够启动同一 Linux guest、执行 shell，并在前台
 保持稳定；iOS 不承诺后台常驻。

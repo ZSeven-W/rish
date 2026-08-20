@@ -13,13 +13,15 @@
   或经过探测的宿主 Linux 后端。
 - 能力不足时失败关闭，不会把“模拟成功”伪装成真实内核隔离。
 
-> 当前状态：P1 数据面原型。能力模型、三端 native-offload SDK、OCI
-> Registry/CAS、安全解层、事务 rootfs snapshot、Guest RPC 与 bootstrap
-> agent 已可编译测试；iOS Simulator 已真实拉取并校验 Docker Hub 的
-> `alpine:latest` `linux/amd64` 图。VM 候选仍必须经过 probe、真实 Linux
-> boot、握手、Kconfig 和 Guest capability 证据链才能进入调度。三端最小
-> Demo 已接入；x86_64 TCTI provider、Linux boot-to-agent、Android/鸿蒙
-> Registry transport 和产品级应用仍未完成。
+> 当前状态：P1 数据面原型 + P3 软模拟主线。能力模型、三端 native-offload
+> SDK、OCI Registry/CAS、安全解层、事务 rootfs snapshot、Guest RPC 与
+> bootstrap agent 已可编译测试；iOS Simulator 已真实拉取并校验 Docker Hub
+> 的 `alpine:latest` `linux/amd64` 图。方向（ADR-0003）：iOS/Android 通过
+> 仓库自研的纯 Rust 无 JIT x86_64 全系统解释器（rish-softvm-core）运行
+> docker，不使用 UTM/QEMU。解释器核心（CPU/分页/中断/8259/8254/CMOS/16550
+> 与首批指令子集）已落地并有 59 项测试；docker 诊断 guest（pinned kernel +
+> 模块树 + 静态 Docker 工具链 + agent PID 1）已可复现构建。待办：SSE2/LAPIC
+> /bzImage 装载与 Linux boot 调试。
 
 ## 架构
 
