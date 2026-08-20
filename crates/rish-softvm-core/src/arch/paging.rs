@@ -93,7 +93,12 @@ fn walk_generic(
     }
     if five_level {
         let pml4_index = (linear >> 39) & 0x1FF;
-        entry = read_entry(memory, entry + pml4_index * 8, linear, reserved)?;
+        entry = read_entry(
+            memory,
+            (entry & TABLE_MASK) + pml4_index * 8,
+            linear,
+            reserved,
+        )?;
         if entry & PAGE_LARGE != 0 {
             return Err(PageFault {
                 linear,
@@ -102,17 +107,32 @@ fn walk_generic(
         }
     }
     let pdpt_index = (linear >> 30) & 0x1FF;
-    entry = read_entry(memory, entry + pdpt_index * 8, linear, reserved)?;
+    entry = read_entry(
+        memory,
+        (entry & TABLE_MASK) + pdpt_index * 8,
+        linear,
+        reserved,
+    )?;
     if entry & PAGE_LARGE != 0 {
         return large_page(entry, linear, 30, cr4);
     }
     let pd_index = (linear >> 21) & 0x1FF;
-    entry = read_entry(memory, entry + pd_index * 8, linear, reserved)?;
+    entry = read_entry(
+        memory,
+        (entry & TABLE_MASK) + pd_index * 8,
+        linear,
+        reserved,
+    )?;
     if entry & PAGE_LARGE != 0 {
         return large_page(entry, linear, 21, cr4);
     }
     let pt_index = (linear >> 12) & 0x1FF;
-    entry = read_entry(memory, entry + pt_index * 8, linear, reserved)?;
+    entry = read_entry(
+        memory,
+        (entry & TABLE_MASK) + pt_index * 8,
+        linear,
+        reserved,
+    )?;
     if entry & PAGE_LARGE != 0 {
         return Err(PageFault {
             linear,
@@ -123,7 +143,6 @@ fn walk_generic(
     let _ = efer;
     Ok((entry & TABLE_MASK) + offset)
 }
-
 #[allow(clippy::too_many_arguments)]
 fn walk_pae32(
     memory: &Memory,
@@ -149,12 +168,22 @@ fn walk_pae32(
         });
     }
     let pd_index = (linear >> 21) & 0x1FF;
-    entry = read_entry(memory, entry + pd_index * 8, linear, reserved)?;
+    entry = read_entry(
+        memory,
+        (entry & TABLE_MASK) + pd_index * 8,
+        linear,
+        reserved,
+    )?;
     if entry & PAGE_LARGE != 0 {
         return large_page(entry, linear, 21, cr4);
     }
     let pt_index = (linear >> 12) & 0x1FF;
-    entry = read_entry(memory, entry + pt_index * 8, linear, reserved)?;
+    entry = read_entry(
+        memory,
+        (entry & TABLE_MASK) + pt_index * 8,
+        linear,
+        reserved,
+    )?;
     if entry & PAGE_LARGE != 0 {
         return Err(PageFault {
             linear,
@@ -189,12 +218,16 @@ fn walk_2_level(
         });
     }
     let pt_index = (linear >> 12) & 0x3FF;
-    let entry = read_entry(memory, entry + pt_index * 4, linear, reserved)?;
+    let entry = read_entry(
+        memory,
+        (entry & 0xFFFF_F000) + pt_index * 4,
+        linear,
+        reserved,
+    )?;
     check_access(entry, linear, kind)?;
     let _ = efer;
     Ok((entry & 0xFFFF_F000) + offset)
 }
-
 fn read_entry(memory: &Memory, address: u64, linear: u64, reserved: u64) -> Result<u64, PageFault> {
     let entry = memory.read_u64(address).map_err(|_| PageFault {
         linear,
@@ -212,7 +245,7 @@ fn read_entry(memory: &Memory, address: u64, linear: u64, reserved: u64) -> Resu
             error_code: 0b1000,
         });
     }
-    Ok(entry & TABLE_MASK)
+    Ok(entry)
 }
 
 fn check_access(entry: u64, linear: u64, kind: AccessKind) -> Result<(), PageFault> {

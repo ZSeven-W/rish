@@ -4,6 +4,7 @@ pub mod arithmetic;
 pub mod branch;
 pub mod data;
 pub mod logic;
+pub mod sse;
 pub mod stack;
 pub mod string;
 pub mod system;

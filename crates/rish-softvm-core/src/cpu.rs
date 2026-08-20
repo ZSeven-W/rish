@@ -8,7 +8,7 @@ use crate::arch::paging::{AccessKind, translate};
 use crate::arch::registers::{CpuMode, Registers, index};
 use crate::arch::segments::{Descriptor, SegmentRegister, SegmentSelector};
 use crate::devices::{Cmos, InterruptLines, Pic8259, Pit8254, PortBus, Uart16550};
-use crate::ops::{arithmetic, branch, data, logic, stack, string, system};
+use crate::ops::{arithmetic, branch, data, logic, sse, stack, string, system};
 use crate::{CpuError, Memory};
 
 const MAX_INSTRUCTION_BYTES: usize = 15;
@@ -31,6 +31,12 @@ pub struct Cpu {
     pub tsc: u64,
     pub halted: bool,
     pub boot_ok_seen: bool,
+    pub kernel_gs_base: u64,
+    pub xcr0: u64,
+    pub fpu_control_word: u16,
+    pub fpu_status_word: u16,
+    pub mxcsr: u32,
+    pub trace: VecDeque<(u64, u64, u64, u64, [u8; 4])>,
     pending_interrupts: VecDeque<Deliverable>,
     in_exception: bool,
 }
@@ -59,6 +65,12 @@ impl Cpu {
             tsc: 0,
             halted: false,
             boot_ok_seen: false,
+            kernel_gs_base: 0,
+            xcr0: 0x3,
+            fpu_control_word: 0x037F,
+            fpu_status_word: 0,
+            mxcsr: 0x1F80,
+            trace: VecDeque::new(),
             pending_interrupts: VecDeque::new(),
             in_exception: false,
         })
@@ -89,6 +101,19 @@ impl Cpu {
 
     fn execute_one(&mut self) -> Result<(), CpuError> {
         let (instruction, bytes) = self.decode_at_rip()?;
+        let mut head = [0_u8; 4];
+        let count = bytes.len().min(4);
+        head[..count].copy_from_slice(&bytes[..count]);
+        if self.trace.len() >= 4096 {
+            self.trace.pop_front();
+        }
+        self.trace.push_back((
+            self.regs.rip,
+            self.regs.gpr(index::RAX),
+            self.regs.gpr(index::RBP),
+            self.regs.gpr(index::RSP),
+            head,
+        ));
         self.regs.rip = self.regs.rip.wrapping_add(instruction.len() as u64);
         let result = self.dispatch(&instruction);
         if let Err(CpuError::UnimplementedInstruction {
@@ -197,7 +222,7 @@ impl Cpu {
             | Mnemonic::Leave => stack::push_pop(self, instruction),
             Mnemonic::Jmp => branch::jump(self, instruction),
             Mnemonic::Call => branch::call(self, instruction),
-            Mnemonic::Ret => branch::ret(self, instruction),
+            Mnemonic::Ret | Mnemonic::Retf => branch::ret(self, instruction),
             Mnemonic::Loop
             | Mnemonic::Loope
             | Mnemonic::Loopne
@@ -245,6 +270,91 @@ impl Cpu {
             | Mnemonic::Sti
             | Mnemonic::Sahf
             | Mnemonic::Lahf => branch::flag_ops(self, instruction),
+            Mnemonic::Movaps
+            | Mnemonic::Movups
+            | Mnemonic::Movapd
+            | Mnemonic::Movupd
+            | Mnemonic::Movdqa
+            | Mnemonic::Movdqu
+            | Mnemonic::Movq
+            | Mnemonic::Movd
+            | Mnemonic::Movss
+            | Mnemonic::Movlps
+            | Mnemonic::Movlpd
+            | Mnemonic::Movhps
+            | Mnemonic::Movhpd
+            | Mnemonic::Movddup
+            | Mnemonic::Movsldup
+            | Mnemonic::Movshdup
+            | Mnemonic::Xorps
+            | Mnemonic::Xorpd
+            | Mnemonic::Pxor
+            | Mnemonic::Andps
+            | Mnemonic::Andpd
+            | Mnemonic::Pand
+            | Mnemonic::Andnps
+            | Mnemonic::Andnpd
+            | Mnemonic::Pandn
+            | Mnemonic::Orps
+            | Mnemonic::Orpd
+            | Mnemonic::Por
+            | Mnemonic::Pshufd
+            | Mnemonic::Pshuflw
+            | Mnemonic::Pshufhw
+            | Mnemonic::Shufps
+            | Mnemonic::Shufpd
+            | Mnemonic::Punpcklbw
+            | Mnemonic::Punpcklwd
+            | Mnemonic::Punpckldq
+            | Mnemonic::Punpcklqdq
+            | Mnemonic::Punpckhbw
+            | Mnemonic::Punpckhwd
+            | Mnemonic::Punpckhdq
+            | Mnemonic::Punpckhqdq
+            | Mnemonic::Movntdq
+            | Mnemonic::Movntps
+            | Mnemonic::Movntq
+            | Mnemonic::Movnti
+            | Mnemonic::Pcmpeqb
+            | Mnemonic::Pcmpeqw
+            | Mnemonic::Pcmpeqd
+            | Mnemonic::Pcmpeqq
+            | Mnemonic::Psllw
+            | Mnemonic::Pslld
+            | Mnemonic::Psllq
+            | Mnemonic::Psrlw
+            | Mnemonic::Psrld
+            | Mnemonic::Psrlq
+            | Mnemonic::Pslldq
+            | Mnemonic::Psrldq
+            | Mnemonic::Cvtsi2sd
+            | Mnemonic::Cvtsi2ss
+            | Mnemonic::Cvttsd2si
+            | Mnemonic::Cvttss2si
+            | Mnemonic::Emms
+            | Mnemonic::Femms => sse::sse_op(self, instruction),
+            Mnemonic::Movsd
+                if is_xmm_register(instruction.op0_register())
+                    || is_xmm_register(instruction.op1_register()) =>
+            {
+                sse::sse_op(self, instruction)
+            }
+            Mnemonic::Cmovo
+            | Mnemonic::Cmovno
+            | Mnemonic::Cmovb
+            | Mnemonic::Cmovae
+            | Mnemonic::Cmove
+            | Mnemonic::Cmovne
+            | Mnemonic::Cmovbe
+            | Mnemonic::Cmova
+            | Mnemonic::Cmovs
+            | Mnemonic::Cmovns
+            | Mnemonic::Cmovp
+            | Mnemonic::Cmovnp
+            | Mnemonic::Cmovl
+            | Mnemonic::Cmovge
+            | Mnemonic::Cmovle
+            | Mnemonic::Cmovg => branch::cmovcc(self, instruction),
             Mnemonic::Movsb
             | Mnemonic::Movsw
             | Mnemonic::Movsd
@@ -295,6 +405,32 @@ impl Cpu {
             | Mnemonic::Int3
             | Mnemonic::Into
             | Mnemonic::Bound => system::system_op(self, instruction),
+            Mnemonic::Bswap
+            | Mnemonic::Popcnt
+            | Mnemonic::Ud2
+            | Mnemonic::Rdrand
+            | Mnemonic::Rdseed
+            | Mnemonic::Prefetcht0
+            | Mnemonic::Prefetcht1
+            | Mnemonic::Prefetcht2
+            | Mnemonic::Prefetchnta
+            | Mnemonic::Clflush
+            | Mnemonic::Clflushopt
+            | Mnemonic::Fxsave
+            | Mnemonic::Fxrstor
+            | Mnemonic::Fninit
+            | Mnemonic::Fnstcw
+            | Mnemonic::Fldcw
+            | Mnemonic::Fnstsw
+            | Mnemonic::Fnclex
+            | Mnemonic::Wait
+            | Mnemonic::Shld
+            | Mnemonic::Shrd
+            | Mnemonic::Swapgs
+            | Mnemonic::Xgetbv
+            | Mnemonic::Xsetbv
+            | Mnemonic::Endbr64
+            | Mnemonic::Endbr32 => system::extra_op(self, instruction),
             _ => Err(CpuError::UnimplementedInstruction {
                 code: format!("{mnemonic:?}"),
                 address: self.regs.rip,
@@ -318,6 +454,9 @@ impl Cpu {
 
     /// Computes the effective linear address for a memory operand.
     pub fn effective_address(&self, instruction: &Instruction, _operand: u32) -> u64 {
+        if instruction.is_ip_rel_memory_operand() {
+            return instruction.ip_rel_memory_address();
+        }
         let base = instruction.memory_base();
         let index = instruction.memory_index();
         let scale = instruction.memory_index_scale();
@@ -608,7 +747,7 @@ impl Cpu {
         Ok(value)
     }
 
-    fn pop64(&mut self) -> Result<u64, CpuError> {
+    pub fn pop64(&mut self) -> Result<u64, CpuError> {
         let physical = self.translate(self.regs.gpr[index::RSP], AccessKind::Read)?;
         let value = self.memory.read_u64(physical)?;
         self.regs.gpr[index::RSP] = self.regs.gpr[index::RSP].wrapping_add(8);
@@ -697,6 +836,28 @@ impl Cpu {
 struct Gate {
     selector: SegmentSelector,
     offset: u64,
+}
+
+fn is_xmm_register(register: Register) -> bool {
+    matches!(
+        register,
+        Register::XMM0
+            | Register::XMM1
+            | Register::XMM2
+            | Register::XMM3
+            | Register::XMM4
+            | Register::XMM5
+            | Register::XMM6
+            | Register::XMM7
+            | Register::XMM8
+            | Register::XMM9
+            | Register::XMM10
+            | Register::XMM11
+            | Register::XMM12
+            | Register::XMM13
+            | Register::XMM14
+            | Register::XMM15
+    )
 }
 
 fn is_control_register(register: Register) -> bool {

@@ -3,7 +3,7 @@
 use iced_x86::{Instruction, Mnemonic, OpKind, Register};
 
 use crate::arch::registers::{CpuMode, RFlags, index};
-use crate::ops::{read_register, write_register};
+use crate::ops::{operand_size, read_register, write_register};
 use crate::{CpuError, cpu::Cpu};
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -28,23 +28,22 @@ enum Condition {
 
 fn condition_of(mnemonic: Mnemonic) -> Option<Condition> {
     Some(match mnemonic {
-        Mnemonic::Jo => Condition::O,
-        Mnemonic::Jno | Mnemonic::Setno => Condition::No,
-        Mnemonic::Jb | Mnemonic::Setb => Condition::B,
-        Mnemonic::Jae | Mnemonic::Setae => Condition::Ae,
-        Mnemonic::Je | Mnemonic::Sete => Condition::E,
-        Mnemonic::Jne | Mnemonic::Setne => Condition::Ne,
-        Mnemonic::Jbe | Mnemonic::Setbe => Condition::Be,
-        Mnemonic::Ja | Mnemonic::Seta => Condition::A,
-        Mnemonic::Js | Mnemonic::Sets => Condition::S,
-        Mnemonic::Jns | Mnemonic::Setns => Condition::Ns,
-        Mnemonic::Jp | Mnemonic::Setp => Condition::P,
-        Mnemonic::Jnp | Mnemonic::Setnp => Condition::Np,
-        Mnemonic::Jl | Mnemonic::Setl => Condition::L,
-        Mnemonic::Jge | Mnemonic::Setge => Condition::Ge,
-        Mnemonic::Jle | Mnemonic::Setle => Condition::Le,
-        Mnemonic::Jg | Mnemonic::Setg => Condition::G,
-        Mnemonic::Seto => Condition::O,
+        Mnemonic::Jo | Mnemonic::Seto | Mnemonic::Cmovo => Condition::O,
+        Mnemonic::Jno | Mnemonic::Setno | Mnemonic::Cmovno => Condition::No,
+        Mnemonic::Jb | Mnemonic::Setb | Mnemonic::Cmovb => Condition::B,
+        Mnemonic::Jae | Mnemonic::Setae | Mnemonic::Cmovae => Condition::Ae,
+        Mnemonic::Je | Mnemonic::Sete | Mnemonic::Cmove => Condition::E,
+        Mnemonic::Jne | Mnemonic::Setne | Mnemonic::Cmovne => Condition::Ne,
+        Mnemonic::Jbe | Mnemonic::Setbe | Mnemonic::Cmovbe => Condition::Be,
+        Mnemonic::Ja | Mnemonic::Seta | Mnemonic::Cmova => Condition::A,
+        Mnemonic::Js | Mnemonic::Sets | Mnemonic::Cmovs => Condition::S,
+        Mnemonic::Jns | Mnemonic::Setns | Mnemonic::Cmovns => Condition::Ns,
+        Mnemonic::Jp | Mnemonic::Setp | Mnemonic::Cmovp => Condition::P,
+        Mnemonic::Jnp | Mnemonic::Setnp | Mnemonic::Cmovnp => Condition::Np,
+        Mnemonic::Jl | Mnemonic::Setl | Mnemonic::Cmovl => Condition::L,
+        Mnemonic::Jge | Mnemonic::Setge | Mnemonic::Cmovge => Condition::Ge,
+        Mnemonic::Jle | Mnemonic::Setle | Mnemonic::Cmovle => Condition::Le,
+        Mnemonic::Jg | Mnemonic::Setg | Mnemonic::Cmovg => Condition::G,
         _ => return None,
     })
 }
@@ -135,6 +134,33 @@ pub fn jump(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
     }
 }
 
+pub fn cmovcc(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
+    let condition =
+        condition_of(instruction.mnemonic()).expect("dispatch only routes condition codes here");
+    if condition_holds(condition, cpu.regs.rflags) {
+        let value = match instruction.op1_kind() {
+            OpKind::Memory => {
+                cpu.read_operand(instruction, 1, crate::ops::memory_size(instruction))?
+            }
+            _ => read_register(
+                &cpu.regs,
+                instruction.op1_register(),
+                operand_size(instruction, 1),
+            ),
+        };
+        if instruction.op0_kind() == OpKind::Memory {
+            cpu.write_operand(instruction, 0, crate::ops::memory_size(instruction), value)?;
+        } else {
+            write_register(
+                &mut cpu.regs,
+                instruction.op0_register(),
+                operand_size(instruction, 0),
+                value,
+            );
+        }
+    }
+    Ok(())
+}
 pub fn jcc(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
     let condition =
         condition_of(instruction.mnemonic()).expect("dispatch only routes condition codes here");
@@ -192,10 +218,15 @@ pub fn ret(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
     let far = matches!(
         instruction.op0_kind(),
         OpKind::FarBranch16 | OpKind::FarBranch32
-    );
+    ) || instruction.mnemonic() == Mnemonic::Retf;
     let target = cpu.pop_native()?;
     if far {
-        let selector = cpu.pop_native()? as u16;
+        // Long-mode RETF pops a 64-bit RIP slot and a 64-bit CS slot.
+        let selector = if cpu.regs.mode() == CpuMode::Long {
+            cpu.pop64()? as u16
+        } else {
+            cpu.pop_native()? as u16
+        };
         let segment = crate::arch::segments::SegmentSelector(selector);
         cpu.regs.cs = match cpu.regs.mode() {
             CpuMode::Real | CpuMode::Protected16 => {

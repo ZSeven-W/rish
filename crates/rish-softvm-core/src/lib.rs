@@ -7,12 +7,14 @@
 //! Alpine Linux guest inside iOS and Android apps.
 
 pub mod arch;
+pub mod boot;
 pub mod cpu;
 pub mod devices;
 mod error;
 pub mod memory;
 mod ops;
 
+pub use boot::bzimage;
 pub use cpu::{Cpu, register_index};
 pub use error::CpuError;
 pub use memory::Memory;

@@ -4,7 +4,9 @@ use iced_x86::{Instruction, Mnemonic, OpKind, Register};
 
 use crate::arch::registers::{Cr0, Cr4, Efer, index};
 use crate::arch::segments::SegmentSelector;
-use crate::ops::{operand_size, read_operand0, read_operand1, read_register, write_register};
+use crate::ops::{
+    operand_size, read_operand0, read_operand1, read_register, write_operand0, write_register,
+};
 use crate::{CpuError, cpu::Cpu};
 
 pub fn in_out(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
@@ -316,6 +318,176 @@ pub fn system_op(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuErro
     Ok(())
 }
 
+pub fn extra_op(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
+    match instruction.mnemonic() {
+        Mnemonic::Bswap => {
+            let size = operand_size(instruction, 0);
+            let value = read_operand0(cpu, instruction)?;
+            let swapped = match size {
+                4 => u64::from((value as u32).swap_bytes()),
+                8 => value.swap_bytes(),
+                _ => return Err(bad_op(cpu, instruction)),
+            };
+            write_operand0(cpu, instruction, swapped)?;
+        }
+        Mnemonic::Popcnt => {
+            let size = operand_size(instruction, 1);
+            let value = if instruction.op1_kind() == OpKind::Memory {
+                cpu.read_operand(instruction, 1, crate::ops::memory_size(instruction))?
+            } else {
+                read_register(&cpu.regs, instruction.op1_register(), size)
+            };
+            let count = value.count_ones();
+            cpu.regs
+                .rflags
+                .set(crate::arch::registers::RFlags::ZF, value == 0);
+            cpu.regs.rflags -= crate::arch::registers::RFlags::CF
+                - crate::arch::registers::RFlags::OF
+                - crate::arch::registers::RFlags::SF
+                - crate::arch::registers::RFlags::AF
+                - crate::arch::registers::RFlags::PF;
+            write_register(
+                &mut cpu.regs,
+                instruction.op0_register(),
+                size,
+                u64::from(count),
+            );
+        }
+        Mnemonic::Ud2 => cpu.raise(6, 0, false)?,
+        Mnemonic::Rdrand | Mnemonic::Rdseed => {
+            let size = operand_size(instruction, 0);
+            let value = cpu.tsc.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            cpu.regs.rflags |= crate::arch::registers::RFlags::CF;
+            if instruction.op0_kind() == OpKind::Memory {
+                cpu.write_operand(instruction, 0, size, value)?;
+            } else {
+                write_register(&mut cpu.regs, instruction.op0_register(), size, value);
+            }
+        }
+        Mnemonic::Prefetcht0
+        | Mnemonic::Prefetcht1
+        | Mnemonic::Prefetcht2
+        | Mnemonic::Prefetchnta
+        | Mnemonic::Clflush
+        | Mnemonic::Clflushopt
+        | Mnemonic::Endbr64
+        | Mnemonic::Endbr32 => {}
+        Mnemonic::Fxsave => {
+            let linear = cpu.effective_address(instruction, 0);
+            let physical = cpu.translate(linear, crate::arch::paging::AccessKind::Write)?;
+            let mut region = [0_u8; 512];
+            region[0..2].copy_from_slice(&cpu.fpu_control_word.to_le_bytes());
+            region[2..4].copy_from_slice(&cpu.fpu_status_word.to_le_bytes());
+            region[4..6].copy_from_slice(&0xFFFF_u16.to_le_bytes());
+            region[24..28].copy_from_slice(&cpu.mxcsr.to_le_bytes());
+            cpu.memory.write(physical, &region)?;
+        }
+        Mnemonic::Fxrstor => {
+            let linear = cpu.effective_address(instruction, 0);
+            let physical = cpu.translate(linear, crate::arch::paging::AccessKind::Read)?;
+            let mut region = [0_u8; 512];
+            cpu.memory.read(physical, &mut region)?;
+            cpu.fpu_control_word = u16::from_le_bytes([region[0], region[1]]);
+            cpu.fpu_status_word = u16::from_le_bytes([region[2], region[3]]);
+            cpu.mxcsr = u32::from_le_bytes([region[24], region[25], region[26], region[27]]);
+        }
+        Mnemonic::Fninit => {
+            cpu.fpu_control_word = 0x037F;
+            cpu.fpu_status_word = 0;
+        }
+        Mnemonic::Fnstcw => {
+            let linear = cpu.effective_address(instruction, 0);
+            let physical = cpu.translate(linear, crate::arch::paging::AccessKind::Write)?;
+            cpu.memory.write_u16(physical, cpu.fpu_control_word)?;
+        }
+        Mnemonic::Fldcw => {
+            let linear = cpu.effective_address(instruction, 0);
+            let physical = cpu.translate(linear, crate::arch::paging::AccessKind::Read)?;
+            cpu.fpu_control_word = cpu.memory.read_u16(physical)?;
+        }
+        Mnemonic::Fnstsw => {
+            if instruction.op0_kind() == OpKind::Memory {
+                let linear = cpu.effective_address(instruction, 0);
+                let physical = cpu.translate(linear, crate::arch::paging::AccessKind::Write)?;
+                cpu.memory.write_u16(physical, cpu.fpu_status_word)?;
+            } else {
+                write_register(
+                    &mut cpu.regs,
+                    Register::AX,
+                    2,
+                    u64::from(cpu.fpu_status_word),
+                );
+            }
+        }
+        Mnemonic::Fnclex => cpu.fpu_status_word &= !0xFF,
+        Mnemonic::Wait => {}
+        Mnemonic::Shld | Mnemonic::Shrd => {
+            shld_shrd(cpu, instruction)?;
+        }
+        Mnemonic::Swapgs => {
+            std::mem::swap(&mut cpu.regs.gs.base, &mut cpu.kernel_gs_base);
+        }
+        Mnemonic::Xgetbv => {
+            let index = read_register(&cpu.regs, Register::ECX, 4) as u32;
+            let value = if index == 0 { cpu.xcr0 } else { 0 };
+            write_register(&mut cpu.regs, Register::EAX, 4, value & 0xFFFF_FFFF);
+            write_register(&mut cpu.regs, Register::EDX, 4, value >> 32);
+        }
+        Mnemonic::Xsetbv => {
+            let index = read_register(&cpu.regs, Register::ECX, 4) as u32;
+            if index == 0 {
+                let value = read_register(&cpu.regs, Register::EAX, 4)
+                    | read_register(&cpu.regs, Register::EDX, 4) << 32;
+                cpu.xcr0 = value & 0x7;
+            }
+        }
+        _ => return Err(bad_op(cpu, instruction)),
+    }
+    Ok(())
+}
+
+fn shld_shrd(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
+    let size = operand_size(instruction, 0);
+    let destination = read_operand0(cpu, instruction)?;
+    let source = read_register(&cpu.regs, instruction.op1_register(), size);
+    let count = match instruction.op2_kind() {
+        OpKind::Immediate8 => instruction.immediate(2) & 0x3F,
+        _ => read_register(&cpu.regs, Register::CL, 1) & 0x3F,
+    };
+    let bits = u32::from(size) * 8;
+    let result = if instruction.mnemonic() == Mnemonic::Shld {
+        if count >= u64::from(bits) {
+            u64::MAX
+        } else {
+            (destination << count) | (source >> (bits - count as u32))
+        }
+    } else if count >= u64::from(bits) {
+        0
+    } else {
+        (destination >> count) | (source << (bits - count as u32))
+    };
+    let mask = crate::ops::bits_mask(bits);
+    let result = result & mask;
+    crate::ops::set_szp(&mut cpu.regs, result, bits);
+    if count == 1 {
+        let msb = destination & (1_u64 << (bits - 1)) != 0;
+        cpu.regs.rflags.set(crate::arch::registers::RFlags::CF, msb);
+        let new_msb = (result >> (bits - 1)) & 1 != 0;
+        cpu.regs
+            .rflags
+            .set(crate::arch::registers::RFlags::OF, msb != new_msb);
+    }
+    write_operand0(cpu, instruction, result)?;
+    Ok(())
+}
+
+fn bad_op(cpu: &Cpu, instruction: &Instruction) -> CpuError {
+    CpuError::UnimplementedInstruction {
+        code: format!("{:?}", instruction.mnemonic()),
+        address: cpu.regs.rip,
+        bytes: Vec::new(),
+    }
+}
 fn is_control_register(register: Register) -> bool {
     matches!(
         register,

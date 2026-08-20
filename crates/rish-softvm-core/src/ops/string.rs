@@ -19,9 +19,16 @@ pub fn string_op(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuErro
     let repe = instruction.has_repe_prefix();
     let repne = instruction.has_repne_prefix();
     if rep || repe || repne {
-        count = match size {
-            1 => read_register(&cpu.regs, Register::RCX, 8) & 0xFF,
-            _ => read_register(&cpu.regs, Register::RCX, 8),
+        // The count register is CX in 16-bit mode, ECX in 32-bit, RCX in 64-bit.
+        count = match cpu.regs.mode() {
+            crate::arch::registers::CpuMode::Real
+            | crate::arch::registers::CpuMode::Protected16 => {
+                read_register(&cpu.regs, Register::RCX, 8) & 0xFFFF
+            }
+            crate::arch::registers::CpuMode::Protected32 => {
+                read_register(&cpu.regs, Register::RCX, 8) & 0xFFFF_FFFF
+            }
+            crate::arch::registers::CpuMode::Long => read_register(&cpu.regs, Register::RCX, 8),
         };
     }
     match mnemonic {

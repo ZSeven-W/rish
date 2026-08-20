@@ -96,6 +96,11 @@ impl Pic8259 {
         self.inputs = lines.asserted;
     }
 
+    #[must_use]
+    pub fn initialized(&self) -> bool {
+        self.initialized
+    }
+
     pub fn master_mask(&self) -> u8 {
         self.master.mask
     }
