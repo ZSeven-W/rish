@@ -2,6 +2,7 @@
 
 use iced_x86::{Instruction, Mnemonic, OpKind, Register};
 
+use crate::arch::segments::SegmentSelector;
 use crate::ops::{
     memory_size, operand_size, read_operand0, read_operand1, read_register, write_operand0,
     write_register,
@@ -9,6 +10,26 @@ use crate::ops::{
 use crate::{CpuError, cpu::Cpu};
 
 pub fn mov(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
+    // Segment register moves: mov r/m16, Sreg and mov Sreg, r/m16.
+    if let Some(segment) = segment_register(instruction.op1_register()) {
+        let selector = u64::from(cpu.regs.segment_selector(segment));
+        write_operand0(cpu, instruction, selector)?;
+        return Ok(());
+    }
+    if let Some(segment) = segment_register(instruction.op0_register()) {
+        let selector = SegmentSelector(read_operand1(cpu, instruction)? as u16);
+        let loaded = cpu.load_segment_from_table(selector)?;
+        match segment {
+            Register::ES => cpu.regs.es = loaded,
+            Register::SS => cpu.regs.ss = loaded,
+            Register::DS => cpu.regs.ds = loaded,
+            Register::FS => cpu.regs.fs = loaded,
+            Register::GS => cpu.regs.gs = loaded,
+            Register::CS => return cpu.raise(13, 0, true),
+            _ => unreachable!("segment register"),
+        }
+        return Ok(());
+    }
     let code = instruction.code();
     // moffs forms: absolute address plus accumulator register.
     match code {
@@ -129,11 +150,6 @@ pub fn xadd(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
 }
 
 pub fn cmpxchg(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
-    if instruction.op0_kind() == OpKind::Memory
-        && matches!(crate::ops::memory_size(instruction), 8 | 16)
-    {
-        return cmpxchg8b(cpu, instruction);
-    }
     let size = operand_size(instruction, 0);
     let accumulator = match size {
         1 => read_register(&cpu.regs, Register::AL, 1),
@@ -156,7 +172,7 @@ pub fn cmpxchg(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError>
     Ok(())
 }
 
-fn cmpxchg8b(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
+pub fn cmpxchg8b(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
     let wide = crate::ops::memory_size(instruction) == 16;
     let (low, high) = if wide {
         (
@@ -228,6 +244,15 @@ pub fn xlatb(cpu: &mut Cpu, _instruction: &Instruction) -> Result<(), CpuError> 
     Ok(())
 }
 
+fn segment_register(register: Register) -> Option<Register> {
+    match register {
+        Register::ES | Register::CS | Register::SS | Register::DS | Register::FS | Register::GS => {
+            Some(register)
+        }
+        _ => None,
+    }
+}
+
 fn read_accumulator(regs: &crate::arch::registers::Registers, size: u8) -> u64 {
     match size {
         1 => read_register(regs, Register::AL, 1),
@@ -243,5 +268,63 @@ fn write_accumulator(regs: &mut crate::arch::registers::Registers, size: u8, val
         2 => write_register(regs, Register::AX, 2, value),
         4 => write_register(regs, Register::EAX, 4, value),
         _ => write_register(regs, Register::RAX, 8, value),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arch::registers::index;
+
+    fn cpu() -> Cpu {
+        Cpu::new(1, 0).unwrap()
+    }
+
+    fn run(cpu: &mut Cpu, bytes: &[u8]) -> Result<(), CpuError> {
+        cpu.memory.write(0x1000, bytes).unwrap();
+        cpu.regs.rip = 0x1000;
+        cpu.regs.efer |= crate::arch::registers::Efer::LMA;
+        cpu.regs.cs = crate::arch::segments::SegmentRegister {
+            base: 0,
+            long_mode: true,
+            default_32: false,
+            code: true,
+            limit: u32::MAX,
+            granularity: true,
+            writable_or_readable: true,
+            ..Default::default()
+        };
+        let instruction = {
+            let mut decoder =
+                iced_x86::Decoder::with_ip(64, bytes, 0x1000, iced_x86::DecoderOptions::NONE);
+            decoder.decode()
+        };
+        cpu.regs.rip = 0x1000 + instruction.len() as u64;
+        cpu.dispatch(&instruction)
+    }
+
+    #[test]
+    fn cmpxchg_64_bit_memory_form_swaps_on_match() {
+        let mut cpu = cpu();
+        cpu.regs.set_gpr(index::RBX, 0x6000);
+        cpu.regs.set_gpr(index::RDX, 0xDEAD_BEEF_CAFE_F00D);
+        cpu.memory.write_u64(0x6000, 0).unwrap();
+        run(&mut cpu, &[0xF0, 0x48, 0x0F, 0xB1, 0x13]).unwrap(); // lock cmpxchg [rbx], rdx
+        assert_eq!(cpu.memory.read_u64(0x6000).unwrap(), 0xDEAD_BEEF_CAFE_F00D);
+        assert!(cpu.regs.rflags.contains(crate::arch::registers::RFlags::ZF));
+        assert_eq!(cpu.regs.gpr(index::RDX), 0xDEAD_BEEF_CAFE_F00D);
+    }
+
+    #[test]
+    fn cmpxchg_64_bit_memory_form_loads_old_on_mismatch() {
+        let mut cpu = cpu();
+        cpu.regs.set_gpr(index::RBX, 0x6000);
+        cpu.regs.set_gpr(index::RDX, 0xCAFE);
+        cpu.memory.write_u64(0x6000, 0x1234).unwrap();
+        run(&mut cpu, &[0xF0, 0x48, 0x0F, 0xB1, 0x13]).unwrap(); // lock cmpxchg [rbx], rdx
+        assert_eq!(cpu.memory.read_u64(0x6000).unwrap(), 0x1234);
+        assert!(!cpu.regs.rflags.contains(crate::arch::registers::RFlags::ZF));
+        assert_eq!(cpu.regs.gpr(index::RAX), 0x1234);
+        assert_eq!(cpu.regs.gpr(index::RDX), 0xCAFE);
     }
 }

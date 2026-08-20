@@ -40,7 +40,14 @@ pub fn in_out(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> 
     Ok(())
 }
 pub fn hlt(cpu: &mut Cpu, _instruction: &Instruction) -> Result<(), CpuError> {
-    cpu.halted = true;
+    if cpu.regs.rflags.contains(crate::arch::registers::RFlags::IF) {
+        // Interrupts enabled: this is the idle loop. Stop retiring
+        // instructions until an interrupt is deliverable.
+        cpu.waiting_for_interrupt = true;
+    } else {
+        // Interrupts disabled: a deliberate halt (panic/machine_halt).
+        cpu.halted = true;
+    }
     Ok(())
 }
 
@@ -57,11 +64,12 @@ pub fn cpuid(cpu: &mut Cpu, _instruction: &Instruction) -> Result<(), CpuError> 
 
 fn cpuid_leaf(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
     match leaf {
+        // The vendor string is returned in EBX, EDX, ECX order.
         0x0000_0000 => (
             0x0000_0016,
             u32::from_le_bytes(*b"Genu"),
-            u32::from_le_bytes(*b"ineI"),
             u32::from_le_bytes(*b"ntel"),
+            u32::from_le_bytes(*b"ineI"),
         ),
         0x0000_0001 => {
             // Family 6 model 158, no hyperthreads exposed; conservative but

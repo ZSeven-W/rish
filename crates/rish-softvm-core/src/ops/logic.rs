@@ -131,9 +131,12 @@ pub fn shift_rotate(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuE
 pub fn bit_scan_test(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
     let mnemonic = instruction.mnemonic();
     let size = operand_size(instruction, 0);
-    // BSF/BSR take the searched value in operand 1; BTS/BTR/BTC operate
-    // on the destination (operand 0).
-    let source = if matches!(mnemonic, Mnemonic::Bsf | Mnemonic::Bsr) {
+    // BSF/BSR/TZCNT/LZCNT take the searched value in operand 1; BTS/BTR/
+    // BTC operate on the destination (operand 0).
+    let source = if matches!(
+        mnemonic,
+        Mnemonic::Bsf | Mnemonic::Bsr | Mnemonic::Tzcnt | Mnemonic::Lzcnt
+    ) {
         read_operand1(cpu, instruction)?
     } else {
         read_operand0(cpu, instruction)?
@@ -166,6 +169,48 @@ pub fn bit_scan_test(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), Cpu
                 size,
                 u64::from(index),
             );
+        }
+        Mnemonic::Tzcnt => {
+            let bits = u64::from(size) * 8;
+            let mask = if bits >= 64 {
+                u64::MAX
+            } else {
+                (1_u64 << bits) - 1
+            };
+            let masked = source & mask;
+            let index = if masked == 0 {
+                bits
+            } else {
+                u64::from(masked.trailing_zeros())
+            };
+            cpu.regs
+                .rflags
+                .set(crate::arch::registers::RFlags::CF, source == 0);
+            cpu.regs
+                .rflags
+                .set(crate::arch::registers::RFlags::ZF, index == 0);
+            write_register(&mut cpu.regs, instruction.op0_register(), size, index);
+        }
+        Mnemonic::Lzcnt => {
+            let bits = u64::from(size) * 8;
+            let mask = if bits >= 64 {
+                u64::MAX
+            } else {
+                (1_u64 << bits) - 1
+            };
+            let masked = source & mask;
+            let index = if masked == 0 {
+                bits
+            } else {
+                u64::from(masked.leading_zeros()) - (64 - bits)
+            };
+            cpu.regs
+                .rflags
+                .set(crate::arch::registers::RFlags::CF, source == 0);
+            cpu.regs
+                .rflags
+                .set(crate::arch::registers::RFlags::ZF, index == 0);
+            write_register(&mut cpu.regs, instruction.op0_register(), size, index);
         }
         _ => {
             let bit = match instruction.op1_kind() {

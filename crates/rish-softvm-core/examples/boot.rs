@@ -156,7 +156,7 @@ fn run() -> Result<u8, String> {
     let mut last_checkpoint = cpu.regs.instructions_retired;
     let mut watch_prev = [0_u8; 16];
     let _ = cpu.memory.read(0x35bd000, &mut watch_prev);
-    let mut watch_addrs: [(&str, u64, [u8; 8]); 8] = [
+    let mut watch_addrs: [(&str, u64, [u8; 8]); 10] = [
         ("top_level_pgt", 0x35e3000, [0; 8]),
         ("info0", 0x35df020, [0; 8]),
         ("info8", 0x35df028, [0; 8]),
@@ -165,6 +165,8 @@ fn run() -> Result<u8, String> {
         ("free_mem_end_ptr", 0x35cd408, [0; 8]),
         ("free_mem_ptr", 0x35cd410, [0; 8]),
         ("malloc_ptr", 0x35de458, [0; 8]),
+        ("kernel_global_2a40010", 0x2a40010, [0; 8]),
+        ("early_pml4_0x111", 0x30e8888, [0; 8]),
     ];
     for slot in watch_addrs.iter_mut() {
         let _ = cpu.memory.read(slot.1, &mut slot.2);

@@ -56,6 +56,9 @@ pub struct Cpu {
     pending_interrupts: VecDeque<Deliverable>,
     in_exception: bool,
     translation_cache: std::cell::RefCell<Vec<(u64, u64, u64)>>,
+    /// Set by hlt with IF=1 (the idle loop): the CPU retires no instructions
+    /// until an interrupt is deliverable.
+    pub waiting_for_interrupt: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -107,6 +110,7 @@ impl Cpu {
                 (0, u64::MAX, 0);
                 TRANSLATION_CACHE_ENTRIES
             ]),
+            waiting_for_interrupt: false,
         })
     }
 
@@ -116,6 +120,18 @@ impl Cpu {
             return Err(CpuError::Halted);
         }
         self.deliver_pending()?;
+        if self.waiting_for_interrupt {
+            // hlt with interrupts enabled: the CPU is asleep. Advance the
+            // clock sources so the timer can eventually fire, and keep
+            // serial lines fresh for the wake-up interrupt.
+            self.memory.lapic_tick();
+            if self.pit.advance(10) {
+                self.lines.assert(0);
+            }
+            self.refresh_serial_lines();
+            self.pic.set_input(self.lines);
+            return Ok(());
+        }
         self.execute_one()?;
         self.regs.instructions_retired = self.regs.instructions_retired.saturating_add(1);
         self.tsc = self.tsc.saturating_add(1);
@@ -124,6 +140,12 @@ impl Cpu {
         if self.pit.advance(10) {
             self.lines.assert(0);
         }
+        self.refresh_serial_lines();
+        self.pic.set_input(self.lines);
+        Ok(())
+    }
+
+    fn refresh_serial_lines(&mut self) {
         // 16550 receive interrupts follow the buffered input state. Assert
         // the line while the receive interrupt is enabled and data is
         // pending, so the guest control protocol can run IRQ-driven.
@@ -137,8 +159,6 @@ impl Cpu {
         } else {
             self.lines.deassert(self.uart_control.irq_line());
         }
-        self.pic.set_input(self.lines);
-        Ok(())
     }
 
     /// Runs up to the given number of instructions, returning how many ran.
@@ -264,6 +284,7 @@ impl Cpu {
             Mnemonic::Xchg => data::xchg(self, instruction),
             Mnemonic::Xadd => data::xadd(self, instruction),
             Mnemonic::Cmpxchg => data::cmpxchg(self, instruction),
+            Mnemonic::Cmpxchg8b | Mnemonic::Cmpxchg16b => data::cmpxchg8b(self, instruction),
             Mnemonic::Xlatb => data::xlatb(self, instruction),
             Mnemonic::Add => arithmetic::add(self, instruction),
             Mnemonic::Sub => arithmetic::sub(self, instruction),
@@ -292,6 +313,8 @@ impl Cpu {
             | Mnemonic::Rcr => logic::shift_rotate(self, instruction),
             Mnemonic::Bsf
             | Mnemonic::Bsr
+            | Mnemonic::Tzcnt
+            | Mnemonic::Lzcnt
             | Mnemonic::Bt
             | Mnemonic::Bts
             | Mnemonic::Btr
@@ -706,6 +729,7 @@ impl Cpu {
                 let vector = self.pic.acknowledge(irq);
                 let handler = self.idt_gate(vector)?;
                 self.transfer_to_gate(handler, 0, false, false)?;
+                self.waiting_for_interrupt = false;
                 return Ok(());
             }
         }
@@ -718,12 +742,14 @@ impl Cpu {
                 drop(queue);
                 let handler = self.idt_gate(vector)?;
                 self.transfer_to_gate(handler, 0, false, false)?;
+                self.waiting_for_interrupt = false;
                 return Ok(());
             }
         }
         if let Some(item) = self.pending_interrupts.pop_front() {
             let handler = self.idt_gate(item.vector)?;
             self.transfer_to_gate(handler, item.error_code, item.has_error_code, false)?;
+            self.waiting_for_interrupt = false;
         }
         Ok(())
     }

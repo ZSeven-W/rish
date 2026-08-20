@@ -246,19 +246,40 @@ impl Registers {
         }
     }
 
+    /// Visible selector of a segment register.
+    #[inline]
+    #[must_use]
+    pub fn segment_selector(&self, segment: iced_x86::Register) -> u16 {
+        match segment {
+            iced_x86::Register::ES => self.es.selector.0,
+            iced_x86::Register::CS => self.cs.selector.0,
+            iced_x86::Register::SS => self.ss.selector.0,
+            iced_x86::Register::DS => self.ds.selector.0,
+            iced_x86::Register::FS => self.fs.selector.0,
+            iced_x86::Register::GS => self.gs.selector.0,
+            _ => 0,
+        }
+    }
+
     /// Effective data segment base for a segment override, if any.
+    ///
+    /// In long mode DS/ES/SS bases are forced to zero, but FS and GS keep
+    /// their per-cpu bases (set through WRMSR or SWAPGS).
     #[inline]
     #[must_use]
     pub fn data_base(&self, segment: iced_x86::Register) -> u64 {
-        let segment = match segment {
-            iced_x86::Register::ES => &self.es,
-            iced_x86::Register::FS => &self.fs,
-            iced_x86::Register::GS => &self.gs,
-            _ => &self.ds,
-        };
         match self.mode() {
-            CpuMode::Long => 0,
-            _ => segment.base,
+            CpuMode::Long => match segment {
+                iced_x86::Register::FS => self.fs.base,
+                iced_x86::Register::GS => self.gs.base,
+                _ => 0,
+            },
+            _ => match segment {
+                iced_x86::Register::ES => self.es.base,
+                iced_x86::Register::FS => self.fs.base,
+                iced_x86::Register::GS => self.gs.base,
+                _ => self.ds.base,
+            },
         }
     }
 
