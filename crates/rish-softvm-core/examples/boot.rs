@@ -217,6 +217,12 @@ fn report_gap(error: &CpuError, cpu: &Cpu, console: &[u8]) {
     walk_tables(cpu, 0xcbad95c);
     println!("page walk for linear 0x100000:");
     walk_tables(cpu, 0x100000);
+    println!("page walk for linear 0x35c05bb:");
+    walk_tables(cpu, 0x35c05bb);
+    println!("memory at PD page 0x35e5000:");
+    dump_region(cpu, 0x35e5000, 0x120);
+    println!("memory at PDPT page 0x35e4000:");
+    dump_region(cpu, 0x35e4000, 0x40);
     println!("scanning for decompressed image:");
     println!("scanning for decompressed image:");
     scan_memory(cpu, b"\x7fELF");

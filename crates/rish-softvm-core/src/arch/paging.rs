@@ -58,12 +58,12 @@ pub fn translate(
     walk_2_level(memory, cr3, cr4, efer, reserved, linear, kind)
 }
 
-fn reserved_mask(efer: Efer) -> u64 {
-    if efer.contains(Efer::NXE) {
-        !TABLE_MASK & !0xFFF & !PAGE_NX
-    } else {
-        !TABLE_MASK & !0xFFF
-    }
+fn reserved_mask(_efer: Efer) -> u64 {
+    // Bits above the physical-address width (MAXPHYADDR) are available to
+    // software: Linux sets software bits 52-62 in entries, e.g. bit 58 in
+    // the PML4 entries built by kernel_ident_mapping_init. Treating them as
+    // reserved breaks the first CR3 switch, so stay permissive.
+    0
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -403,5 +403,35 @@ mod tests {
         )
         .unwrap();
         assert_eq!(physical, 0x5000);
+    }
+
+    #[test]
+    fn entry_with_software_bit_58_walks_fine() {
+        let mut memory = Memory::new(64).unwrap();
+        // PML4[0] = PDPT@0x1000 with Linux software bit 58 set.
+        memory
+            .write_u64(0x0000, 0x4000_0000_0000_1000 | PAGE_PRESENT | PAGE_WRITABLE)
+            .unwrap();
+        // PDPT[0] -> PD@0x2000; PD[0] = 2 MiB large page at phys 0x200000.
+        memory
+            .write_u64(0x1000, 0x2000 | PAGE_PRESENT | PAGE_WRITABLE)
+            .unwrap();
+        memory
+            .write_u64(
+                0x2000,
+                0x200000 | PAGE_PRESENT | PAGE_WRITABLE | PAGE_LARGE,
+            )
+            .unwrap();
+        let physical = translate(
+            &memory,
+            0,
+            Cr0::PG,
+            Cr4::PAE | Cr4::PSE,
+            Efer::LMA | Efer::NXE,
+            0xABC,
+            AccessKind::Read,
+        )
+        .unwrap();
+        assert_eq!(physical, 0x200ABC);
     }
 }
