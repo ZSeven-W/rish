@@ -12,6 +12,8 @@ use crate::devices::lapic::{LAPIC_BASE, LAPIC_SIZE, LocalApic};
 pub struct Memory {
     ram: Box<[u8]>,
     lapic: Option<RefCell<LocalApic>>,
+    /// Bumped on every write so translation caches can invalidate cheaply.
+    generation: u64,
 }
 
 impl Memory {
@@ -27,7 +29,15 @@ impl Memory {
         Ok(Self {
             ram: vec![0; bytes].into_boxed_slice(),
             lapic: None,
+            generation: 0,
         })
+    }
+
+    /// Write generation, for translation-cache invalidation.
+    #[inline]
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     #[inline]
@@ -122,6 +132,7 @@ impl Memory {
         }
         let start = address as usize;
         self.ram[start..start + input.len()].copy_from_slice(input);
+        self.generation = self.generation.wrapping_add(1);
         Ok(())
     }
 

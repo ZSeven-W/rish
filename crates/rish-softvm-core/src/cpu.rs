@@ -14,6 +14,12 @@ use crate::{CpuError, Memory};
 
 const MAX_INSTRUCTION_BYTES: usize = 15;
 
+/// Direct-mapped per-page translation cache entries (power of two).
+const TRANSLATION_CACHE_ENTRIES: usize = 4096;
+
+/// Diagnostic switch: RISH_NO_TCACHE=1 disables the translation cache.
+static CACHE_DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 const VECTOR_DIVIDE: u8 = 0;
 const VECTOR_INVALID_OPCODE: u8 = 6;
 const VECTOR_DOUBLE_FAULT: u8 = 8;
@@ -49,6 +55,7 @@ pub struct Cpu {
     pub lapic_queue: Arc<std::sync::Mutex<VecDeque<u8>>>,
     pending_interrupts: VecDeque<Deliverable>,
     in_exception: bool,
+    translation_cache: std::cell::RefCell<Vec<(u64, u64, u64)>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -60,6 +67,12 @@ struct Deliverable {
 
 impl Cpu {
     pub fn new(memory_mib: usize, boot_epoch_seconds: u64) -> Result<Self, CpuError> {
+        let _ = CACHE_DISABLED.compare_exchange(
+            false,
+            std::env::var_os("RISH_NO_TCACHE").is_some(),
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let mut memory = Memory::new(memory_mib)?;
         let lapic_queue = Arc::new(std::sync::Mutex::new(VecDeque::new()));
         memory.attach_lapic(Arc::clone(&lapic_queue));
@@ -90,6 +103,10 @@ impl Cpu {
             lapic_queue,
             pending_interrupts: VecDeque::new(),
             in_exception: false,
+            translation_cache: std::cell::RefCell::new(vec![
+                (0, u64::MAX, 0);
+                TRANSLATION_CACHE_ENTRIES
+            ]),
         })
     }
 
@@ -514,8 +531,39 @@ impl Cpu {
         }
     }
     /// Translates a linear address using the current mode and CR3.
+    ///
+    /// Successful page translations are cached per page, keyed by CR3 and
+    /// the linear page. Every guest memory write bumps the memory
+    /// generation, which invalidates stale entries (page-table updates are
+    /// always writes).
     pub fn translate(&self, linear: u64, kind: AccessKind) -> Result<u64, CpuError> {
-        translate(
+        if !self.regs.cr0.contains(crate::arch::registers::Cr0::PG) {
+            return Ok(linear);
+        }
+        if CACHE_DISABLED.load(std::sync::atomic::Ordering::Relaxed) {
+            return translate(
+                &self.memory,
+                self.regs.cr3,
+                self.regs.cr0,
+                self.regs.cr4,
+                self.regs.efer,
+                linear,
+                kind,
+            )
+            .map_err(|fault| CpuError::PageFault {
+                linear: fault.linear,
+                error_code: fault.error_code,
+            });
+        }
+        let key = self.regs.cr3 ^ (linear & !0xFFF);
+        let index = (key as usize >> 3) & (TRANSLATION_CACHE_ENTRIES - 1);
+        let cache = self.translation_cache.borrow();
+        let entry = cache[index];
+        if entry.0 == key && entry.1 == self.memory.generation() {
+            return Ok(entry.2 | (linear & 0xFFF));
+        }
+        drop(cache);
+        let physical = translate(
             &self.memory,
             self.regs.cr3,
             self.regs.cr0,
@@ -527,7 +575,10 @@ impl Cpu {
         .map_err(|fault| CpuError::PageFault {
             linear: fault.linear,
             error_code: fault.error_code,
-        })
+        })?;
+        let generation = self.memory.generation();
+        self.translation_cache.borrow_mut()[index] = (key, generation, physical & !0xFFF);
+        Ok(physical)
     }
 
     /// Computes the effective linear address for a memory operand.
