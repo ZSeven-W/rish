@@ -444,6 +444,30 @@ mod tests {
     }
 
     #[test]
+    fn idiv_signed_memory_operand_reads_32_bits() {
+        let mut cpu = cpu();
+        // [rsp+8] holds upa=1 with garbage in the upper 32 bits; the dword
+        // divisor must be 1, not the 8-byte value, or the division diverges.
+        cpu.memory.write_u64(0x8, 0xffff_ffff_0000_0001).unwrap();
+        cpu.regs.set_gpr(crate::arch::registers::index::RSP, 0);
+        cpu.regs.set_gpr(crate::arch::registers::index::RAX, 1);
+        cpu.regs.set_gpr(crate::arch::registers::index::RDX, 0);
+        // idiv dword ptr [rsp+8] (f7 7c 24 08): the BUG_ON(gi->nr_units % upa)
+        // division in pcpu_dump_alloc_info.
+        run(&mut cpu, 64, &[0xF7, 0x7C, 0x24, 0x08]).unwrap();
+        assert_eq!(
+            cpu.regs.gpr(crate::arch::registers::index::RAX),
+            1,
+            "quotient"
+        );
+        assert_eq!(
+            cpu.regs.gpr(crate::arch::registers::index::RDX),
+            0,
+            "remainder"
+        );
+    }
+
+    #[test]
     fn imul_register_form_reads_the_register() {
         let mut cpu = cpu();
         cpu.regs

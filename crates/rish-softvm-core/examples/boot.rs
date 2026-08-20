@@ -164,7 +164,7 @@ fn run() -> Result<u8, String> {
         ("pud_page", 0x35bf000, [0; 8]),
         ("free_mem_end_ptr", 0x35cd408, [0; 8]),
         ("free_mem_ptr", 0x35cd410, [0; 8]),
-        ("malloc_ptr", 0x35de458, [0; 8]),
+        ("prev_size_0", 0x3149e60, [0; 8]),
         ("kernel_global_2a40010", 0x2a40010, [0; 8]),
         ("early_pml4_0x111", 0x30e8888, [0; 8]),
         ("fixmap_table_0", 0x3149ea0, [0; 8]),
@@ -174,6 +174,11 @@ fn run() -> Result<u8, String> {
         let _ = cpu.memory.read(slot.1, &mut slot.2);
     }
     let mut last_region: Option<u64> = None;
+    // Targeted watch for the pcpu_dump_alloc_info stack local that holds
+    // upa: log every change once the kernel is running so the writer that
+    // clobbers it after the upa store can be identified by its rip.
+    let mut upa_slot_prev = [0_u8; 8];
+    let _ = cpu.memory.read(0x2a03d70, &mut upa_slot_prev);
     for _ in 0..options.steps {
         let mut watch_cur = [0_u8; 16];
         if cpu.memory.read(0x35bd000, &mut watch_cur).is_ok() && watch_cur != watch_prev {
@@ -197,6 +202,18 @@ fn run() -> Result<u8, String> {
                     cpu.regs.instructions_retired
                 );
                 slot.2 = cur;
+            }
+        }
+        if cpu.regs.rip >= 0xffff_ffff_8100_0000 {
+            let mut cur = [0_u8; 8];
+            if cpu.memory.read(0x2a03d70, &mut cur).is_ok() && cur != upa_slot_prev {
+                eprintln!(
+                    "watch: upa_stack_slot (0x2a03d70) changed to {} at rip={:#x} after {} instructions",
+                    hex(&cur),
+                    cpu.regs.rip,
+                    cpu.regs.instructions_retired
+                );
+                upa_slot_prev = cur;
             }
         }
         let region = if cpu.regs.rip < 0x1c0_0000 {

@@ -199,13 +199,16 @@ pub fn register_size(register: Register) -> u8 {
 
 pub fn memory_size(instruction: &Instruction) -> u8 {
     match instruction.memory_size() {
-        iced_x86::MemorySize::UInt8 => 1,
-        iced_x86::MemorySize::UInt16 => 2,
-        iced_x86::MemorySize::UInt32 => 4,
-        iced_x86::MemorySize::UInt64 => 8,
-        iced_x86::MemorySize::UInt128 => 16,
-        iced_x86::MemorySize::UInt256 => 32,
-        iced_x86::MemorySize::UInt512 => 64,
+        iced_x86::MemorySize::UInt8 | iced_x86::MemorySize::Int8 => 1,
+        iced_x86::MemorySize::UInt16 | iced_x86::MemorySize::Int16 => 2,
+        iced_x86::MemorySize::UInt32 | iced_x86::MemorySize::Int32 => 4,
+        iced_x86::MemorySize::UInt64 | iced_x86::MemorySize::Int64 => 8,
+        iced_x86::MemorySize::UInt128 | iced_x86::MemorySize::Int128 => 16,
+        iced_x86::MemorySize::UInt256 | iced_x86::MemorySize::Int256 => 32,
+        iced_x86::MemorySize::UInt512 | iced_x86::MemorySize::Int512 => 64,
+        // iced reports signed memory sizes (Int*) for idiv/imul memory
+        // operands; they are the same width as the unsigned forms and must
+        // not fall through to the 8-byte default.
         _ => 8,
     }
 }
