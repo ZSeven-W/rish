@@ -65,8 +65,10 @@ pub fn load(
     // zeroed and only the setup header (from offset 0x1f1) is loaded. The
     // real-mode boot sector and setup code must NOT be copied.
     let header_size = (setup_bytes as u64 - 0x1F1).min(0x100);
-    cpu.memory
-        .write(ZERO_PAGE_BASE + 0x1F1, &kernel_image[0x1F1..0x1F1 + header_size as usize])?;
+    cpu.memory.write(
+        ZERO_PAGE_BASE + 0x1F1,
+        &kernel_image[0x1F1..0x1F1 + header_size as usize],
+    )?;
     // Command line.
     let mut cmdline = params.command_line.as_bytes().to_vec();
     cmdline.push(0);

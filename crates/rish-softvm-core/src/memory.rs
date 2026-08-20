@@ -1,9 +1,13 @@
 //! Physical guest memory with bounds-checked access.
 
-use std::{cell::RefCell, collections::VecDeque, sync::{Arc, Mutex}};
+use std::{
+    cell::RefCell,
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+};
 
-use crate::devices::lapic::{LocalApic, LAPIC_BASE, LAPIC_SIZE};
 use crate::CpuError;
+use crate::devices::lapic::{LAPIC_BASE, LAPIC_SIZE, LocalApic};
 
 pub struct Memory {
     ram: Box<[u8]>,
@@ -62,7 +66,9 @@ impl Memory {
                 let first = output.len().min(4);
                 output[..first].copy_from_slice(&bytes[..first]);
                 if output.len() > 4 {
-                    let value2 = lapic.borrow_mut().read(offset + 4, (output.len() - 4) as u8);
+                    let value2 = lapic
+                        .borrow_mut()
+                        .read(offset + 4, (output.len() - 4) as u8);
                     let bytes2 = value2.to_le_bytes();
                     let rest = output.len() - 4;
                     output[4..].copy_from_slice(&bytes2[..rest]);

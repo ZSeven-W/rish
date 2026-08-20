@@ -297,7 +297,8 @@ mod tests {
     #[test]
     fn bts_imm8_sets_bit_58() {
         let mut cpu = cpu();
-        cpu.regs.set_gpr(crate::arch::registers::index::RSI, 0x35E_4063);
+        cpu.regs
+            .set_gpr(crate::arch::registers::index::RSI, 0x35E_4063);
         // bts rsi, 0x3a (48 0f ba ee 3a)
         run(&mut cpu, 64, &[0x48, 0x0F, 0xBA, 0xEE, 0x3A]).unwrap();
         assert_eq!(

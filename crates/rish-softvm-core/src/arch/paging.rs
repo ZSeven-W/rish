@@ -417,10 +417,7 @@ mod tests {
             .write_u64(0x1000, 0x2000 | PAGE_PRESENT | PAGE_WRITABLE)
             .unwrap();
         memory
-            .write_u64(
-                0x2000,
-                0x200000 | PAGE_PRESENT | PAGE_WRITABLE | PAGE_LARGE,
-            )
+            .write_u64(0x2000, 0x200000 | PAGE_PRESENT | PAGE_WRITABLE | PAGE_LARGE)
             .unwrap();
         let physical = translate(
             &memory,

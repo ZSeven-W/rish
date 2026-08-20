@@ -388,7 +388,8 @@ mod tests {
     #[test]
     fn cmp_does_not_modify_the_destination() {
         let mut cpu = cpu();
-        cpu.regs.set_gpr(crate::arch::registers::index::RBP, 0x1000000);
+        cpu.regs
+            .set_gpr(crate::arch::registers::index::RBP, 0x1000000);
         // 48 81 fd 00 00 00 01: cmp rbp, 0x1000000
         run(&mut cpu, 64, &[0x48, 0x81, 0xFD, 0x00, 0x00, 0x00, 0x01]).unwrap();
         assert_eq!(cpu.regs.gpr(crate::arch::registers::index::RBP), 0x1000000);
