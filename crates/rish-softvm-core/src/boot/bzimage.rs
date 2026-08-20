@@ -84,18 +84,19 @@ pub fn load(
         }
     }
 
-    // boot_params fields.
-    write_u8(cpu, 0x1F1 + 0x1E, 0xFF)?; // type_of_loader
+    // Runtime boot_params fields, at their absolute offsets in the zero
+    // page (boot.rst offsets are relative to the start of boot_params).
+    write_u8(cpu, ZERO_PAGE_BASE + 0x210, 0xFF)?; // type_of_loader
     let loadflags = LOADFLAG_LOADED_HIGH | LOADFLAG_KEEP_SEGMENTS | LOADFLAG_CAN_USE_HEAP;
-    write_u8(cpu, 0x1F1 + 0x1F, loadflags)?;
-    write_u16(cpu, 0x1F1 + 0x30, 0xFE00)?; // heap_end_ptr + ext_loader_ver
-    write_u32(cpu, 0x1F1 + 0x33, CMDLINE_BASE as u32)?; // cmd_line_ptr
-    write_u32(cpu, 0x1F1 + 0x26, initrd_image as u32)?; // ramdisk_image
-    write_u32(cpu, 0x1F1 + 0x2A, initrd_size)?; // ramdisk_size
+    write_u8(cpu, ZERO_PAGE_BASE + 0x211, loadflags)?;
+    write_u32(cpu, ZERO_PAGE_BASE + 0x218, initrd_image as u32)?; // ramdisk_image
+    write_u32(cpu, ZERO_PAGE_BASE + 0x21C, initrd_size)?; // ramdisk_size
+    write_u16(cpu, ZERO_PAGE_BASE + 0x224, 0xFE00)?; // heap_end_ptr + ext_loader_ver
+    write_u32(cpu, ZERO_PAGE_BASE + 0x228, CMDLINE_BASE as u32)?; // cmd_line_ptr
     let alt_mem_k = (params.memory_mib as u64)
         .saturating_mul(1024)
         .saturating_sub(1024);
-    write_u32(cpu, 0x1E0, alt_mem_k as u32)?; // alt_mem_k
+    write_u32(cpu, ZERO_PAGE_BASE + 0x1E0, alt_mem_k as u32)?; // alt_mem_k
 
     // E820 memory map.
     let ram_end = (params.memory_mib as u64) * 1024 * 1024;
@@ -105,9 +106,9 @@ pub fn load(
         (0x000F_0000, 0x0001_0000, 2),
         (0x0010_0000, ram_end - 0x0010_0000, 1),
     ];
-    write_u32(cpu, 0x2D0, entries.len() as u32)?;
+    write_u32(cpu, ZERO_PAGE_BASE + 0x2D0, entries.len() as u32)?;
     for (index, (base, size, kind)) in entries.iter().enumerate() {
-        let address = 0x2D4 + (index as u64) * 20;
+        let address = ZERO_PAGE_BASE + 0x2D4 + (index as u64) * 20;
         write_u64(cpu, address, *base)?;
         write_u64(cpu, address + 8, *size)?;
         write_u32(cpu, address + 16, *kind)?;
@@ -411,21 +412,24 @@ mod tests {
         assert_eq!(cpu.memory.read_u8(KERNEL_BASE).unwrap(), image[0x600]);
         // Initramfs copied to 256 MiB.
         assert_eq!(cpu.memory.read_u8(INITRD_BASE).unwrap(), 0xAB);
-        // hdr fields in memory.
-        assert_eq!(cpu.memory.read_u8(0x1F1 + 0x1E).unwrap(), 0xFF);
+        // Runtime boot_params fields at their absolute zero-page offsets.
+        assert_eq!(cpu.memory.read_u8(ZERO_PAGE_BASE + 0x210).unwrap(), 0xFF);
         assert_eq!(
-            cpu.memory.read_u32(0x1F1 + 0x33).unwrap(),
+            cpu.memory.read_u32(ZERO_PAGE_BASE + 0x228).unwrap(),
             CMDLINE_BASE as u32
         );
         assert_eq!(
-            cpu.memory.read_u32(0x1F1 + 0x26).unwrap(),
+            cpu.memory.read_u32(ZERO_PAGE_BASE + 0x218).unwrap(),
             INITRD_BASE as u32
         );
-        assert_eq!(cpu.memory.read_u32(0x1F1 + 0x2A).unwrap(), 16);
+        assert_eq!(cpu.memory.read_u32(ZERO_PAGE_BASE + 0x21C).unwrap(), 16);
         // E820 count and first entry.
-        assert_eq!(cpu.memory.read_u32(0x2D0).unwrap(), 4);
-        assert_eq!(cpu.memory.read_u64(0x2D4).unwrap(), 0);
-        assert_eq!(cpu.memory.read_u64(0x2DC).unwrap(), 0x9FC00);
+        assert_eq!(cpu.memory.read_u32(ZERO_PAGE_BASE + 0x2D0).unwrap(), 4);
+        assert_eq!(cpu.memory.read_u64(ZERO_PAGE_BASE + 0x2D4).unwrap(), 0);
+        assert_eq!(
+            cpu.memory.read_u64(ZERO_PAGE_BASE + 0x2DC).unwrap(),
+            0x9FC00
+        );
         // CPU state: long mode, paging, boot segments, entry point.
         assert_eq!(cpu.regs.mode(), crate::arch::registers::CpuMode::Long);
         assert!(cpu.regs.cr0.contains(Cr0::PG));
