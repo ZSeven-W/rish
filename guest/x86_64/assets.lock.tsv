@@ -4,4 +4,7 @@ alpine-vmlinuz-virt	required	vmlinuz-virt-6.18.35	12575744	1e6bf9027720c75c3ed0d
 alpine-kernel-config	required	config-6.18.35-0-virt	151801	bc34b9908e38508d9b98cbd2d1c6a7a13fc70b734cad4782de5b92d69b59cc77	https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/netboot-3.24.1/config-6.18.35-0-virt
 alpine-minirootfs	required	alpine-minirootfs-3.24.1-x86_64.tar.gz	3698422	41f73e3cf5fa919b8aa5ca6b30dc48f0da2720776d7423e2a7748211456fe081	https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/alpine-minirootfs-3.24.1-x86_64.tar.gz
 alpine-virt-iso	optional	alpine-virt-3.24.1-x86_64.iso	69206016	e73a6241bd5f3c5c2d4d38c02cc52c378c0415a7c888bd292066bf36e0f41a39	https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/alpine-virt-3.24.1-x86_64.iso
+alpine-modloop-virt	required	modloop-virt	22867968	78907e7cc812d555f08d4e1133d090cf11fa197370882adfe67b0a5986ccb3f9	https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/netboot-3.24.1/modloop-virt
+alpine-netboot-initramfs	required	initramfs-virt	9637032	6d80a739fedeeb6cd63e24dd208845e22199c41a5fb2054941ef61ec30264fa9	https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/netboot-3.24.1/initramfs-virt
+docker-moby-static	required	docker-29.7.2.tgz	85700518	803d433f226db4776e1768fd319fc6c6e4935a456acf84fcc0080818b854bc8f	https://download.docker.com/linux/static/stable/x86_64/docker-29.7.2.tgz
 

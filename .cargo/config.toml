@@ -1,0 +1,4 @@
+# Cross toolchain for the in-guest agent binary.
+# Hosts need the musl-cross toolchain (macOS: brew install filosottile/musl-cross/musl-cross).
+[target.x86_64-unknown-linux-musl]
+linker = "x86_64-linux-musl-gcc"

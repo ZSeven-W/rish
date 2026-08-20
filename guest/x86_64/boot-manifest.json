@@ -1,7 +1,7 @@
 {
   "schema": "org.rish.guest.boot-manifest",
-  "schema_version": 1,
-  "status": "diagnostic_boot_only",
+  "schema_version": 2,
+  "status": "docker_guest_diagnostic",
   "architecture": {
     "cpu": "x86_64",
     "oci_platform": "linux/amd64",
@@ -9,7 +9,7 @@
   },
   "machine": {
     "boot_protocol": "linux-x86-bzimage",
-    "minimum_memory_bytes": 268435456,
+    "minimum_memory_bytes": 1073741824,
     "vcpu_count": 1,
     "serial": {
       "model": "16550A",
@@ -19,14 +19,25 @@
       "data_bits": 8,
       "parity": "none",
       "stop_bits": 1
+    },
+    "control_serial": {
+      "model": "16550A",
+      "io_port": "0x2f8",
+      "irq": 3,
+      "baud": 115200,
+      "data_bits": 8,
+      "parity": "none",
+      "stop_bits": 1
     }
   },
   "boot": {
     "kernel": "out/downloads/vmlinuz-virt-6.18.35",
-    "initramfs": "out/rish-alpine-3.24.1-x86_64-initramfs.cpio",
+    "initramfs": "out/rish-alpine-3.24.1-x86_64-docker-initramfs.cpio",
     "command_line": "console=ttyS0,115200n8 rdinit=/init panic=-1 oops=panic nokaslr cgroup_no_v1=all",
     "expected_serial_marker": "RISH_X86_64_BOOT_OK",
-    "failure_serial_marker": "RISH_X86_64_BOOT_FAILED"
+    "failure_serial_marker": "RISH_X86_64_BOOT_FAILED",
+    "guest_agent_path": "/usr/bin/rish-guest-agent",
+    "control_serial_device": "ttyS1"
   },
   "artifacts": [
     {
@@ -48,29 +59,50 @@
       "sha256": "41f73e3cf5fa919b8aa5ca6b30dc48f0da2720776d7423e2a7748211456fe081"
     },
     {
-      "id": "rish-alpine-diagnostic-initramfs",
+      "id": "alpine-netboot-initramfs",
+      "kind": "boot_modules_source",
+      "size": 9637032,
+      "sha256": "6d80a739fedeeb6cd63e24dd208845e22199c41a5fb2054941ef61ec30264fa9"
+    },
+    {
+      "id": "alpine-modloop-virt",
+      "kind": "kernel_module_squashfs",
+      "size": 22867968,
+      "sha256": "78907e7cc812d555f08d4e1133d090cf11fa197370882adfe67b0a5986ccb3f9"
+    },
+    {
+      "id": "docker-moby-static",
+      "kind": "docker_static_toolchain",
+      "size": 85700518,
+      "sha256": "803d433f226db4776e1768fd319fc6c6e4935a456acf84fcc0080818b854bc8f"
+    },
+    {
+      "id": "rish-alpine-docker-initramfs",
       "kind": "derived_initramfs_newc",
-      "size": 8484864,
-      "sha256": "a92bf96c76dee0850db6662843d39bc52fe97762b6074f28b05ed6e01bf8b488"
+      "size": 285961728,
+      "sha256": "036d8f99f7cb8888df6a8311cebb5dcaea14d8f0f6cc31d007445a1f85571fc8"
     }
   ],
   "engine_requirements": [
     "Linux x86 bzImage boot protocol and boot_params",
     "initramfs placement below the kernel boot limit",
     "x86 reset, protected mode, paging, interrupts, and timers",
-    "one legacy 16550A serial port at I/O 0x3f8 with IRQ 4"
+    "one legacy 16550A serial port at I/O 0x3f8 with IRQ 4 for the console",
+    "one legacy 16550A serial port at I/O 0x2f8 with IRQ 3 for the guest control protocol"
   ],
   "capabilities": {
     "real_linux_kernel": true,
-    "interactive_busybox_shell": true,
     "linux_namespaces_in_kernel": true,
     "cgroup_v2_mount": true,
+    "kernel_module_payload": true,
+    "guest_agent_control": true,
+    "oci_runtime": true,
+    "docker_stack": true,
+    "guest_network_user_mode": true,
+    "interactive_busybox_shell": false,
     "systemd": false,
-    "oci_runtime": false,
-    "kernel_module_payload": false,
     "persistent_rootfs": false,
-    "guest_network": false,
-    "host_port_forwarding": false
+    "host_port_forwarding": false,
+    "kernel_modules_host_access": false
   }
 }
-

@@ -1,0 +1,15 @@
+[package]
+name = "rish-softvm-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure-Rust no-JIT x86_64 full-system interpreter for the rish mobile guest"
+
+[dependencies]
+bitflags = "2"
+iced-x86 = { version = "1.21", default-features = false, features = ["decoder", "gas", "intel", "masm", "nasm", "std"] }
+
+[dev-dependencies]
+tempfile = "3.8"

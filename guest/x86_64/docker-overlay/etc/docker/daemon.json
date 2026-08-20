@@ -1,0 +1,10 @@
+{
+  "iptables": false,
+  "ip6tables": false,
+  "bridge": "none",
+  "ip-forward": false,
+  "ip-masq": false,
+  "storage-driver": "overlay2",
+  "data-root": "/var/lib/docker",
+  "log-driver": "json-file"
+}

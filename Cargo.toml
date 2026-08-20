@@ -6,6 +6,7 @@ members = [
   "crates/rish-core",
   "crates/rish-ffi",
   "crates/rish-guest-agent",
+  "crates/rish-guest-boot",
   "crates/rish-guest-importer",
   "crates/rish-guest-protocol",
   "crates/rish-layer",
@@ -14,6 +15,7 @@ members = [
   "crates/rish-registry",
   "crates/rish-runtime",
   "crates/rish-snapshot",
+  "crates/rish-softvm-core",
   "crates/rish-softvm-x86_64",
   "crates/rish-vm",
 ]
@@ -31,6 +33,7 @@ rish-applets = { path = "crates/rish-applets" }
 rish-content = { path = "crates/rish-content" }
 rish-core = { path = "crates/rish-core" }
 rish-guest-agent = { path = "crates/rish-guest-agent" }
+rish-guest-boot = { path = "crates/rish-guest-boot" }
 rish-guest-importer = { path = "crates/rish-guest-importer" }
 rish-guest-protocol = { path = "crates/rish-guest-protocol" }
 rish-layer = { path = "crates/rish-layer" }
@@ -39,6 +42,7 @@ rish-pull = { path = "crates/rish-pull" }
 rish-registry = { path = "crates/rish-registry" }
 rish-runtime = { path = "crates/rish-runtime" }
 rish-snapshot = { path = "crates/rish-snapshot" }
+rish-softvm-core = { path = "crates/rish-softvm-core" }
 rish-softvm-x86_64 = { path = "crates/rish-softvm-x86_64" }
 rish-vm = { path = "crates/rish-vm" }
 serde = { version = "1.0", features = ["derive"] }

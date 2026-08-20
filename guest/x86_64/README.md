@@ -95,6 +95,44 @@ features built in:
 Those are actual Linux kernel facilities inside the emulated guest. They are
 not Swift/Java/ArkTS lookalikes and they do not imply mobile-host privilege.
 
+## Docker diagnostic guest
+
+`build-docker-initramfs.sh` extends the diagnostic rootfs into a guest that
+carries a real container stack:
+
+- the full 6.18.35-0-virt kernel module tree (boot modules and metadata from
+  the pinned netboot initramfs, remaining modules from the pinned modloop
+  squashfs);
+- the static Docker 29.7.2 toolchain (dockerd, containerd, runc, ctr, docker
+  CLI, docker-init, docker-proxy);
+- the statically linked rish-guest-agent, started as PID 1 with its framed
+  protocol on ttyS1.
+
+Build it from this directory:
+
+```sh
+./build-docker-initramfs.sh --update-lock
+```
+
+The first run records the derived digest in `derived.lock.tsv`; later runs
+fail closed unless the bytes match. dockerd runs with bridge networking and
+iptables disabled and overlay2 on tmpfs, so containers run on the guest
+host network (`docker run --network host`). This is real dockerd and runc
+inside a real Linux kernel, not a portable lookalike.
+
+Boot the oracle on a development machine:
+
+```sh
+cargo run -p rish-guest-boot -- \
+  --manifest guest/x86_64/boot-manifest.json \
+  --exec docker version
+```
+
+The harness spawns QEMU with two serial ports (console on stdio, the guest
+protocol on a control socket), negotiates the session, collects live kernel
+evidence, and streams the requested command. It is a diagnostic tool: the
+verified Full VM capability profile still requires the TCTI provider gate.
+
 ## What is not claimed yet
 
 The Alpine `virt` kernel config builds several container/storage/network

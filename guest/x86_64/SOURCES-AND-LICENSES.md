@@ -67,6 +67,23 @@ primarily GPL-2.0 and includes components under other licenses. Any eventual
 distribution must audit the exact configured source set, retain notices, and
 meet the corresponding source obligations.
 
+## Docker diagnostic guest additions
+
+`build-docker-initramfs.sh` adds two more pinned inputs to the same
+`assets.lock.tsv`:
+
+- `modloop-virt`, the Alpine kernel module squashfs for 6.18.35-0-virt
+  (module binaries are Linux kernel code under GPL-2.0-only); and
+- the static Docker 29.7.2 toolchain tarball from
+  <https://download.docker.com/linux/static/stable/x86_64/>, whose
+  components are Apache-2.0 (Moby, containerd, runc, ctr) with
+  BSD-3-Clause parts (docker-init/tini, docker-proxy).
+
+Distributing the generated docker initramfs requires the Alpine and Moby
+license notices and, for the kernel modules, corresponding source. The
+module set stays inside the emulated guest and grants no mobile-host
+privilege.
+
 ## Capability and redistribution boundary
 
 The generated image is a diagnostic initramfs. It contains no Alpine kernel

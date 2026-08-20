@@ -71,20 +71,22 @@ rustc \
     "$script_dir/tools/pack-newc.rs" \
     -o "$packer"
 
+expected_id=${EXPECTED_ID:-rish-alpine-diagnostic-initramfs}
 tab=$(printf '\t')
 derived_id=
 while IFS="$tab" read -r candidate_id filename expected_size expected_sha extra; do
     case "$candidate_id" in
         ''|'#'*) continue ;;
     esac
+    [ "$candidate_id" = "$expected_id" ] || continue
     [ -z "${extra:-}" ] || die "unexpected field in derived.lock.tsv"
-    [ -z "$derived_id" ] || die "derived.lock.tsv must contain exactly one artifact"
+    [ -z "$derived_id" ] || die "derived.lock.tsv has a duplicate $expected_id"
     derived_id=$candidate_id
     output_name=$filename
     output_size=$expected_size
     output_sha=$expected_sha
 done <"$script_dir/derived.lock.tsv"
-[ -n "$derived_id" ] || die "derived.lock.tsv has no artifact"
+[ -n "$derived_id" ] || die "derived.lock.tsv has no $expected_id artifact"
 case "$output_name" in
     ''|*/*|.|..) die "unsafe derived output filename: $output_name" ;;
 esac
