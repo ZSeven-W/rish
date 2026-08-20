@@ -1,6 +1,6 @@
 //! Integer arithmetic: add/sub/cmp/adc/sbb/inc/dec/neg/mul/imul/div/idiv.
 
-use iced_x86::{Instruction, Mnemonic, Register};
+use iced_x86::{Instruction, Mnemonic, OpKind, Register};
 
 use crate::ops::{
     AddResult, carry, operand_size, read_operand0, read_operand1, read_register, set_adjust,
@@ -152,14 +152,22 @@ fn mul(cpu: &mut Cpu, instruction: &Instruction, signed: bool) -> Result<(), Cpu
 
 fn imul_two_three(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
     let size = operand_size(instruction, 0);
-    let left = read_operand0(cpu, instruction)?;
-    // iced-x86 decodes both `imul r, r/m` (two operands) and the three
-    // operand forms `imul r, r/m, imm` and `imul r, imm` (the assembler
-    // two-operand immediate form repeats the destination register as op1).
-    let right = if instruction.op_count() >= 3 {
-        instruction.immediate(2)
-    } else {
-        read_operand1(cpu, instruction)?
+    // iced-x86 decodes `imul r, r/m` with two operands, the true
+    // three-operand form `imul r, r/m, imm` with three, and the two-operand
+    // immediate shorthand `imul r, imm` also with three operands where op1
+    // repeats the destination register. The shorthand multiplies the
+    // destination's old value by the immediate; the true three-operand form
+    // multiplies op1 (the r/m operand) by the immediate.
+    let repeats_dest = instruction.op_count() >= 3
+        && instruction.op1_kind() == OpKind::Register
+        && instruction.op1_register() == instruction.op0_register();
+    let (left, right) = match instruction.op_count() {
+        2 => (
+            read_operand0(cpu, instruction)?,
+            read_operand1(cpu, instruction)?,
+        ),
+        _ if repeats_dest => (read_operand0(cpu, instruction)?, instruction.immediate(2)),
+        _ => (read_operand1(cpu, instruction)?, instruction.immediate(2)),
     };
     let bits = u32::from(size) * 8;
     let mask = crate::ops::bits_mask(bits);
@@ -416,6 +424,22 @@ mod tests {
         assert_eq!(
             cpu.regs.gpr(crate::arch::registers::index::RDI) & 0xFFFF_FFFF,
             0xA8
+        );
+    }
+
+    #[test]
+    fn imul_three_operand_multiplies_rm_by_immediate() {
+        let mut cpu = cpu();
+        cpu.regs
+            .set_gpr(crate::arch::registers::index::R13, 0x10000);
+        cpu.regs.set_gpr(crate::arch::registers::index::R14, 3);
+        // imul r13d, r14d, -64 (45 6b ee c0): the fixmap idx computation
+        // `FIX_BTMAP_BEGIN - NR_FIX_BTMAPS*slot` in early_iounmap. The
+        // multiplicand must be r14d, not the destination's old value.
+        run(&mut cpu, 64, &[0x45, 0x6B, 0xEE, 0xC0]).unwrap();
+        assert_eq!(
+            cpu.regs.gpr(crate::arch::registers::index::R13),
+            0xFFFF_FF40
         );
     }
 

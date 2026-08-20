@@ -28,9 +28,28 @@ const VECTOR_INVALID_OPCODE: u8 = 6;
 const VECTOR_DOUBLE_FAULT: u8 = 8;
 const VECTOR_PAGE_FAULT: u8 = 14;
 
-/// One retired-instruction trace entry: RIP, the eight captured GPRs,
+/// One retired-instruction trace entry: RIP, the sixteen captured GPRs,
 /// and up to sixteen instruction bytes.
-pub type TraceEntry = (u64, u64, u64, u64, u64, u64, u64, u64, u64, [u8; 16]);
+pub type TraceEntry = (
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    [u8; 16],
+);
 
 pub struct Cpu {
     pub regs: Registers,
@@ -204,6 +223,14 @@ impl Cpu {
                 self.regs.gpr(index::RDI),
                 self.regs.gpr(index::RBP),
                 self.regs.gpr(index::RSP),
+                self.regs.gpr(index::R8),
+                self.regs.gpr(index::R9),
+                self.regs.gpr(index::R10),
+                self.regs.gpr(index::R11),
+                self.regs.gpr(index::R12),
+                self.regs.gpr(index::R13),
+                self.regs.gpr(index::R14),
+                self.regs.gpr(index::R15),
                 head,
             ));
             self.regs.rip = self.regs.rip.wrapping_add(instruction.len() as u64);

@@ -156,7 +156,7 @@ fn run() -> Result<u8, String> {
     let mut last_checkpoint = cpu.regs.instructions_retired;
     let mut watch_prev = [0_u8; 16];
     let _ = cpu.memory.read(0x35bd000, &mut watch_prev);
-    let mut watch_addrs: [(&str, u64, [u8; 8]); 10] = [
+    let mut watch_addrs: [(&str, u64, [u8; 8]); 12] = [
         ("top_level_pgt", 0x35e3000, [0; 8]),
         ("info0", 0x35df020, [0; 8]),
         ("info8", 0x35df028, [0; 8]),
@@ -167,6 +167,8 @@ fn run() -> Result<u8, String> {
         ("malloc_ptr", 0x35de458, [0; 8]),
         ("kernel_global_2a40010", 0x2a40010, [0; 8]),
         ("early_pml4_0x111", 0x30e8888, [0; 8]),
+        ("fixmap_table_0", 0x3149ea0, [0; 8]),
+        ("fixmap_seed", 0x2b227d0, [0; 8]),
     ];
     for slot in watch_addrs.iter_mut() {
         let _ = cpu.memory.read(slot.1, &mut slot.2);
@@ -265,9 +267,29 @@ fn save_checkpoint(options: &Options, cpu: &Cpu) -> Result<(), String> {
 
 fn write_trace(cpu: &Cpu) {
     let mut trace_text = String::new();
-    for (rip, rax, rcx, rdx, rbx, rsi, rdi, rbp, rsp, bytes) in &cpu.trace {
+    for (
+        rip,
+        rax,
+        rcx,
+        rdx,
+        rbx,
+        rsi,
+        rdi,
+        rbp,
+        rsp,
+        r8,
+        r9,
+        r10,
+        r11,
+        r12,
+        r13,
+        r14,
+        r15,
+        bytes,
+    ) in &cpu.trace
+    {
         let line = format!(
-            "  {rip:#x}: rax={rax:#x} rcx={rcx:#x} rdx={rdx:#x} rbx={rbx:#x} rsi={rsi:#x} rdi={rdi:#x} rbp={rbp:#x} rsp={rsp:#x} bytes={}",
+            "  {rip:#x}: rax={rax:#x} rcx={rcx:#x} rdx={rdx:#x} rbx={rbx:#x} rsi={rsi:#x} rdi={rdi:#x} rbp={rbp:#x} rsp={rsp:#x} r8={r8:#x} r9={r9:#x} r10={r10:#x} r11={r11:#x} r12={r12:#x} r13={r13:#x} r14={r14:#x} r15={r15:#x} bytes={}",
             hex(bytes)
         );
         trace_text.push_str(&line);
@@ -278,9 +300,29 @@ fn write_trace(cpu: &Cpu) {
 
 fn report_gap(error: &CpuError, cpu: &Cpu, console: &[u8]) {
     println!("last instructions:");
-    for (rip, rax, rcx, rdx, rbx, rsi, rdi, rbp, rsp, bytes) in &cpu.trace {
+    for (
+        rip,
+        rax,
+        rcx,
+        rdx,
+        rbx,
+        rsi,
+        rdi,
+        rbp,
+        rsp,
+        r8,
+        r9,
+        r10,
+        r11,
+        r12,
+        r13,
+        r14,
+        r15,
+        bytes,
+    ) in &cpu.trace
+    {
         println!(
-            "  {rip:#x}: rax={rax:#x} rcx={rcx:#x} rdx={rdx:#x} rbx={rbx:#x} rsi={rsi:#x} rdi={rdi:#x} rbp={rbp:#x} rsp={rsp:#x} bytes={}",
+            "  {rip:#x}: rax={rax:#x} rcx={rcx:#x} rdx={rdx:#x} rbx={rbx:#x} rsi={rsi:#x} rdi={rdi:#x} rbp={rbp:#x} rsp={rsp:#x} r8={r8:#x} r9={r9:#x} r10={r10:#x} r11={r11:#x} r12={r12:#x} r13={r13:#x} r14={r14:#x} r15={r15:#x} bytes={}",
             hex(bytes)
         );
     }
