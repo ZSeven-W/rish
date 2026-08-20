@@ -111,40 +111,60 @@ impl Cpu {
     }
 
     fn execute_one(&mut self) -> Result<(), CpuError> {
-        let (instruction, bytes) = self.decode_at_rip()?;
-        let mut head = [0_u8; 16];
-        let count = bytes.len().min(16);
-        head[..count].copy_from_slice(&bytes[..count]);
-        if self.trace.len() >= 16384 {
-            self.trace.pop_front();
+        loop {
+            let (instruction, bytes) = match self.decode_at_rip() {
+                Ok(pair) => pair,
+                Err(CpuError::PageFault { linear, error_code }) => {
+                    // Instruction fetch fault: deliver through the guest IDT;
+                    // the handler maps the page and the fetch is retried.
+                    self.regs.cr2 = linear;
+                    self.raise(VECTOR_PAGE_FAULT, error_code, true)?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let mut head = [0_u8; 16];
+            let count = bytes.len().min(16);
+            head[..count].copy_from_slice(&bytes[..count]);
+            if self.trace.len() >= 16384 {
+                self.trace.pop_front();
+            }
+            self.trace.push_back((
+                self.regs.rip,
+                self.regs.gpr(index::RAX),
+                self.regs.gpr(index::RCX),
+                self.regs.gpr(index::RDX),
+                self.regs.gpr(index::RBX),
+                self.regs.gpr(index::RSI),
+                self.regs.gpr(index::RDI),
+                self.regs.gpr(index::RBP),
+                self.regs.gpr(index::RSP),
+                head,
+            ));
+            self.regs.rip = self.regs.rip.wrapping_add(instruction.len() as u64);
+            match self.dispatch(&instruction) {
+                Err(CpuError::PageFault { linear, error_code }) => {
+                    // Data-access fault: rewind rip so the instruction
+                    // re-executes after the guest handler maps the page.
+                    self.regs.rip = self.regs.rip.wrapping_sub(instruction.len() as u64);
+                    self.regs.cr2 = linear;
+                    self.raise(VECTOR_PAGE_FAULT, error_code, true)?;
+                    continue;
+                }
+                Err(CpuError::UnimplementedInstruction {
+                    code,
+                    address,
+                    bytes: _,
+                }) => {
+                    return Err(CpuError::UnimplementedInstruction {
+                        code,
+                        address,
+                        bytes,
+                    });
+                }
+                other => return other,
+            }
         }
-        self.trace.push_back((
-            self.regs.rip,
-            self.regs.gpr(index::RAX),
-            self.regs.gpr(index::RCX),
-            self.regs.gpr(index::RDX),
-            self.regs.gpr(index::RBX),
-            self.regs.gpr(index::RSI),
-            self.regs.gpr(index::RDI),
-            self.regs.gpr(index::RBP),
-            self.regs.gpr(index::RSP),
-            head,
-        ));
-        self.regs.rip = self.regs.rip.wrapping_add(instruction.len() as u64);
-        let result = self.dispatch(&instruction);
-        if let Err(CpuError::UnimplementedInstruction {
-            code,
-            address,
-            bytes: _,
-        }) = &result
-        {
-            return Err(CpuError::UnimplementedInstruction {
-                code: code.clone(),
-                address: *address,
-                bytes,
-            });
-        }
-        result
     }
 
     fn decode_at_rip(&self) -> Result<(Instruction, Vec<u8>), CpuError> {
@@ -465,7 +485,10 @@ impl Cpu {
             linear,
             kind,
         )
-        .map_err(|fault| CpuError::GuestFault(format!("page fault at {:#x}", fault.linear)))
+        .map_err(|fault| CpuError::PageFault {
+            linear: fault.linear,
+            error_code: fault.error_code,
+        })
     }
 
     /// Computes the effective linear address for a memory operand.

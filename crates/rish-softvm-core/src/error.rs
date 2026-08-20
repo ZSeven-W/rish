@@ -6,6 +6,8 @@ use std::fmt;
 pub enum CpuError {
     InvalidConfig(String),
     GuestFault(String),
+    /// A page fault to deliver through the guest IDT (CR2 already set).
+    PageFault { linear: u64, error_code: u16 },
     UnimplementedInstruction {
         code: String,
         address: u64,
@@ -20,6 +22,9 @@ impl fmt::Display for CpuError {
         match self {
             Self::InvalidConfig(message) => write!(formatter, "invalid config: {message}"),
             Self::GuestFault(message) => write!(formatter, "guest fault: {message}"),
+            Self::PageFault { linear, error_code } => {
+                write!(formatter, "page fault at {linear:#x} (error {error_code:#x})")
+            }
             Self::UnimplementedInstruction { code, address, .. } => {
                 write!(
                     formatter,
