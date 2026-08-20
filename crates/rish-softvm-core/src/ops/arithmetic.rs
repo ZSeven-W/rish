@@ -424,14 +424,10 @@ mod tests {
         let mut cpu = cpu();
         cpu.regs
             .set_gpr(crate::arch::registers::index::RAX, 0x10000);
-        cpu.regs
-            .set_gpr(crate::arch::registers::index::RBX, 0x10);
+        cpu.regs.set_gpr(crate::arch::registers::index::RBX, 0x10);
         // imul rax, rbx (48 0f af c3)
         run(&mut cpu, 64, &[0x48, 0x0F, 0xAF, 0xC3]).unwrap();
-        assert_eq!(
-            cpu.regs.gpr(crate::arch::registers::index::RAX),
-            0x10_0000
-        );
+        assert_eq!(cpu.regs.gpr(crate::arch::registers::index::RAX), 0x10_0000);
     }
 
     #[test]
