@@ -13,6 +13,10 @@ use tempfile::TempDir;
 
 use crate::{LimitKind, PullError, PullPolicy, Puller};
 
+mod docker_hub;
+mod multiarch;
+mod verified_image;
+
 #[derive(Clone)]
 struct ExpectedExchange {
     path: String,
@@ -121,6 +125,27 @@ fn manifest_parts(
     diff_id_count: usize,
     sha512_first_layer: bool,
 ) -> ManifestParts {
+    manifest_parts_with_config(
+        layer_media_types,
+        diff_id_count,
+        sha512_first_layer,
+        "arm64",
+        ImageConfig {
+            env: vec!["PATH=/usr/bin:/bin".to_owned()],
+            cmd: vec!["/bin/sh".to_owned()],
+            working_dir: "/".to_owned(),
+            ..ImageConfig::default()
+        },
+    )
+}
+
+fn manifest_parts_with_config(
+    layer_media_types: &[MediaType],
+    diff_id_count: usize,
+    sha512_first_layer: bool,
+    architecture: &str,
+    config: ImageConfig,
+) -> ManifestParts {
     let layer_bodies = layer_media_types
         .iter()
         .enumerate()
@@ -144,14 +169,9 @@ fn manifest_parts(
         .map(|index| Digest::sha256(format!("uncompressed-layer-{index}").as_bytes()).to_string())
         .collect();
     let image_configuration = ImageConfiguration {
-        architecture: "arm64".to_owned(),
+        architecture: architecture.to_owned(),
         os: "linux".to_owned(),
-        config: ImageConfig {
-            env: vec!["PATH=/usr/bin:/bin".to_owned()],
-            cmd: vec!["/bin/sh".to_owned()],
-            working_dir: "/".to_owned(),
-            ..ImageConfig::default()
-        },
+        config,
         rootfs: RootFilesystem {
             kind: "layers".to_owned(),
             diff_ids,
@@ -367,6 +387,19 @@ fn response(descriptor: &Descriptor, body: Vec<u8>) -> RegistryResponse {
     }
 }
 
+fn replace_with_descriptor_headers(
+    response: &mut RegistryResponse,
+    descriptor: &Descriptor,
+    content_type: &str,
+) {
+    let mut headers = HeaderMap::default();
+    headers.insert("content-type", content_type).unwrap();
+    headers
+        .insert("content-length", descriptor.size.to_string())
+        .unwrap();
+    response.headers = headers;
+}
+
 fn content_store() -> (TempDir, ContentStore) {
     let temporary = TempDir::new().unwrap();
     let store = ContentStore::open(StoreConfig::new(temporary.path().join("content"))).unwrap();
@@ -458,26 +491,6 @@ fn resolves_a_tag_directly_to_an_immutable_manifest_digest() {
     assert!(image.index.is_none());
     assert_eq!(image.resolved_digest(), &fixture.root.digest);
     transport.assert_finished();
-}
-
-#[test]
-fn rejects_top_level_digest_mismatch_before_cas_admission() {
-    let mut fixture = direct_fixture();
-    fixture.exchanges[0].response.body[0] ^= 1;
-    let transport = MockTransport::new(fixture.exchanges);
-    let (_temporary, store) = content_store();
-
-    let error = Puller::new(&transport, &store)
-        .pull(&fixture.reference)
-        .unwrap_err();
-
-    assert!(matches!(
-        error,
-        PullError::Response(ResponseValidationError::DigestValidation(
-            DigestValidationError::Mismatch { .. }
-        ))
-    ));
-    assert!(!store.contains(cas_digest(&fixture.root.digest)).unwrap());
 }
 
 #[test]

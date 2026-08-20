@@ -655,9 +655,38 @@ final class RishDemoAppDelegate: UIResponder, UIApplicationDelegate {
         print(report.log, terminator: "")
         RishIOSDemo.persist(report)
 
-        let controller = RishDemoViewController(report: report)
+        let pullController = RishImagePullViewController(
+            service: RishImagePullClientAdapter()
+        )
+        pullController.tabBarItem = UITabBarItem(
+            title: "Pull",
+            image: UIImage(systemName: "shippingbox.and.arrow.backward"),
+            selectedImage: UIImage(
+                systemName: "shippingbox.and.arrow.backward.fill"
+            )
+        )
+
+        let runtimeController = RishDemoViewController(report: report)
+        runtimeController.tabBarItem = UITabBarItem(
+            title: "Runtime",
+            image: UIImage(systemName: "terminal"),
+            selectedImage: UIImage(systemName: "terminal.fill")
+        )
+
+        let tabs = UITabBarController()
+        tabs.viewControllers = [pullController, runtimeController]
+        tabs.selectedIndex = 0
+        tabs.tabBar.tintColor = RishPalette.accent
+        tabs.tabBar.unselectedItemTintColor = RishPalette.secondary
+        let appearance = UITabBarAppearance()
+        appearance.configureWithOpaqueBackground()
+        appearance.backgroundColor = RishPalette.card
+        appearance.shadowColor = RishPalette.border
+        tabs.tabBar.standardAppearance = appearance
+        tabs.tabBar.scrollEdgeAppearance = appearance
+
         let appWindow = UIWindow(frame: UIScreen.main.bounds)
-        appWindow.rootViewController = controller
+        appWindow.rootViewController = tabs
         appWindow.makeKeyAndVisible()
         window = appWindow
         return true

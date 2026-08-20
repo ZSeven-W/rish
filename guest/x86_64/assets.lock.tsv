@@ -1,0 +1,7 @@
+# rish-x86-assets-v1
+# id	requirement	filename	size	sha256	url
+alpine-vmlinuz-virt	required	vmlinuz-virt-6.18.35	12575744	1e6bf9027720c75c3ed0d79171f21b5791ee40ca9795d07c7c6e04dc5ea2ae90	https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/netboot-3.24.1/vmlinuz-virt
+alpine-kernel-config	required	config-6.18.35-0-virt	151801	bc34b9908e38508d9b98cbd2d1c6a7a13fc70b734cad4782de5b92d69b59cc77	https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/netboot-3.24.1/config-6.18.35-0-virt
+alpine-minirootfs	required	alpine-minirootfs-3.24.1-x86_64.tar.gz	3698422	41f73e3cf5fa919b8aa5ca6b30dc48f0da2720776d7423e2a7748211456fe081	https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/alpine-minirootfs-3.24.1-x86_64.tar.gz
+alpine-virt-iso	optional	alpine-virt-3.24.1-x86_64.iso	69206016	e73a6241bd5f3c5c2d4d38c02cc52c378c0415a7c888bd292066bf36e0f41a39	https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/alpine-virt-3.24.1-x86_64.iso
+

@@ -21,7 +21,10 @@ pub use model::{
     Descriptor, ImageIndex, ImageManifest, ManifestDocument, ModelValidationError, Platform,
 };
 pub use reference::{ImageReference, ImageReferenceError};
-pub use selection::{PlatformRequest, PlatformSelectionError, select_platform};
+pub use selection::{
+    GuestPlatform, MAX_GUEST_PLATFORM_TOKEN_BYTES, PlatformRequest, PlatformSelectionError,
+    select_platform,
+};
 pub use transport::{
     DEFAULT_MANIFEST_RESPONSE_LIMIT, HeaderError, HeaderMap, HttpMethod, MAX_HEADER_BYTES,
     MAX_HEADER_FIELDS, MAX_HEADER_NAME_BYTES, MAX_HEADER_VALUE_BYTES, RegistryRequest,

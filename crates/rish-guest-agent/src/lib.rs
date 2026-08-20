@@ -4,6 +4,7 @@
 //! starts a supervised process and returns immediately; callers drive
 //! completion, output, cancellation, and deadlines through [`GuestAgent::poll`].
 
+mod oci_runtime;
 mod supervisor;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,6 +17,7 @@ use rish_guest_protocol::{
 };
 use thiserror::Error;
 
+pub use oci_runtime::{OciLifecycleReply, OciRuntimeBackend, OciRuntimeConfig};
 pub use supervisor::{
     DEFAULT_MAX_CONCURRENT_EXEC, DEFAULT_STREAM_CHUNK_SIZE, DEFAULT_STREAM_OUTPUT_LIMIT,
     NativeExecutionConfig, NativeOperationHandler,
@@ -424,7 +426,17 @@ pub fn bootstrap_agent() -> GuestAgent<NativeOperationHandler> {
                 ("execution_mode".to_owned(), "supervised_async".into()),
                 ("supports_cancel".to_owned(), true.into()),
                 ("supports_timeout".to_owned(), true.into()),
-                ("supports_stdin_stream".to_owned(), false.into()),
+                ("supports_stdin_stream".to_owned(), cfg!(unix).into()),
+                ("supports_tty".to_owned(), cfg!(target_os = "linux").into()),
+                (
+                    "tty_stream_channel".to_owned(),
+                    if cfg!(target_os = "linux") {
+                        "console"
+                    } else {
+                        "unavailable"
+                    }
+                    .into(),
+                ),
                 (
                     "max_stdout_bytes".to_owned(),
                     execution_config.max_stdout_bytes.into(),

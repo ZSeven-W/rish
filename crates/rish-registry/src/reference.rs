@@ -7,6 +7,8 @@ use thiserror::Error;
 use crate::Digest;
 
 const DEFAULT_REGISTRY: &str = "docker.io";
+const LEGACY_DOCKER_HUB_REGISTRY: &str = "index.docker.io";
+const DOCKER_HUB_DISTRIBUTION_AUTHORITY: &str = "registry-1.docker.io";
 const DEFAULT_NAMESPACE: &str = "library";
 const DEFAULT_TAG: &str = "latest";
 const MAX_REPOSITORY_LENGTH: usize = 255;
@@ -28,6 +30,20 @@ impl ImageReference {
     #[must_use]
     pub fn registry(&self) -> &str {
         &self.registry
+    }
+
+    /// The HTTP authority for OCI Distribution API requests.
+    ///
+    /// `docker.io` remains the canonical logical registry name used in image
+    /// references, while Docker Hub serves `/v2/` from
+    /// `registry-1.docker.io`.
+    #[must_use]
+    pub fn distribution_authority(&self) -> &str {
+        if self.registry == DEFAULT_REGISTRY {
+            DOCKER_HUB_DISTRIBUTION_AUTHORITY
+        } else {
+            &self.registry
+        }
     }
 
     #[must_use]
@@ -100,9 +116,12 @@ impl FromStr for ImageReference {
 
         let (name_and_tag, digest) = split_digest(value)?;
         let (name, tag) = split_tag(name_and_tag)?;
-        let (registry, mut repository) = split_registry(name)?;
+        let (mut registry, mut repository) = split_registry(name)?;
 
         validate_registry(&registry)?;
+        if registry == LEGACY_DOCKER_HUB_REGISTRY {
+            registry = DEFAULT_REGISTRY.to_owned();
+        }
         validate_repository(&repository)?;
         if registry == DEFAULT_REGISTRY && !repository.contains('/') {
             repository = format!("{DEFAULT_NAMESPACE}/{repository}");
@@ -335,6 +354,8 @@ mod tests {
         let namespace: ImageReference = "team/api:1.2".parse().unwrap();
 
         assert_eq!(alpine.to_string(), "docker.io/library/alpine:latest");
+        assert_eq!(alpine.registry(), "docker.io");
+        assert_eq!(alpine.distribution_authority(), "registry-1.docker.io");
         assert_eq!(
             alpine.manifest_path(),
             "/v2/library/alpine/manifests/latest"
@@ -351,6 +372,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(tagged.registry(), "registry.example:5443");
+        assert_eq!(tagged.distribution_authority(), "registry.example:5443");
         assert_eq!(ipv6.registry(), "[2001:db8::1]:5000");
         assert_eq!(pinned.tag(), Some("v1"));
         assert_eq!(pinned.digest().unwrap().to_string(), SHA256);
@@ -365,6 +387,15 @@ mod tests {
         let image: ImageReference = format!("example.com/a/b@{SHA256}").parse().unwrap();
         assert_eq!(image.tag(), None);
         assert_eq!(image.to_string(), format!("example.com/a/b@{SHA256}"));
+    }
+
+    #[test]
+    fn normalizes_the_legacy_docker_hub_registry_alias() {
+        let image: ImageReference = "index.docker.io/alpine:edge".parse().unwrap();
+
+        assert_eq!(image.to_string(), "docker.io/library/alpine:edge");
+        assert_eq!(image.registry(), "docker.io");
+        assert_eq!(image.distribution_authority(), "registry-1.docker.io");
     }
 
     #[test]

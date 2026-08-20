@@ -102,7 +102,7 @@ cgroup。要求这些行为的调用必须标记 `requires-kernel`。
 
 ```text
 registry resolve/auth
-  → choose linux/arm64 manifest
+  → choose the explicit linux/amd64 manifest for the x86_64 guest
   → verify digest and size
   → content-addressed blob store
   → parse image config
@@ -133,10 +133,10 @@ Mobile host
   ├─ platform UI and permission broker
   ├─ user-mode NAT and port forwarding
   └─ VM engine
-       ├─ software interpreter on stock devices
+       ├─ no-JIT x86_64 full-system interpreter on stock devices
        ├─ AVF/crosvm on approved Android/OEM devices
        ├─ KVM on explicitly permitted devices
-       └─ virtio block/net/console/rng/vsock
+       └─ PCI/APIC + virtio block/net/console/rng/control channel
              │
              ▼
           Linux guest
@@ -155,6 +155,11 @@ Full VM 不能仅凭配置被加入 backend selector。唯一受控路径依次�
 session 和 kernel release 绑定的 Kconfig evidence，以及 contract 所需的
 `Available + version=1` capability。只有这条链路能产生
 `VerifiedVmProfile`；Guest 多报、缺失、受限或未知版本的能力都不会升级。
+
+移动端软件 provider 必须报告并通过构建身份检查。AMD64 基线只接受
+`x86_64-softmmu` 的 no-JIT threaded interpreter；JIT、HVF、KVM、私有 API
+或运行时可执行内存任一标志出现都失败关闭。OCI 的 `amd64` 只在已认证 guest
+架构为 `x86_64` 时匹配，不能从手机宿主的 ARM64 架构推断。
 
 Full VM 的设备范围：
 

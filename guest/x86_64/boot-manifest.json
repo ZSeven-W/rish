@@ -1,0 +1,76 @@
+{
+  "schema": "org.rish.guest.boot-manifest",
+  "schema_version": 1,
+  "status": "diagnostic_boot_only",
+  "architecture": {
+    "cpu": "x86_64",
+    "oci_platform": "linux/amd64",
+    "endianness": "little"
+  },
+  "machine": {
+    "boot_protocol": "linux-x86-bzimage",
+    "minimum_memory_bytes": 268435456,
+    "vcpu_count": 1,
+    "serial": {
+      "model": "16550A",
+      "io_port": "0x3f8",
+      "irq": 4,
+      "baud": 115200,
+      "data_bits": 8,
+      "parity": "none",
+      "stop_bits": 1
+    }
+  },
+  "boot": {
+    "kernel": "out/downloads/vmlinuz-virt-6.18.35",
+    "initramfs": "out/rish-alpine-3.24.1-x86_64-initramfs.cpio",
+    "command_line": "console=ttyS0,115200n8 rdinit=/init panic=-1 oops=panic nokaslr cgroup_no_v1=all",
+    "expected_serial_marker": "RISH_X86_64_BOOT_OK",
+    "failure_serial_marker": "RISH_X86_64_BOOT_FAILED"
+  },
+  "artifacts": [
+    {
+      "id": "alpine-vmlinuz-virt",
+      "kind": "linux_kernel",
+      "size": 12575744,
+      "sha256": "1e6bf9027720c75c3ed0d79171f21b5791ee40ca9795d07c7c6e04dc5ea2ae90"
+    },
+    {
+      "id": "alpine-kernel-config",
+      "kind": "linux_kernel_config",
+      "size": 151801,
+      "sha256": "bc34b9908e38508d9b98cbd2d1c6a7a13fc70b734cad4782de5b92d69b59cc77"
+    },
+    {
+      "id": "alpine-minirootfs",
+      "kind": "rootfs_source",
+      "size": 3698422,
+      "sha256": "41f73e3cf5fa919b8aa5ca6b30dc48f0da2720776d7423e2a7748211456fe081"
+    },
+    {
+      "id": "rish-alpine-diagnostic-initramfs",
+      "kind": "derived_initramfs_newc",
+      "size": 8484864,
+      "sha256": "a92bf96c76dee0850db6662843d39bc52fe97762b6074f28b05ed6e01bf8b488"
+    }
+  ],
+  "engine_requirements": [
+    "Linux x86 bzImage boot protocol and boot_params",
+    "initramfs placement below the kernel boot limit",
+    "x86 reset, protected mode, paging, interrupts, and timers",
+    "one legacy 16550A serial port at I/O 0x3f8 with IRQ 4"
+  ],
+  "capabilities": {
+    "real_linux_kernel": true,
+    "interactive_busybox_shell": true,
+    "linux_namespaces_in_kernel": true,
+    "cgroup_v2_mount": true,
+    "systemd": false,
+    "oci_runtime": false,
+    "kernel_module_payload": false,
+    "persistent_rootfs": false,
+    "guest_network": false,
+    "host_port_forwarding": false
+  }
+}
+

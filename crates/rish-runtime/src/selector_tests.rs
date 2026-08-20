@@ -18,15 +18,19 @@ use crate::{CommandPlan, OffloadRegistry, Planner, VerifiedVmRuntime, portable_o
 
 struct TestEngine;
 
-struct TestChannel;
+struct TestChannel {
+    architecture: String,
+}
 
 impl VmEngine for TestEngine {
     fn probe(&self) -> VmProbe {
         VmProbe::available([VmAcceleration::Interpreter])
     }
 
-    fn boot(&self, _config: &VmConfig) -> Result<Box<dyn GuestChannel>, VmError> {
-        Ok(Box::new(TestChannel))
+    fn boot(&self, config: &VmConfig) -> Result<Box<dyn GuestChannel>, VmError> {
+        Ok(Box::new(TestChannel {
+            architecture: config.architecture.clone(),
+        }))
     }
 }
 
@@ -46,11 +50,11 @@ impl GuestChannel for TestChannel {
                         name: "guest".to_owned(),
                         version: "0.1.0".to_owned(),
                         platform: "linux".to_owned(),
-                        architecture: "aarch64".to_owned(),
+                        architecture: self.architecture.clone(),
                     },
                     capabilities: Box::new(GuestCapabilities {
                         kernel_release: "6.12".to_owned(),
-                        architecture: "aarch64".to_owned(),
+                        architecture: self.architecture.clone(),
                         init_system: "systemd".to_owned(),
                         cgroup_version: Some(2),
                         container_runtimes: vec!["youki".to_owned()],
@@ -104,10 +108,14 @@ impl GuestChannel for TestChannel {
 }
 
 fn booted_vm() -> BootedVm {
+    booted_vm_for_architecture("aarch64")
+}
+
+fn booted_vm_for_architecture(architecture: &str) -> BootedVm {
     VmCandidate::new(
         Platform::Ios,
         VmConfig {
-            architecture: "aarch64".to_owned(),
+            architecture: architecture.to_owned(),
             vcpus: 1,
             memory_mib: 512,
             kernel_path: "/app/kernel".to_owned(),
@@ -147,6 +155,46 @@ fn booted_vm_without_exec_contract() -> BootedVm {
 fn verified_vm_candidate() -> BackendCandidate {
     let vm = booted_vm();
     BackendCandidate::full_virtual_machine(&vm, 100).unwrap()
+}
+
+#[test]
+fn full_vm_candidate_carries_only_the_verified_oci_guest_architecture() {
+    let arm64_vm = booted_vm_for_architecture("aarch64");
+    let arm64 = BackendCandidate::full_virtual_machine(&arm64_vm, 1).unwrap();
+    assert_eq!(arm64.verified_guest_architecture(), Some("arm64"));
+
+    let amd64_vm = booted_vm_for_architecture("x86_64");
+    let amd64 = BackendCandidate::full_virtual_machine(&amd64_vm, 1).unwrap();
+    assert_eq!(amd64.verified_guest_architecture(), Some("amd64"));
+
+    let portable = BackendCandidate::portable_offload(
+        portable_offload_profile(Platform::Ios, PrivilegeMode::AppSandbox),
+        1,
+    )
+    .unwrap();
+    assert_eq!(portable.verified_guest_architecture(), None);
+}
+
+#[test]
+fn verified_guest_architecture_normalization_is_closed() {
+    assert_eq!(
+        canonical_oci_architecture("aarch64").map(VerifiedGuestArchitecture::oci_name),
+        Some("arm64")
+    );
+    assert_eq!(
+        canonical_oci_architecture("x86_64").map(VerifiedGuestArchitecture::oci_name),
+        Some("amd64")
+    );
+    assert_eq!(canonical_oci_architecture("riscv64"), None);
+    assert_eq!(canonical_oci_architecture("AMD64"), None);
+}
+
+#[test]
+fn serialized_vm_candidate_is_diagnostic_and_includes_verified_identity() {
+    let candidate = verified_vm_candidate();
+    let value = serde_json::to_value(candidate).unwrap();
+
+    assert_eq!(value["verified_guest_architecture"], "arm64");
 }
 
 #[test]

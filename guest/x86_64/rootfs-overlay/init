@@ -1,0 +1,39 @@
+#!/bin/busybox sh
+
+export HOME=/root
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+fail() {
+    echo "RISH_X86_64_BOOT_FAILED: $1"
+    echo "Dropping to the emergency shell on the kernel console."
+    exec /bin/sh -l
+}
+
+mkdir -p /proc /sys /dev /run || fail "cannot create mount points"
+mount -t proc proc /proc || fail "cannot mount proc"
+mount -t sysfs sysfs /sys || fail "cannot mount sysfs"
+
+if ! grep -q ' /dev devtmpfs ' /proc/mounts; then
+    mount -t devtmpfs devtmpfs /dev || fail "cannot mount devtmpfs"
+fi
+
+mkdir -p /dev/pts || fail "cannot create /dev/pts"
+if ! grep -q ' /dev/pts devpts ' /proc/mounts; then
+    mount -t devpts devpts /dev/pts -o mode=0620,ptmxmode=0666 ||
+        fail "cannot mount devpts"
+fi
+ln -snf pts/ptmx /dev/ptmx || fail "cannot link /dev/ptmx"
+
+mount -t tmpfs tmpfs /run -o mode=0755,nosuid,nodev ||
+    fail "cannot mount /run"
+
+mkdir -p /sys/fs/cgroup || fail "cannot create cgroup mount point"
+mount -t cgroup2 cgroup2 /sys/fs/cgroup ||
+    fail "cannot mount cgroup v2"
+
+hostname rish-guest 2>/dev/null || true
+echo "RISH_X86_64_BOOT_OK"
+echo "Linux $(uname -r) on $(uname -m); cgroup v2 and devpts are mounted."
+echo "This is the diagnostic BusyBox shell, not the full OCI/systemd guest."
+exec /bin/sh -l
+

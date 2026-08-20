@@ -4,9 +4,9 @@ use std::io::Read;
 use rish_content::{BlobDescriptor, ContentStore, Lease, Sha256Digest};
 use rish_oci::ImageConfiguration;
 use rish_registry::{
-    Descriptor, Digest, ImageManifest, ImageReference, ManifestDocument, MediaType,
-    PlatformRequest, RegistryRequest, RegistryResponse, RegistryStreamResponse, RegistryTransport,
-    ValidationPolicy, select_platform,
+    Descriptor, Digest, GuestPlatform, ImageManifest, ImageReference, ManifestDocument, MediaType,
+    PlatformRequest, RegistryRequest, RegistryStreamResponse, RegistryTransport, ValidationPolicy,
+    select_platform,
 };
 
 use crate::json_limits::validate_json_shape;
@@ -131,6 +131,16 @@ where
         self
     }
 
+    /// Selects one of the explicitly supported guest image platforms.
+    ///
+    /// Index matching is exact: ARM64 requires `v8`, while AMD64 requires a
+    /// variantless `linux/amd64` descriptor.
+    #[must_use]
+    pub fn with_guest_platform(mut self, platform: GuestPlatform) -> Self {
+        self.platform = platform.selection_request();
+        self
+    }
+
     #[must_use]
     pub fn policy(&self) -> PullPolicy {
         self.policy
@@ -248,16 +258,15 @@ where
 
         let media_type = required_content_type(&response.headers)?;
         let kind = document_kind(&media_type)?;
-        let registry_digest = required_registry_digest(&response.headers)?;
-        ensure_sha256(&registry_digest, kind)?;
-
-        let digest = if let Some(expected) = reference.digest() {
-            expected.clone()
+        let (digest, header_policy) = if let Some(expected) = reference.digest() {
+            (expected.clone(), ValidationPolicy::descriptor_headers())
         } else {
-            registry_digest
+            let registry_digest = required_registry_digest(&response.headers)?;
+            ensure_sha256(&registry_digest, kind)?;
+            (registry_digest, ValidationPolicy::strict_headers())
         };
         let descriptor = synthetic_descriptor(media_type, digest, size);
-        response.validate_descriptor_metadata(&descriptor, ValidationPolicy::strict_headers())?;
+        response.validate_descriptor_metadata(&descriptor, header_policy)?;
         budget.charge(size)?;
         read_small_verified(response, descriptor, self.manifest_limit(), kind)
     }
@@ -277,7 +286,8 @@ where
         }
         .with_response_body_limit(descriptor.size.min(maximum));
         let response = self.transport.execute(&request)?;
-        response.validate_descriptor_metadata(descriptor, ValidationPolicy::strict_headers())?;
+        response
+            .validate_descriptor_metadata(descriptor, ValidationPolicy::descriptor_headers())?;
         read_small_verified(response, descriptor.clone(), maximum, kind)
     }
 
@@ -289,7 +299,8 @@ where
     ) -> Result<PulledBlob, PullError> {
         let request = RegistryRequest::blob(reference, descriptor);
         let response = self.transport.execute(&request)?;
-        response.validate_descriptor_metadata(descriptor, ValidationPolicy::strict_headers())?;
+        response
+            .validate_descriptor_metadata(descriptor, ValidationPolicy::descriptor_headers())?;
         let expected = cas_descriptor(descriptor)?;
         let stored = lease.ingest_verified(response.body, expected)?;
         Ok(PulledBlob {
@@ -358,7 +369,7 @@ where
                 actual_architecture: configuration.architecture.clone(),
             });
         }
-        configuration.validate()?;
+        configuration.validate_linux_guest_metadata()?;
         if configuration.rootfs.diff_ids.len() != manifest.layers.len() {
             return Err(PullError::LayerDiffIdCountMismatch {
                 diff_ids: configuration.rootfs.diff_ids.len(),
@@ -505,6 +516,8 @@ fn store_payload(lease: &Lease, payload: VerifiedPayload) -> Result<PulledBlob, 
     })
 }
 
+/// Reads a bounded config/manifest after the caller has validated its response
+/// metadata, then independently verifies the descriptor size and digest.
 fn read_small_verified<B: Read>(
     response: RegistryStreamResponse<B>,
     descriptor: Descriptor,
@@ -517,11 +530,7 @@ fn read_small_verified<B: Read>(
         limit: maximum,
         actual: descriptor.size,
     })?;
-    let RegistryStreamResponse {
-        status,
-        headers,
-        body,
-    } = response;
+    let RegistryStreamResponse { body, .. } = response;
     let mut body = body.take(descriptor.size);
     let mut buffered = Vec::with_capacity(capacity);
     body.read_to_end(&mut buffered)?;
@@ -537,15 +546,24 @@ fn read_small_verified<B: Read>(
         );
     }
 
-    let response = RegistryResponse {
-        status,
-        headers,
-        body: buffered,
-    };
-    response.validate_descriptor(&descriptor, ValidationPolicy::strict_headers())?;
+    let actual = u64::try_from(buffered.len())
+        .map_err(|_| rish_registry::ResponseValidationError::BodyTooLarge)?;
+    if actual != descriptor.size {
+        return Err(
+            rish_registry::ResponseValidationError::DescriptorSizeMismatch {
+                expected: descriptor.size,
+                actual,
+            }
+            .into(),
+        );
+    }
+    descriptor
+        .digest
+        .verify(&buffered)
+        .map_err(rish_registry::ResponseValidationError::from)?;
     Ok(VerifiedPayload {
         descriptor,
-        body: response.body,
+        body: buffered,
     })
 }
 

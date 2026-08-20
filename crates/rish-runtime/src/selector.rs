@@ -8,6 +8,23 @@ use serde::{Deserialize, Serialize};
 
 use crate::profile::VerifiedNativeProfile;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+enum VerifiedGuestArchitecture {
+    #[serde(rename = "arm64")]
+    Arm64,
+    #[serde(rename = "amd64")]
+    Amd64,
+}
+
+impl VerifiedGuestArchitecture {
+    const fn oci_name(self) -> &'static str {
+        match self {
+            Self::Arm64 => "arm64",
+            Self::Amd64 => "amd64",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendClass {
@@ -21,11 +38,27 @@ pub enum BackendClass {
 /// Native-Linux and full-VM candidates require evidence-gated tokens.
 /// Candidates are serializable for diagnostics but deliberately cannot be
 /// deserialized into trusted runtime state.
+///
+/// A serialized diagnostic cannot be promoted back into a trusted candidate:
+///
+/// ```compile_fail
+/// use rish_runtime::BackendCandidate;
+///
+/// let json = r#"{
+///   "class":"full_virtual_machine",
+///   "profile":{},
+///   "startup_cost":0,
+///   "verified_guest_architecture":"amd64"
+/// }"#;
+/// let _: BackendCandidate = serde_json::from_str(json).unwrap();
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct BackendCandidate {
     class: BackendClass,
     profile: CapabilityProfile,
     startup_cost: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verified_guest_architecture: Option<VerifiedGuestArchitecture>,
 }
 
 impl BackendCandidate {
@@ -38,6 +71,7 @@ impl BackendCandidate {
             class: BackendClass::PortableOffload,
             profile,
             startup_cost,
+            verified_guest_architecture: None,
         })
     }
 
@@ -67,6 +101,7 @@ impl BackendCandidate {
             class: BackendClass::NativeLinux,
             profile: profile.capabilities().clone(),
             startup_cost,
+            verified_guest_architecture: None,
         })
     }
 
@@ -87,10 +122,26 @@ impl BackendCandidate {
                 "full-VM candidate requires a verified guest execution capability",
             ));
         }
+        let session = vm.session();
+        if session.peer().platform != "linux"
+            || session.peer().architecture != session.capabilities().architecture
+        {
+            return Err(BackendCandidateError::new(
+                "full-VM candidate requires a consistent verified Linux guest identity",
+            ));
+        }
+        let verified_guest_architecture = canonical_oci_architecture(&session.peer().architecture)
+            .ok_or_else(|| {
+                BackendCandidateError::new(format!(
+                    "full-VM candidate has unsupported verified guest architecture {}",
+                    session.peer().architecture
+                ))
+            })?;
         Ok(Self {
             class: BackendClass::FullVirtualMachine,
             profile: profile.clone(),
             startup_cost,
+            verified_guest_architecture: Some(verified_guest_architecture),
         })
     }
 
@@ -107,6 +158,18 @@ impl BackendCandidate {
     #[must_use]
     pub fn startup_cost(&self) -> u32 {
         self.startup_cost
+    }
+
+    /// Returns the OCI architecture authenticated by the live VM bootstrap.
+    ///
+    /// This is present only for [`BackendClass::FullVirtualMachine`]. The
+    /// `BootedVm` handshake has already matched both guest identity fields to
+    /// the configured VM architecture. Native architecture spellings are
+    /// normalized to OCI (`aarch64` → `arm64`, `x86_64` → `amd64`).
+    #[must_use]
+    pub fn verified_guest_architecture(&self) -> Option<&str> {
+        self.verified_guest_architecture
+            .map(VerifiedGuestArchitecture::oci_name)
     }
 }
 
@@ -223,6 +286,14 @@ fn validate_portable_profile(profile: &CapabilityProfile) -> Result<(), BackendC
         ));
     }
     Ok(())
+}
+
+fn canonical_oci_architecture(guest_architecture: &str) -> Option<VerifiedGuestArchitecture> {
+    match guest_architecture {
+        "aarch64" | "arm64" => Some(VerifiedGuestArchitecture::Arm64),
+        "x86_64" | "amd64" => Some(VerifiedGuestArchitecture::Amd64),
+        _ => None,
+    }
 }
 
 fn score(candidate: &BackendCandidate, policy: SelectionPolicy) -> (u8, u32) {

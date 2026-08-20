@@ -7,6 +7,10 @@ use rish_runtime::{
 };
 use serde::{Deserialize, Serialize};
 
+mod pull_ffi;
+
+pub use pull_ffi::{RishRegistryFetchCallback, pull_image_json};
+
 const MAX_ABI_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_FFI_APPLET_BYTES: usize = 1024 * 1024;
 const MAX_FFI_FILESYSTEM_ENTRIES: usize = 10_000;
@@ -227,6 +231,30 @@ pub unsafe extern "C" fn rish_execute_applet_json(
     input_len: usize,
 ) -> *mut c_char {
     unsafe { invoke_json_abi(input, input_len, execute_applet_json) }
+}
+
+/// Pulls and verifies one OCI image through a trusted host HTTP callback.
+///
+/// The operation is synchronous and may block on network and filesystem I/O.
+/// Mobile callers must invoke it on a worker thread. Response bodies travel
+/// through the borrowed file descriptor supplied to `fetch`; they are never
+/// encoded into the JSON control envelopes.
+///
+/// # Safety
+///
+/// `input` must point to `input_len` readable bytes. `fetch`, when present,
+/// must obey [`RishRegistryFetchCallback`]'s pointer and file-descriptor
+/// contract. `context` is passed through unchanged and must remain valid until
+/// this function returns. The returned pointer must be released exactly once
+/// with [`rish_string_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rish_pull_image_json(
+    input: *const c_char,
+    input_len: usize,
+    fetch: Option<RishRegistryFetchCallback>,
+    context: *mut std::ffi::c_void,
+) -> *mut c_char {
+    unsafe { pull_ffi::invoke_pull_image_abi(input, input_len, fetch, context) }
 }
 
 unsafe fn invoke_json_abi(

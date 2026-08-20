@@ -11,6 +11,8 @@ use rish_guest_protocol::{
 
 use super::*;
 
+mod interactive;
+
 fn host_hello(max_frame_size: u32, versions: Vec<ProtocolVersion>) -> Hello {
     Hello {
         request_id: request_id("hello-1"),

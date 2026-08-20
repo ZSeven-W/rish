@@ -297,10 +297,13 @@ impl RegistryRequest {
         headers
             .insert("accept", MediaType::manifest_accept_header())
             .expect("static Accept header is valid");
+        headers
+            .insert("accept-encoding", "identity")
+            .expect("static Accept-Encoding header is valid");
         Self {
             method: HttpMethod::Get,
             scheme: RegistryScheme::Https,
-            authority: image.registry().to_owned(),
+            authority: image.distribution_authority().to_owned(),
             path_and_query: image.manifest_path(),
             headers,
             body: Vec::new(),
@@ -310,12 +313,18 @@ impl RegistryRequest {
 
     #[must_use]
     pub fn blob(image: &ImageReference, descriptor: &Descriptor) -> Self {
+        let mut headers = HeaderMap::default();
+        // Descriptor digests cover the representation bytes, so transports
+        // must not negotiate a content coding that changes those bytes.
+        headers
+            .insert("accept-encoding", "identity")
+            .expect("static Accept-Encoding header is valid");
         Self {
             method: HttpMethod::Get,
             scheme: RegistryScheme::Https,
-            authority: image.registry().to_owned(),
+            authority: image.distribution_authority().to_owned(),
             path_and_query: image.blob_path(&descriptor.digest),
-            headers: HeaderMap::default(),
+            headers,
             body: Vec::new(),
             max_response_bytes: descriptor.size,
         }
@@ -493,9 +502,24 @@ mod tests {
                 .unwrap()
                 .contains("image.index")
         );
+        assert_eq!(manifest.headers.get("accept-encoding"), Some("identity"));
+        assert_eq!(blob.headers.get("accept-encoding"), Some("identity"));
         assert!(blob.path_and_query.contains("/blobs/sha256:"));
         assert_eq!(blob.max_response_bytes, descriptor().size);
         assert_eq!(manifest.max_response_bytes, DEFAULT_MANIFEST_RESPONSE_LIMIT);
+    }
+
+    #[test]
+    fn docker_hub_requests_use_its_distribution_api_authority() {
+        let image: ImageReference = "alpine".parse().unwrap();
+        let request = RegistryRequest::manifest(&image);
+
+        assert_eq!(image.to_string(), "docker.io/library/alpine:latest");
+        assert_eq!(request.authority, "registry-1.docker.io");
+        assert_eq!(
+            request.uri(),
+            "https://registry-1.docker.io/v2/library/alpine/manifests/latest"
+        );
     }
 
     #[test]

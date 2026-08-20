@@ -10,6 +10,7 @@ mod error;
 mod json_limits;
 mod policy;
 mod puller;
+mod verified_image;
 
 pub use error::{BlobKind, LimitKind, PullError};
 pub use json_limits::JsonLimits;
@@ -18,6 +19,12 @@ pub use policy::{
     DEFAULT_MAX_MANIFEST_BYTES, DEFAULT_MAX_TOTAL_BYTES, PullPolicy,
 };
 pub use puller::{PulledBlob, PulledImage, Puller};
+pub use rish_registry::GuestPlatform;
+pub use verified_image::{
+    VERIFIED_IMAGE_RECORD_SCHEMA_VERSION, VerifiedDescriptor, VerifiedImageHandle,
+    VerifiedImageLayer, VerifiedImageRecord, VerifiedImageRecordError, VerifiedImageRecordStore,
+    VerifiedPlatform, VerifiedProcessConfig,
+};
 
 #[cfg(test)]
 mod tests;

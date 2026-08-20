@@ -1,6 +1,94 @@
+use std::fmt;
+
+use serde::de::{self, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 use crate::{Descriptor, ImageIndex, Platform};
+
+pub const MAX_GUEST_PLATFORM_TOKEN_BYTES: usize = 32;
+
+/// Guest platforms accepted by the mobile image-pull boundary.
+///
+/// This is deliberately a closed enum: accepting an image for storage does
+/// not imply that an execution backend for its architecture is available.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub enum GuestPlatform {
+    #[default]
+    #[serde(rename = "linux/arm64/v8")]
+    LinuxArm64V8,
+    #[serde(rename = "linux/amd64")]
+    LinuxAmd64,
+}
+
+impl GuestPlatform {
+    #[must_use]
+    pub const fn os(self) -> &'static str {
+        "linux"
+    }
+
+    #[must_use]
+    pub const fn architecture(self) -> &'static str {
+        match self {
+            Self::LinuxArm64V8 => "arm64",
+            Self::LinuxAmd64 => "amd64",
+        }
+    }
+
+    #[must_use]
+    pub const fn variant(self) -> Option<&'static str> {
+        match self {
+            Self::LinuxArm64V8 => Some("v8"),
+            Self::LinuxAmd64 => None,
+        }
+    }
+
+    /// Returns an exact index-selection request for this guest platform.
+    #[must_use]
+    pub fn selection_request(self) -> PlatformRequest {
+        match self {
+            Self::LinuxArm64V8 => PlatformRequest::new("linux", "arm64")
+                .with_variant_preferences(["v8"])
+                .allow_variantless_fallback(false),
+            Self::LinuxAmd64 => {
+                PlatformRequest::new("linux", "amd64").allow_variantless_fallback(true)
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for GuestPlatform {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct GuestPlatformVisitor;
+
+        impl Visitor<'_> for GuestPlatformVisitor {
+            type Value = GuestPlatform;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a supported bounded guest platform token")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                if value.len() > MAX_GUEST_PLATFORM_TOKEN_BYTES {
+                    return Err(E::custom("guest platform token exceeds its byte limit"));
+                }
+                match value {
+                    "linux/arm64/v8" => Ok(GuestPlatform::LinuxArm64V8),
+                    "linux/amd64" => Ok(GuestPlatform::LinuxAmd64),
+                    _ => Err(E::custom("unsupported guest platform")),
+                }
+            }
+        }
+
+        deserializer.deserialize_str(GuestPlatformVisitor)
+    }
+}
 
 /// Ordered platform constraints for selecting a manifest from an OCI index.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -271,5 +359,52 @@ mod tests {
             .requiring_os_features(["cgroup-v2"]);
 
         assert!(select_platform(&index(vec![matching]), &request).is_ok());
+    }
+
+    #[test]
+    fn guest_platform_selection_is_exact_for_arm64_v8_and_amd64() {
+        let candidates = index(vec![
+            manifest("linux", "arm64", None, 1),
+            manifest("linux", "arm64", Some("v8"), 2),
+            manifest("linux", "arm64", Some("v9"), 3),
+            manifest("linux", "amd64", None, 4),
+            manifest("linux", "amd64", Some("future"), 5),
+        ]);
+
+        let arm64 = select_platform(
+            &candidates,
+            &GuestPlatform::LinuxArm64V8.selection_request(),
+        )
+        .unwrap();
+        assert_eq!(arm64.digest, Digest::sha256(&[2]));
+
+        let amd64 =
+            select_platform(&candidates, &GuestPlatform::LinuxAmd64.selection_request()).unwrap();
+        assert_eq!(amd64.digest, Digest::sha256(&[4]));
+    }
+
+    #[test]
+    fn unsupported_guest_platform_or_variant_is_rejected_by_the_typed_boundary() {
+        assert!(serde_json::from_str::<GuestPlatform>("\"linux/riscv64\"").is_err());
+        assert!(serde_json::from_str::<GuestPlatform>("\"linux/arm64/v9\"").is_err());
+
+        let incompatible = index(vec![
+            manifest("linux", "arm64", Some("v9"), 1),
+            manifest("linux", "amd64", Some("future"), 2),
+        ]);
+        assert!(
+            select_platform(
+                &incompatible,
+                &GuestPlatform::LinuxArm64V8.selection_request()
+            )
+            .is_err()
+        );
+        assert!(
+            select_platform(
+                &incompatible,
+                &GuestPlatform::LinuxAmd64.selection_request()
+            )
+            .is_err()
+        );
     }
 }

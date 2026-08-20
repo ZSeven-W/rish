@@ -26,6 +26,22 @@ impl ValidationPolicy {
             require_registry_digest: true,
         }
     }
+
+    /// Requires representation metadata while treating the registry digest as
+    /// optional for a response already anchored by a trusted descriptor.
+    ///
+    /// Docker Hub redirects blobs to a CDN whose final response retains the
+    /// exact `Content-Length` and uses `application/octet-stream`, but omits
+    /// `Docker-Content-Digest`. If that header is present it is still parsed
+    /// and required to match by the common validation path below.
+    #[must_use]
+    pub const fn descriptor_headers() -> Self {
+        Self {
+            require_content_length: true,
+            require_content_type: true,
+            require_registry_digest: false,
+        }
+    }
 }
 
 /// Proof that a complete registry response matched a trusted descriptor.
@@ -330,6 +346,67 @@ mod tests {
                 .unwrap_err(),
             ResponseValidationError::MissingContentLength
         );
+    }
+
+    #[test]
+    fn descriptor_policy_accepts_docker_cdn_metadata_without_registry_digest() {
+        let (descriptor, mut response) = fixture();
+        let mut headers = HeaderMap::default();
+        headers
+            .insert("content-type", MediaType::OCTET_STREAM)
+            .unwrap();
+        headers
+            .insert("content-length", descriptor.size.to_string())
+            .unwrap();
+        response.headers = headers;
+
+        assert!(
+            response
+                .validate_descriptor(&descriptor, ValidationPolicy::descriptor_headers())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn descriptor_policy_still_requires_size_type_and_matches_optional_digest() {
+        let (descriptor, mut response) = fixture();
+        let mut missing_length = HeaderMap::default();
+        missing_length
+            .insert("content-type", MediaType::OCTET_STREAM)
+            .unwrap();
+        response.headers = missing_length;
+        assert_eq!(
+            response
+                .validate_descriptor(&descriptor, ValidationPolicy::descriptor_headers())
+                .unwrap_err(),
+            ResponseValidationError::MissingContentLength
+        );
+
+        let (descriptor, mut response) = fixture();
+        let mut missing_type = HeaderMap::default();
+        missing_type
+            .insert("content-length", descriptor.size.to_string())
+            .unwrap();
+        response.headers = missing_type;
+        assert_eq!(
+            response
+                .validate_descriptor(&descriptor, ValidationPolicy::descriptor_headers())
+                .unwrap_err(),
+            ResponseValidationError::MissingContentType
+        );
+
+        let (descriptor, mut response) = fixture();
+        response
+            .headers
+            .insert(
+                "docker-content-digest",
+                Digest::sha256(b"other").to_string(),
+            )
+            .unwrap();
+        assert!(matches!(
+            response.validate_descriptor(&descriptor, ValidationPolicy::descriptor_headers()),
+            Err(ResponseValidationError::RegistryDigestMismatch { .. })
+        ));
     }
 
     #[test]

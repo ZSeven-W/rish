@@ -12,3 +12,7 @@ rish-runtime.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+rish-guest-protocol.workspace = true
+rish-vm.workspace = true

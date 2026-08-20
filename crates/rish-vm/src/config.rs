@@ -56,20 +56,30 @@ pub struct VmConfig {
 
 impl VmConfig {
     pub fn validate(&self) -> Result<(), VmError> {
-        if self.architecture != "aarch64" {
-            return Err(VmError::InvalidConfig(
-                "the mobile backend currently requires aarch64".to_owned(),
-            ));
-        }
+        let minimum_memory_mib = match (self.architecture.as_str(), self.acceleration) {
+            ("aarch64", _) => 256,
+            ("x86_64", VmAcceleration::Interpreter) => 128,
+            ("x86_64", _) => {
+                return Err(VmError::InvalidConfig(
+                    "x86_64 guests currently require software interpreter acceleration".to_owned(),
+                ));
+            }
+            _ => {
+                return Err(VmError::InvalidConfig(
+                    "the mobile backend currently supports aarch64 or interpreted x86_64"
+                        .to_owned(),
+                ));
+            }
+        };
         if self.vcpus == 0 {
             return Err(VmError::InvalidConfig(
                 "at least one virtual CPU is required".to_owned(),
             ));
         }
-        if self.memory_mib < 256 {
-            return Err(VmError::InvalidConfig(
-                "at least 256 MiB of guest memory is required".to_owned(),
-            ));
+        if self.memory_mib < minimum_memory_mib {
+            return Err(VmError::InvalidConfig(format!(
+                "at least {minimum_memory_mib} MiB of guest memory is required"
+            )));
         }
         if self.kernel_path.is_empty() || self.root_disk_path.is_empty() {
             return Err(VmError::InvalidConfig(
@@ -95,5 +105,38 @@ pub(crate) fn platform_name(platform: Platform) -> &'static str {
         Platform::Android => "android",
         Platform::Harmony => "harmony",
         Platform::Linux => "linux",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(architecture: &str, acceleration: VmAcceleration, memory_mib: u32) -> VmConfig {
+        VmConfig {
+            architecture: architecture.to_owned(),
+            vcpus: 1,
+            memory_mib,
+            kernel_path: "/kernel".to_owned(),
+            initrd_path: None,
+            root_disk_path: "/root.img".to_owned(),
+            acceleration,
+            devices: vec![VmDevice::Console],
+        }
+    }
+
+    #[test]
+    fn interpreted_x86_64_accepts_bounded_mobile_memory() {
+        config("x86_64", VmAcceleration::Interpreter, 128)
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn x86_64_rejects_hardware_acceleration_labels() {
+        let error = config("x86_64", VmAcceleration::Kvm, 256)
+            .validate()
+            .unwrap_err();
+        assert!(matches!(error, VmError::InvalidConfig(_)));
     }
 }

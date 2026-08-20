@@ -28,12 +28,13 @@ portable backend。
 
 - [x] OCI/Docker 引用、Registry 请求和 Bearer challenge 解析
 - [x] descriptor/header/body digest、size 和 media type 校验
-- [x] `linux/arm64` index/manifest 选择
+- [x] 严格 `linux/arm64/v8` 与 `linux/amd64` index/manifest 选择
 - [x] digest CAS、lease、persistent pin 和 garbage collection
 - [x] 安全 tar/gzip layer 解包、diff-id 及 whiteout
 - [x] 私有 staging 与 atomic no-replace rootfs snapshot
 - [x] manifest/config/layer count/单层/总下载资源上限
-- [ ] URLSession、OkHttp、ArkTS HTTP transport 与 token 获取
+- [x] iOS URLSession streaming transport 与 Docker Bearer token 获取
+- [ ] Android OkHttp、ArkTS HTTP transport 与 token 获取
 - [ ] 签名/attestation hook
 - [ ] Keychain/Keystore/安全存储凭据适配
 
@@ -53,23 +54,26 @@ portable backend。
 
 验收：同一个带 `io.rish.offload.handler` 的镜像可在三端运行，输出一致。
 
-## P3：Full VM boot
+## P3：AMD64 Full VM boot
 
-- 软件 ARM64 CPU/MMU/exception interpreter
-- GICv3、timer 和 PSCI
-- virtio-blk、console、rng、net、vsock
-- Linux kernel/initramfs/ext4 可复现构建
+- [ ] 无 JIT 的 x86_64 全系统软件解释器
+- [ ] long mode、四级页表、APIC/PIC/PIT/RTC 与 PCI
+- [ ] virtio-blk、16550 console、rng、net 与独立 guest control channel
+- [ ] x86_64 Linux kernel/initramfs/ext4 可复现构建
 - [x] 版本化 Guest RPC 协议
 - [x] evidence-gated VM probe/boot/HelloAck/Kconfig/capability profile
 - [x] bootstrap Rust guest agent、严格握手和 capability gate
-- [x] 非阻塞 exec 监督、Cancel、timeout、进程组清理和有界输出
+- [x] 非阻塞 exec、Cancel、timeout、进程组清理、streaming 与 Linux PTY
+- [x] 固定 `linux/amd64` 镜像平台贯穿 pull、记录、FFI 与 Full VM 规划
 - [ ] Youki/systemd capability probe 与完整 guest agent handler
 - [ ] Native Linux OEM executor 与执行时主动 syscall 重验
-- 用户态 NAT、DNS、TCP/UDP 端口转发
-- suspend/checkpoint/restore
+- [ ] 用户态 NAT、DNS、TCP/UDP 端口转发
+- [ ] suspend/checkpoint/restore
 
-现实工程策略：先用成熟全系统后端验证 guest 协议，再并行推进纯 Rust
-解释器。若引入 QEMU，发行和链接必须单独完成 GPL 合规评审。
+现实工程策略：Rust 负责 OCI、生命周期、安全门和 provider ABI；首个可用
+provider 采用 UTM QEMU TCTI 的 no-JIT x86_64 full-system 路径。纯 Rust
+provider 可并行实验，但必须通过同一真实 boot/handshake gate。QEMU 链接和
+发行必须单独完成 GPL 合规评审。
 
 验收：三端 stock 设备能够启动同一 Linux guest、执行 shell，并在前台
 保持稳定；iOS 不承诺后台常驻。
@@ -83,7 +87,7 @@ portable backend。
 - seccomp/capabilities
 - volumes、signals、TTY 和 lifecycle
 
-验收：通过 OCI runtime 核心测试并运行常用 `linux/arm64` 镜像。
+验收：通过 OCI runtime 核心测试并运行常用 `linux/amd64` 镜像。
 
 ## P5：systemd、网络和 privileged
 

@@ -1,9 +1,15 @@
 # iOS Simulator demo
 
-This minimal app links the real `rish-ffi` Rust static library and the
-production `RishBridge.swift`. It checks that `grep` plans as a
-`portable_applet`, executes the Rust `echo` applet inside an app-owned
-container directory, and renders plus persists the returned stdout.
+This app links the real `rish-ffi` Rust static library and the production iOS
+bridges. Its first tab can stream a real OCI image pull over HTTPS into the
+app-owned content store, with bounded response sizes, SHA-256 verification,
+per-blob progress, cancellation, and a verified receipt. The platform picker
+selects exact `linux/arm64/v8` or `linux/amd64` index entries. Pulling
+content does not start a container or execute image binaries.
+
+The Runtime tab checks that `grep` plans as a `portable_applet`, executes the
+Rust `echo` applet inside an app-owned container directory, and renders plus
+persists the returned stdout.
 
 Run it from the repository root:
 
@@ -29,6 +35,39 @@ RISH_DEMO PASS
 Each launch carries a fresh run identifier, so the script cannot accept a
 result left behind by an earlier Simulator process. The script does not call
 `simctl uninstall`.
+
+Normal launches never start a network request. UI automation may opt in once
+per process by passing:
+
+```text
+--rish-auto-pull alpine:latest
+--rish-auto-platform linux/amd64
+```
+
+The platform flag is optional and defaults to `linux/arm64/v8`; any other
+token fails closed.
+
+The app atomically writes a short versioned result to
+`Documents/RishPullResult.json` when that pull succeeds, fails, or is
+cancelled. The regular `run-simulator.sh` success check remains the local
+Runtime self-test and does not wait for an image pull.
+
+For a real end-to-end pull check, including a fresh result, every pinned CAS
+blob's SHA-256, and the receipt's verified byte total, run:
+
+```sh
+examples/ios/run-pull-simulator.sh \
+    <Simulator-UDID> \
+    alpine:latest \
+    linux/amd64
+```
+
+The third argument accepts only `linux/arm64/v8` or `linux/amd64` and
+defaults to ARM64/v8.
+
+Set `RISH_PULL_SCREENSHOT` to an absolute `.png` path to capture the completed
+screen. The script uses the host's existing network and proxy configuration;
+it does not weaken TLS or install a registry certificate.
 
 This demonstrates portable userspace command semantics. It does not claim
 iOS namespaces, cgroups, device nodes, kernel modules, `systemd`, or a

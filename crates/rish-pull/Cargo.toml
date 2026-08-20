@@ -8,6 +8,7 @@ repository.workspace = true
 description = "Synchronous transport-agnostic OCI image pull pipeline for rish"
 
 [dependencies]
+libc = "0.2"
 rish-content.workspace = true
 rish-oci.workspace = true
 rish-registry.workspace = true

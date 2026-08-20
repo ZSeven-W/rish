@@ -280,7 +280,11 @@ name = "rish-ffi"
 version = "0.1.0"
 dependencies = [
  "rish-applets",
+ "rish-content",
  "rish-core",
+ "rish-oci",
+ "rish-pull",
+ "rish-registry",
  "rish-runtime",
  "serde",
  "serde_json",
@@ -294,6 +298,23 @@ dependencies = [
  "base64",
  "rish-guest-protocol",
  "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "rish-guest-importer"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "libc",
+ "rish-pull",
+ "rish-registry",
+ "sha2",
+ "tar",
+ "tempfile",
  "thiserror",
 ]
 
@@ -321,7 +342,9 @@ name = "rish-oci"
 version = "0.1.0"
 dependencies = [
  "rish-core",
+ "rish-guest-protocol",
  "rish-runtime",
+ "rish-vm",
  "serde",
  "serde_json",
  "thiserror",
@@ -332,6 +355,7 @@ name = "rish-pull"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "libc",
  "rish-content",
  "rish-oci",
  "rish-registry",
@@ -376,6 +400,18 @@ dependencies = [
  "rish-registry",
  "rustix",
  "tar",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "rish-softvm-x86_64"
+version = "0.1.0"
+dependencies = [
+ "rish-core",
+ "rish-guest-protocol",
+ "rish-vm",
+ "serde",
  "tempfile",
  "thiserror",
 ]

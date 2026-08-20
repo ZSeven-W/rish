@@ -2,22 +2,24 @@
 
 `rish` 是面向 iOS、Android 和鸿蒙的 Rust Linux 命令与容器语义运行时。
 
-项目采用 **native-offload first、Linux VM fallback** 的路线：
+项目采用 **native-offload first、AMD64 Linux software-VM fallback** 的路线：
 
 - 已知 Guest 命令由 Rust 拦截并分派给 Swift/Objective-C、Kotlin/Java、
   ArkTS 或系统特权服务。
 - OCI 镜像可以请求原生 handler 契约；只有宿主 live allow-list 已绑定同名
   handler 时才会采用，无需解释执行其中的 ELF。
 - 未知 ELF、真正的 systemd、Docker-in-Docker、内核模块和完整网络
-  namespace 必须进入真实 Linux guest 或经过探测的宿主 Linux 后端。
+  namespace 必须进入纯软件 x86_64 全系统模拟器中的真实 Linux guest，
+  或经过探测的宿主 Linux 后端。
 - 能力不足时失败关闭，不会把“模拟成功”伪装成真实内核隔离。
 
 > 当前状态：P1 数据面原型。能力模型、三端 native-offload SDK、OCI
 > Registry/CAS、安全解层、事务 rootfs snapshot、Guest RPC 与 bootstrap
-> agent 已可编译测试；VM 候选必须经过 probe、boot、握手、Kconfig 和
-> Guest capability 证据链才能进入调度。三端最小 Demo 已接入；平台
-> HTTP/凭据适配、完整 VM engine、Youki/Docker guest 和产品级移动端应用
-> 仍未实现。
+> agent 已可编译测试；iOS Simulator 已真实拉取并校验 Docker Hub 的
+> `alpine:latest` `linux/amd64` 图。VM 候选仍必须经过 probe、真实 Linux
+> boot、握手、Kconfig 和 Guest capability 证据链才能进入调度。三端最小
+> Demo 已接入；x86_64 TCTI provider、Linux boot-to-agent、Android/鸿蒙
+> Registry transport 和产品级应用仍未完成。
 
 ## 架构
 
@@ -72,7 +74,7 @@ crates/
   rish-core/       公共命令、能力、后端与 host-call 协议
   rish-content/    SHA-256 CAS、process-local lease、persistent pin 与 GC
   rish-registry/   OCI 引用、manifest/index、Bearer challenge 与响应校验
-  rish-pull/       有资源上限的 linux/arm64 镜像拉取流水线
+  rish-pull/       有资源上限的 linux/arm64/v8 与 linux/amd64 拉取流水线
   rish-layer/      tar/gzip、diff-id、whiteout 与防路径逃逸的安全解层
   rish-snapshot/   私有 staging 和 atomic no-replace rootfs 发布
   rish-runtime/    路由、后端选择、namespace/cgroup/device/service 模型
@@ -80,6 +82,8 @@ crates/
   rish-vm/         evidence-gated VM 启动、设备配置和 guest 内核合同
   rish-guest-protocol/  Host/guest 握手、执行、OCI、端口和 checkpoint RPC
   rish-guest-agent/     Linux guest 内的失败关闭 bootstrap agent
+  rish-guest-importer/  Guest 内流式校验、解层和 Linux 元数据发布
+  rish-softvm-x86_64/   无 JIT x86_64 TCTI provider 的 Rust 安全边界
   rish-ffi/        Swift/JNI/N-API 可调用的稳定 JSON C ABI
   rish-cli/        命令规划调试工具
 platform/
@@ -140,8 +144,8 @@ Swift、Kotlin/Java 和 ArkTS 侧现已包含二进制安全 HostCall/HostReply 
 的 App 内 service supervisor。未知 operation 和真实内核语义均失败关闭。
 
 Guest bootstrap exec 使用有界非阻塞监督器：长进程不会阻塞 Ping，Cancel、
-timeout、进程组清理、stdout/stderr 限额和定期 poll 均已接入。当前仍不提供
-TTY 或 streaming stdin。
+timeout、进程组清理、stdout/stderr 限额、streaming stdin/stdout/stderr 和
+Linux PTY 均已接入。它们尚未连接到真实启动的移动端 x86_64 guest。
 
 ## Linux 命令兼容层
 
@@ -201,9 +205,11 @@ evidence-gated `BackendCandidate` 和宿主构造的 `OffloadHandlerRegistry`；
 详细设计见 [架构说明](docs/architecture.md)、[平台能力矩阵](docs/platform-matrix.md)、
 [OCI 数据面](docs/oci-pipeline.md)、[Linux 命令兼容说明](docs/command-compatibility.md)、
 [offload-first 决策](docs/decisions/0001-offload-first.md) 和
+[纯软件 Linux 决策](docs/decisions/0002-pure-software-linux.md)、
 [路线图](docs/roadmap.md)。
 
 ## 许可证
 
-项目代码采用 MIT License。不得复制 iSH/OpenMinis/PRoot 的 GPL 实现到
-本仓库；若后续分发 QEMU 或 Linux guest，需分别履行其 GPL 和源码提供义务。
+项目自有 Rust 代码采用 MIT License。可选 QEMU TCTI provider、Linux kernel
+和 guest 发行物保持各自许可证；链接或分发 QEMU 的产品必须单独履行 GPLv2
+源码与再分发义务。

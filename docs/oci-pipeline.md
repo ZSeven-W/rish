@@ -7,7 +7,7 @@ parse reference
   → GET /v2/<repo>/manifests/<tag-or-digest>
   → authenticate and bound response size
   → verify response digest before parsing
-  → choose linux/arm64 descriptor from index
+  → choose the exact requested linux/arm64/v8 or linux/amd64 descriptor
   → fetch image manifest by digest
   → fetch config and every layer by digest
   → atomically commit verified blobs to CAS
@@ -91,17 +91,18 @@ multiple processes opening the same store require an external exclusive lock.
 
 ## Platform selection
 
-The initial execution target is:
+The Full VM execution target is:
 
 ```text
 os = linux
-architecture = arm64
-variant = v8 or absent
+architecture = amd64
+variant = absent
 ```
 
-Exact matches win over descriptors with an absent variant. Windows manifests,
-foreign layers and unsupported compression formats are rejected rather than
-silently selected.
+The native-offload path can also request exact `linux/arm64/v8`. Both platform
+records may coexist for one multi-architecture index digest without overwriting
+one another. AMD64 variants, Windows manifests, foreign layers and unsupported
+compression formats are rejected rather than silently selected.
 
 ## Whiteouts
 

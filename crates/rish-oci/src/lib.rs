@@ -46,18 +46,31 @@ pub struct ImageConfiguration {
 
 impl ImageConfiguration {
     pub fn validate(&self) -> Result<(), OciError> {
-        if self.os != "linux" {
+        if self.os != "linux" || self.architecture != "arm64" {
             return Err(OciError::UnsupportedPlatform {
                 os: self.os.clone(),
                 architecture: self.architecture.clone(),
             });
         }
-        if self.architecture != "arm64" {
+        self.validate_metadata()
+    }
+
+    /// Validates metadata that may be stored for a full Linux guest.
+    ///
+    /// This does not assert that the current host can execute the image. A VM
+    /// launch path must separately match this architecture against the
+    /// authenticated guest session before dispatch.
+    pub fn validate_linux_guest_metadata(&self) -> Result<(), OciError> {
+        if self.os != "linux" || !matches!(self.architecture.as_str(), "arm64" | "amd64") {
             return Err(OciError::UnsupportedPlatform {
                 os: self.os.clone(),
                 architecture: self.architecture.clone(),
             });
         }
+        self.validate_metadata()
+    }
+
+    fn validate_metadata(&self) -> Result<(), OciError> {
         if self.rootfs.kind != "layers" {
             return Err(OciError::InvalidRootFilesystem(format!(
                 "rootfs type must be layers, got {}",
@@ -79,9 +92,6 @@ impl ImageConfiguration {
             .any(|entry| !valid_environment_entry(entry))
         {
             return Err(OciError::InvalidEnvironment);
-        }
-        if self.config.entrypoint.is_empty() && self.config.cmd.is_empty() {
-            return Err(OciError::MissingCommand);
         }
         Ok(())
     }
@@ -170,9 +180,18 @@ pub fn plan_image(
     backend: &BackendCandidate,
     handlers: &OffloadHandlerRegistry,
 ) -> ImageExecutionPlan {
-    if let Err(error) = image.validate() {
+    let validation = match backend.class() {
+        BackendClass::FullVirtualMachine => image.validate_linux_guest_metadata(),
+        BackendClass::PortableOffload | BackendClass::NativeLinux => image.validate(),
+    };
+    if let Err(error) = validation {
         return ImageExecutionPlan::Rejected {
             reason: error.to_string(),
+        };
+    }
+    if image.config.entrypoint.is_empty() && image.config.cmd.is_empty() {
+        return ImageExecutionPlan::Rejected {
+            reason: OciError::MissingCommand.to_string(),
         };
     }
 
@@ -217,6 +236,20 @@ pub fn plan_image(
             }
         }
         BackendClass::FullVirtualMachine => {
+            let Some(guest_architecture) = backend.verified_guest_architecture() else {
+                return ImageExecutionPlan::Rejected {
+                    reason: "full VM backend lacks a verified guest architecture".to_owned(),
+                };
+            };
+            if image.architecture != guest_architecture {
+                return ImageExecutionPlan::Rejected {
+                    reason: OciError::GuestArchitectureMismatch {
+                        image: image.architecture.clone(),
+                        guest: guest_architecture.to_owned(),
+                    }
+                    .to_string(),
+                };
+            }
             let profile = backend.profile();
             let has_exec = profile.level(Capability::LinuxElf)
                 == rish_core::SupportLevel::Virtualized
@@ -330,6 +363,9 @@ pub enum OciError {
     #[error("unsupported OCI platform: {os}/{architecture}")]
     UnsupportedPlatform { os: String, architecture: String },
 
+    #[error("OCI image architecture {image} does not match verified guest architecture {guest}")]
+    GuestArchitectureMismatch { image: String, guest: String },
+
     #[error("invalid OCI root filesystem: {0}")]
     InvalidRootFilesystem(String),
 
@@ -351,10 +387,116 @@ pub enum OciError {
 
 #[cfg(test)]
 mod tests {
-    use rish_core::{Platform, PrivilegeMode};
+    use rish_core::{Capability, GuestCommand, HostReply, Platform, PrivilegeMode};
+    use rish_guest_protocol::{
+        CURRENT_PROTOCOL_VERSION, Capability as GuestCapability, CapabilityStatus, Envelope,
+        GuestCapabilities, GuestLimits, HandshakeOutcome, HelloAck, Message, PeerInfo,
+        capability_name,
+    };
     use rish_runtime::portable_offload_profile;
+    use rish_vm::{
+        GuestChannel, GuestKernelContract, GuestKernelEvidence, GuestSession, KernelEvidenceSource,
+        VmAcceleration, VmCandidate, VmConfig, VmDevice, VmEngine, VmError, VmProbe,
+    };
 
     use super::*;
+
+    struct TestEngine;
+
+    struct TestChannel {
+        architecture: String,
+    }
+
+    impl VmEngine for TestEngine {
+        fn probe(&self) -> VmProbe {
+            VmProbe::available([VmAcceleration::Interpreter])
+        }
+
+        fn boot(&self, config: &VmConfig) -> Result<Box<dyn GuestChannel>, VmError> {
+            Ok(Box::new(TestChannel {
+                architecture: config.architecture.clone(),
+            }))
+        }
+    }
+
+    impl GuestChannel for TestChannel {
+        fn bootstrap(&self, hello: &Envelope) -> Result<Envelope, VmError> {
+            let Message::Hello(hello) = &hello.message else {
+                return Err(VmError::Guest("expected Hello".to_owned()));
+            };
+            Ok(Envelope::with_version(
+                CURRENT_PROTOCOL_VERSION,
+                Message::HelloAck(HelloAck {
+                    request_id: hello.request_id.clone(),
+                    outcome: HandshakeOutcome::Accepted {
+                        selected_version: CURRENT_PROTOCOL_VERSION,
+                        session_id: "oci-architecture-test".to_owned(),
+                        peer: PeerInfo {
+                            name: "guest".to_owned(),
+                            version: "0.1.0".to_owned(),
+                            platform: "linux".to_owned(),
+                            architecture: self.architecture.clone(),
+                        },
+                        capabilities: Box::new(GuestCapabilities {
+                            kernel_release: "6.12".to_owned(),
+                            architecture: self.architecture.clone(),
+                            init_system: "systemd".to_owned(),
+                            cgroup_version: Some(2),
+                            container_runtimes: vec!["youki".to_owned()],
+                            features: vec![GuestCapability {
+                                name: capability_name::EXEC.to_owned(),
+                                version: 1,
+                                status: CapabilityStatus::Available,
+                                attributes: BTreeMap::new(),
+                                reason: None,
+                            }],
+                        }),
+                        limits: GuestLimits {
+                            max_frame_size: rish_guest_protocol::DEFAULT_MAX_FRAME_SIZE as u32,
+                            max_concurrent_exec: 1,
+                            max_port_forwards: 0,
+                            max_stream_chunk_size: 32 * 1024,
+                        },
+                    },
+                }),
+            ))
+        }
+
+        fn kernel_config(&self, _session: &GuestSession) -> Result<GuestKernelEvidence, VmError> {
+            GuestKernelEvidence::new(
+                "oci-architecture-test",
+                KernelEvidenceSource::BuildManifest {
+                    kernel_release: "6.12".to_owned(),
+                    sha256: "a".repeat(64),
+                },
+                ["CONFIG_BINFMT_ELF"],
+            )
+        }
+
+        fn execute(&self, _command: &GuestCommand) -> Result<HostReply, VmError> {
+            Err(VmError::Guest("not used by OCI planner tests".to_owned()))
+        }
+    }
+
+    fn full_vm_backend(guest_architecture: &str) -> BackendCandidate {
+        let vm = VmCandidate::new(
+            Platform::Ios,
+            VmConfig {
+                architecture: guest_architecture.to_owned(),
+                vcpus: 1,
+                memory_mib: 512,
+                kernel_path: "/app/kernel".to_owned(),
+                initrd_path: None,
+                root_disk_path: "/app/root.img".to_owned(),
+                acceleration: VmAcceleration::Interpreter,
+                devices: vec![VmDevice::Console],
+            },
+            GuestKernelContract::new(["CONFIG_BINFMT_ELF"], [Capability::LinuxElf]),
+        )
+        .boot(&TestEngine)
+        .unwrap();
+        BackendCandidate::full_virtual_machine(&vm, 0).unwrap()
+    }
 
     fn portable_backend(platform: Platform) -> BackendCandidate {
         BackendCandidate::portable_offload(
@@ -379,6 +521,94 @@ mod tests {
                 diff_ids: Vec::new(),
             },
         }
+    }
+
+    #[test]
+    fn metadata_validation_allows_a_runtime_command_override() {
+        let mut image = image(BTreeMap::new());
+        image.config.entrypoint.clear();
+        image.config.cmd.clear();
+
+        image.validate().unwrap();
+
+        let backend = portable_backend(Platform::Ios);
+        assert!(matches!(
+            plan_image(&image, &backend, &OffloadHandlerRegistry::default()),
+            ImageExecutionPlan::Rejected { reason }
+                if reason == OciError::MissingCommand.to_string()
+        ));
+    }
+
+    #[test]
+    fn amd64_guest_metadata_does_not_widen_portable_or_native_planning() {
+        let mut image = image(BTreeMap::new());
+        image.architecture = "amd64".to_owned();
+
+        image.validate_linux_guest_metadata().unwrap();
+        assert!(matches!(
+            image.validate(),
+            Err(OciError::UnsupportedPlatform { architecture, .. })
+                if architecture == "amd64"
+        ));
+
+        let portable = portable_backend(Platform::Ios);
+        assert!(matches!(
+            plan_image(
+                &image,
+                &portable,
+                &OffloadHandlerRegistry::default()
+            ),
+            ImageExecutionPlan::Rejected { reason }
+                if reason.contains("unsupported OCI platform")
+        ));
+    }
+
+    #[test]
+    fn full_vm_executes_only_an_exact_verified_guest_architecture_match() {
+        let arm64 = full_vm_backend("aarch64");
+        let amd64 = full_vm_backend("x86_64");
+        let mut arm64_image = image(BTreeMap::new());
+        let mut amd64_image = image(BTreeMap::new());
+        amd64_image.architecture = "amd64".to_owned();
+
+        assert!(matches!(
+            plan_image(&arm64_image, &arm64, &OffloadHandlerRegistry::default()),
+            ImageExecutionPlan::VirtualMachine { .. }
+        ));
+        assert!(matches!(
+            plan_image(&amd64_image, &amd64, &OffloadHandlerRegistry::default()),
+            ImageExecutionPlan::VirtualMachine { .. }
+        ));
+
+        for (candidate, guest, candidate_image, image_architecture) in [
+            (&arm64, "arm64", &amd64_image, "amd64"),
+            (&amd64, "amd64", &arm64_image, "arm64"),
+        ] {
+            assert!(matches!(
+                plan_image(
+                    candidate_image,
+                    candidate,
+                    &OffloadHandlerRegistry::default()
+                ),
+                ImageExecutionPlan::Rejected { reason }
+                    if reason == OciError::GuestArchitectureMismatch {
+                        image: image_architecture.to_owned(),
+                        guest: guest.to_owned(),
+                    }
+                    .to_string()
+            ));
+        }
+
+        arm64_image.os = "darwin".to_owned();
+        assert!(matches!(
+            plan_image(
+                &arm64_image,
+                &arm64,
+                &OffloadHandlerRegistry::default()
+            ),
+            ImageExecutionPlan::Rejected { reason }
+                if reason.contains("unsupported OCI platform")
+        ));
     }
 
     #[test]

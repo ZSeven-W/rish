@@ -9,6 +9,8 @@ DEMO_BUILD_ROOT="${DEMO_REPOSITORY_ROOT}/target/ios-demo"
 DEMO_APP="${DEMO_BUILD_ROOT}/RishDemo.app"
 DEMO_BUNDLE_ID=dev.rish.demo
 DEMO_RUN_ID=$(uuidgen | tr '[:upper:]' '[:lower:]')
+DEMO_PLATFORM_SOURCES=("${DEMO_REPOSITORY_ROOT}/platform/ios/"*.swift)
+DEMO_APP_SOURCES=("${DEMO_SCRIPT_DIR}/"*.swift)
 
 if ! rustup "+${DEMO_TOOLCHAIN}" target list --installed | grep -qx "${DEMO_TARGET}"; then
     print -u2 "missing Rust target: ${DEMO_TARGET}"
@@ -40,8 +42,8 @@ xcrun --sdk iphonesimulator swiftc \
     -parse-as-library \
     -warnings-as-errors \
     -import-objc-header "${DEMO_REPOSITORY_ROOT}/platform/rish.h" \
-    "${DEMO_REPOSITORY_ROOT}/platform/ios/RishBridge.swift" \
-    "${DEMO_SCRIPT_DIR}/RishDemo.swift" \
+    "${DEMO_PLATFORM_SOURCES[@]}" \
+    "${DEMO_APP_SOURCES[@]}" \
     "${DEMO_REPOSITORY_ROOT}/target/${DEMO_TARGET}/debug/librish_ffi.a" \
     -framework Foundation \
     -framework UIKit \
