@@ -45,7 +45,7 @@ pub fn string_op(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuErro
                     .read(physical_source, &mut buffer[..size as usize])?;
                 cpu.memory
                     .write(physical_destination, &buffer[..size as usize])?;
-                advance(&mut cpu.regs, direction);
+                advance_both(&mut cpu.regs, direction);
                 decrement_counter(&mut cpu.regs, size);
             }
         }
@@ -61,7 +61,7 @@ pub fn string_op(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuErro
                     4 => cpu.memory.write_u32(physical, value as u32)?,
                     _ => cpu.memory.write_u64(physical, value)?,
                 }
-                advance(&mut cpu.regs, direction);
+                advance_rdi(&mut cpu.regs, direction);
                 decrement_counter(&mut cpu.regs, size);
             }
         }
@@ -76,7 +76,7 @@ pub fn string_op(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuErro
                     _ => cpu.memory.read_u64(physical)?,
                 };
                 write_accumulator(&mut cpu.regs, size, value);
-                advance(&mut cpu.regs, direction);
+                advance_rsi(&mut cpu.regs, direction);
                 decrement_counter(&mut cpu.regs, size);
             }
         }
@@ -97,7 +97,7 @@ pub fn string_op(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuErro
                 crate::ops::set_carry(&mut cpu.regs, flags.carry);
                 crate::ops::set_overflow(&mut cpu.regs, flags.overflow);
                 crate::ops::set_adjust(&mut cpu.regs, flags.adjust);
-                advance(&mut cpu.regs, direction);
+                advance_rdi(&mut cpu.regs, direction);
                 decrement_counter(&mut cpu.regs, size);
                 if repe && !cpu.regs.rflags.contains(RFlags::ZF) {
                     break;
@@ -132,7 +132,7 @@ pub fn string_op(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuErro
                 crate::ops::set_carry(&mut cpu.regs, flags.carry);
                 crate::ops::set_overflow(&mut cpu.regs, flags.overflow);
                 crate::ops::set_adjust(&mut cpu.regs, flags.adjust);
-                advance(&mut cpu.regs, direction);
+                advance_both(&mut cpu.regs, direction);
                 decrement_counter(&mut cpu.regs, size);
                 if repe && !cpu.regs.rflags.contains(RFlags::ZF) {
                     break;
@@ -147,8 +147,16 @@ pub fn string_op(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuErro
     Ok(())
 }
 
-fn advance(regs: &mut crate::arch::registers::Registers, direction: i64) {
+fn advance_both(regs: &mut crate::arch::registers::Registers, direction: i64) {
     regs.gpr[index::RSI] = regs.gpr[index::RSI].wrapping_add(direction as u64);
+    regs.gpr[index::RDI] = regs.gpr[index::RDI].wrapping_add(direction as u64);
+}
+
+fn advance_rsi(regs: &mut crate::arch::registers::Registers, direction: i64) {
+    regs.gpr[index::RSI] = regs.gpr[index::RSI].wrapping_add(direction as u64);
+}
+
+fn advance_rdi(regs: &mut crate::arch::registers::Registers, direction: i64) {
     regs.gpr[index::RDI] = regs.gpr[index::RDI].wrapping_add(direction as u64);
 }
 
@@ -246,6 +254,30 @@ mod tests {
         let mut buffer = [0_u8; 4];
         cpu.memory.read(0x6000, &mut buffer).unwrap();
         assert_eq!(&buffer, b"abcd");
+    }
+
+    #[test]
+    fn rep_stosd_preserves_rsi() {
+        let mut cpu = cpu();
+        cpu.regs.set_gpr(index::RAX, 0x1234_5678);
+        cpu.regs.set_gpr(index::RDI, 0x6000);
+        cpu.regs.set_gpr(index::RSI, 0xABCD);
+        cpu.regs.set_gpr(index::RCX, 4);
+        run(&mut cpu, 64, &[0xF3, 0xAB]).unwrap(); // rep stosd
+        assert_eq!(cpu.regs.gpr(index::RDI), 0x6010);
+        assert_eq!(cpu.regs.gpr(index::RSI), 0xABCD);
+    }
+
+    #[test]
+    fn rep_lodsd_preserves_rdi() {
+        let mut cpu = cpu();
+        cpu.memory.write_u32(0x5000, 0x42).unwrap();
+        cpu.regs.set_gpr(index::RSI, 0x5000);
+        cpu.regs.set_gpr(index::RDI, 0xABCD);
+        cpu.regs.set_gpr(index::RCX, 2);
+        run(&mut cpu, 64, &[0xF3, 0xAD]).unwrap(); // rep lodsd
+        assert_eq!(cpu.regs.gpr(index::RSI), 0x5008);
+        assert_eq!(cpu.regs.gpr(index::RDI), 0xABCD);
     }
 
     #[test]
