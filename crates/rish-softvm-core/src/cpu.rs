@@ -14,6 +14,9 @@ use crate::{CpuError, Memory};
 
 const MAX_INSTRUCTION_BYTES: usize = 15;
 
+/// Retired-instruction trace depth kept for gap diagnostics.
+const TRACE_CAPACITY: usize = 262_144;
+
 /// Direct-mapped per-page translation cache entries (power of two).
 const TRANSLATION_CACHE_ENTRIES: usize = 4096;
 
@@ -188,7 +191,7 @@ impl Cpu {
             let mut head = [0_u8; 16];
             let count = bytes.len().min(16);
             head[..count].copy_from_slice(&bytes[..count]);
-            if self.trace.len() >= 16384 {
+            if self.trace.len() >= TRACE_CAPACITY {
                 self.trace.pop_front();
             }
             self.trace.push_back((
@@ -796,6 +799,8 @@ impl Cpu {
     ) -> Result<(), CpuError> {
         let old_flags = self.regs.rflags;
         let old_cs = self.regs.cs.selector;
+        let old_rsp = self.regs.rsp();
+        let old_ss = self.regs.ss.selector;
         let new_cs = self.load_code_segment(gate.selector)?;
         let new_flags = if is_exception {
             old_flags
@@ -805,6 +810,9 @@ impl Cpu {
         self.regs.rflags = new_flags;
         match self.regs.mode() {
             CpuMode::Long => {
+                // Same-privilege frame: SS, RSP, RFLAGS, CS, RIP, [error].
+                self.push64(u64::from(old_ss.0))?;
+                self.push64(old_rsp)?;
                 self.push64(old_flags.bits())?;
                 self.push64(u64::from(old_cs.0))?;
                 self.push64(self.regs.rip)?;

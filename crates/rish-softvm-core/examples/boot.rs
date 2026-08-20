@@ -255,6 +255,8 @@ fn save_checkpoint(options: &Options, cpu: &Cpu) -> Result<(), String> {
     let Some(path) = &options.checkpoint else {
         return Ok(());
     };
+    // Keep the previous state as a backup so a pre-gap state survives.
+    let _ = fs::rename(path, format!("{path}.bak"));
     let file = fs::File::create(path).map_err(|error| error.to_string())?;
     let mut writer = std::io::BufWriter::new(file);
     boot_state::save(cpu, &mut writer).map_err(|error| error.to_string())?;

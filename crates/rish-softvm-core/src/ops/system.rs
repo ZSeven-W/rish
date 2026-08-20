@@ -297,6 +297,13 @@ pub fn system_op(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuErro
                 }
                 _ => cpu.load_segment_from_table(selector)?,
             };
+            if cpu.regs.mode() == crate::arch::registers::CpuMode::Long {
+                // Same-privilege return: RSP and SS follow on the frame.
+                let rsp = cpu.pop_native()?;
+                let ss = SegmentSelector(cpu.pop_native()? as u16);
+                cpu.regs.set_rsp(rsp);
+                cpu.regs.ss = cpu.load_segment_from_table(ss)?;
+            }
             cpu.regs.rip = target;
         }
         Mnemonic::Int3 | Mnemonic::Int => {
@@ -576,6 +583,8 @@ const MSR_LSTAR: u32 = 0xC000_0082;
 const MSR_CSTAR: u32 = 0xC000_0083;
 const MSR_FMASK: u32 = 0xC000_0084;
 const MSR_IA32_TSC_ADJUST: u32 = 0x3B;
+const MSR_IA32_BIOS_SIGN_ID: u32 = 0x8B;
+const MSR_IA32_PLATFORM_ID: u32 = 0x17;
 const MSR_IA32_MTRRCAP: u32 = 0xFE;
 const MSR_IA32_MCG_CAP: u32 = 0x179;
 const MSR_IA32_MCG_STATUS: u32 = 0x17A;
@@ -607,6 +616,8 @@ fn msr_read(cpu: &Cpu, address: u32) -> Result<u64, CpuError> {
         MSR_CSTAR => Ok(cpu.msr_cstar),
         MSR_FMASK => Ok(cpu.msr_fmask),
         MSR_IA32_TSC_ADJUST
+        | MSR_IA32_BIOS_SIGN_ID
+        | MSR_IA32_PLATFORM_ID
         | MSR_IA32_MCG_STATUS
         | MSR_IA32_MCG_CTL
         | MSR_IA32_THERM_INTERRUPT
@@ -639,6 +650,8 @@ fn msr_write(cpu: &mut Cpu, address: u32, value: u64) -> Result<(), CpuError> {
             // BSP bit and enable bit only; relocation ignored for now.
         }
         MSR_IA32_TSC_ADJUST
+        | MSR_IA32_BIOS_SIGN_ID
+        | MSR_IA32_PLATFORM_ID
         | MSR_IA32_MTRR_DEF_TYPE
         | MSR_IA32_MTRRCAP
         | MSR_IA32_MCG_CAP

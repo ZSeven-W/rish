@@ -99,6 +99,10 @@ pub fn push_pop(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError
                 }
                 OpKind::Immediate8to16 => (instruction.immediate8to16() as i64) as u64,
                 OpKind::Immediate8to32 => (instruction.immediate8to32() as i64) as u64,
+                OpKind::Immediate16 => u64::from(instruction.immediate16()),
+                OpKind::Immediate32 | OpKind::Immediate32to64 => {
+                    (instruction.immediate32() as i32 as i64) as u64
+                }
                 OpKind::Memory => {
                     cpu.read_operand(instruction, 0, crate::ops::memory_size(instruction))?
                 }
@@ -219,6 +223,17 @@ mod tests {
         run(&mut cpu, 64, &[0x6A, 0x81]).unwrap(); // push -127
         let value = cpu.pop_native().unwrap();
         assert_eq!(value, 0xFFFF_FFFF_FFFF_FF81);
+    }
+
+    #[test]
+    fn push_imm32_sign_extends_to_64() {
+        let mut cpu = cpu();
+        cpu.regs.set_gpr(crate::arch::registers::index::RAX, 0x10);
+        // push 0xffffffff8129a80b (68 0b a8 29 81)
+        run(&mut cpu, 64, &[0x68, 0x0B, 0xA8, 0x29, 0x81]).unwrap();
+        let value = cpu.pop_native().unwrap();
+        assert_eq!(value, 0xFFFF_FFFF_8129_A80B);
+        assert_eq!(cpu.regs.rsp(), 0x8000);
     }
 
     #[test]
