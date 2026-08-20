@@ -196,17 +196,25 @@ impl Cpu {
         let (bitness, ip) = self.decode_environment();
         let mut buffer = [0_u8; MAX_INSTRUCTION_BYTES];
         let linear = self.regs.code_base().wrapping_add(ip);
-        let physical = self.translate(linear, AccessKind::Execute)?;
-        let remaining_in_page = 4096 - (physical & 0xFFF);
-        let count = (MAX_INSTRUCTION_BYTES as u64).min(remaining_in_page) as usize;
-        self.memory.read(physical, &mut buffer[..count])?;
-        let mut decoder = Decoder::with_ip(bitness, &buffer[..count], ip, DecoderOptions::NONE);
+        // Instruction fetch crosses page boundaries like hardware: keep
+        // translating each successive linear page until 15 bytes are read.
+        let mut fetched = 0_usize;
+        while fetched < MAX_INSTRUCTION_BYTES {
+            let physical =
+                self.translate(linear.wrapping_add(fetched as u64), AccessKind::Execute)?;
+            let remaining_in_page = 4096 - (physical & 0xFFF);
+            let count = (MAX_INSTRUCTION_BYTES - fetched).min(remaining_in_page as usize);
+            self.memory
+                .read(physical, &mut buffer[fetched..fetched + count])?;
+            fetched += count;
+        }
+        let mut decoder = Decoder::with_ip(bitness, &buffer, ip, DecoderOptions::NONE);
         let instruction = decoder.decode();
         if instruction.is_invalid() {
             return Err(CpuError::UnimplementedInstruction {
                 code: "invalid".to_owned(),
                 address: self.regs.rip,
-                bytes: buffer[..count].to_vec(),
+                bytes: buffer.to_vec(),
             });
         }
         Ok((instruction, buffer[..instruction.len()].to_vec()))
@@ -684,11 +692,17 @@ impl Cpu {
                 self.regs.idt_limit
             )));
         }
-        let raw = self.memory.read_u64(address)?;
+        // The IDT lives at a linear address; translate each half so a gate
+        // may also cross a page boundary.
+        let raw = self
+            .memory
+            .read_u64(self.translate(address, AccessKind::Read)?)?;
         let selector = SegmentSelector((raw >> 16) as u16);
         let offset = match self.regs.mode() {
             CpuMode::Long => {
-                let high = self.memory.read_u64(address + 8)?;
+                let high = self
+                    .memory
+                    .read_u64(self.translate(address + 8, AccessKind::Read)?)?;
                 (raw & 0xFFFF) | ((raw >> 32) & 0xFFFF_0000) | ((high & 0xFFFF_FFFF) << 32)
             }
             _ => (raw & 0xFFFF) | (raw >> 16 & 0xFFFF_0000),
@@ -776,7 +790,10 @@ impl Cpu {
             self.regs.ldtr.base
         };
         let address = table_base.wrapping_add(u64::from(selector.index()) * 8);
-        let entry = self.memory.read_u64(address)?;
+        // Descriptor tables are linear addresses under paging.
+        let entry = self
+            .memory
+            .read_u64(self.translate(address, AccessKind::Read)?)?;
         let descriptor = Descriptor::decode(entry);
         Ok(descriptor.load(selector))
     }

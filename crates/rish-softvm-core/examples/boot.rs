@@ -282,6 +282,14 @@ fn report_gap(error: &CpuError, cpu: &Cpu, console: &[u8]) {
     }
     write_trace(cpu);
     println!("kernel cr3={:#x}", cpu.regs.cr3);
+    if let Some(linear) = faulting_linear(error) {
+        println!("page walk for faulting linear {linear:#x}:");
+        walk_tables(cpu, linear);
+        println!(
+            "interpreter translate: {:?}",
+            cpu.translate(linear, rish_softvm_core::arch::paging::AccessKind::Read)
+        );
+    }
     println!("scanning for decompressed image:");
     scan_memory(cpu, b"\x7fELF");
     scan_memory(cpu, b"Linux version");
@@ -326,6 +334,66 @@ fn report_gap(error: &CpuError, cpu: &Cpu, console: &[u8]) {
         CpuError::Halted => println!("  guest halted"),
         other => println!("  {other}"),
     }
+}
+
+fn faulting_linear(error: &CpuError) -> Option<u64> {
+    let text = match error {
+        CpuError::GuestFault(message) => message,
+        CpuError::PageFault { linear, .. } => return Some(*linear),
+        _ => return None,
+    };
+    let hex_start = text.find("0x")?;
+    let rest = &text[hex_start + 2..];
+    let end = rest.find(|c: char| !c.is_ascii_hexdigit())?;
+    u64::from_str_radix(&rest[..end], 16).ok()
+}
+
+fn walk_tables(cpu: &Cpu, linear: u64) {
+    let cr3 = cpu.regs.cr3 & 0x000F_FFFF_FFFF_F000;
+    let pml4_index = (linear >> 39) & 0x1FF;
+    let read_entry = |address: u64| -> u64 { cpu.memory.read_u64(address).unwrap_or(0) };
+    let pml4e = read_entry(cr3 + pml4_index * 8);
+    println!("  pml4[{pml4_index}] = {pml4e:#x}");
+    if pml4e & 1 == 0 {
+        println!("  (pml4 entry not present)");
+        return;
+    }
+    let pdpt_index = (linear >> 30) & 0x1FF;
+    let pdpte = read_entry((pml4e & 0x000F_FFFF_FFFF_F000) + pdpt_index * 8);
+    println!("  pdpt[{pdpt_index}] = {pdpte:#x}");
+    if pdpte & 1 == 0 {
+        return;
+    }
+    if pdpte & 0x80 != 0 {
+        println!(
+            "  (1 GiB page -> physical {:#x})",
+            (pdpte & !0x3FFF_FFFF) | (linear & 0x3FFF_FFFF)
+        );
+        return;
+    }
+    let pd_index = (linear >> 21) & 0x1FF;
+    let pde = read_entry((pdpte & 0x000F_FFFF_FFFF_F000) + pd_index * 8);
+    println!("  pd[{pd_index}] = {pde:#x}");
+    if pde & 1 == 0 {
+        return;
+    }
+    if pde & 0x80 != 0 {
+        println!(
+            "  (2 MiB page -> physical {:#x})",
+            (pde & !0x1F_FFFF) | (linear & 0x1F_FFFF)
+        );
+        return;
+    }
+    let pt_index = (linear >> 12) & 0x1FF;
+    let pte = read_entry((pde & 0x000F_FFFF_FFFF_F000) + pt_index * 8);
+    println!("  pt[{pt_index}] = {pte:#x}");
+    if pte & 1 == 0 {
+        return;
+    }
+    println!(
+        "  -> physical {:#x}",
+        (pte & 0x000F_FFFF_FFFF_F000) | (linear & 0xFFF)
+    );
 }
 
 fn print_console(console: &[u8]) {
