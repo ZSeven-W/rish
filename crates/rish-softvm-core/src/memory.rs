@@ -1,9 +1,13 @@
 //! Physical guest memory with bounds-checked access.
 
+use std::{cell::RefCell, collections::VecDeque, sync::{Arc, Mutex}};
+
+use crate::devices::lapic::{LocalApic, LAPIC_BASE, LAPIC_SIZE};
 use crate::CpuError;
 
 pub struct Memory {
     ram: Box<[u8]>,
+    lapic: Option<RefCell<LocalApic>>,
 }
 
 impl Memory {
@@ -18,6 +22,7 @@ impl Memory {
             .ok_or_else(|| CpuError::InvalidConfig("guest memory size overflow".to_owned()))?;
         Ok(Self {
             ram: vec![0; bytes].into_boxed_slice(),
+            lapic: None,
         })
     }
 
@@ -33,8 +38,38 @@ impl Memory {
         false
     }
 
+    pub fn attach_lapic(&mut self, queue: Arc<Mutex<VecDeque<u8>>>) {
+        self.lapic = Some(RefCell::new(LocalApic::new(queue)));
+    }
+
+    pub fn lapic_tick(&self) {
+        if let Some(lapic) = &self.lapic {
+            lapic.borrow_mut().tick();
+        }
+    }
+
+    fn in_lapic(address: u64) -> bool {
+        address >= LAPIC_BASE && address < LAPIC_BASE + LAPIC_SIZE
+    }
+
     #[inline]
     pub fn read(&self, address: u64, output: &mut [u8]) -> Result<(), CpuError> {
+        if Self::in_lapic(address) {
+            if let Some(lapic) = &self.lapic {
+                let offset = address - LAPIC_BASE;
+                let value = lapic.borrow_mut().read(offset, output.len() as u8);
+                let bytes = value.to_le_bytes();
+                let first = output.len().min(4);
+                output[..first].copy_from_slice(&bytes[..first]);
+                if output.len() > 4 {
+                    let value2 = lapic.borrow_mut().read(offset + 4, (output.len() - 4) as u8);
+                    let bytes2 = value2.to_le_bytes();
+                    let rest = output.len() - 4;
+                    output[4..].copy_from_slice(&bytes2[..rest]);
+                }
+                return Ok(());
+            }
+        }
         let end = address
             .checked_add(output.len() as u64)
             .ok_or(CpuError::GuestFault(format!(
@@ -53,6 +88,21 @@ impl Memory {
 
     #[inline]
     pub fn write(&mut self, address: u64, input: &[u8]) -> Result<(), CpuError> {
+        if Self::in_lapic(address) {
+            if let Some(lapic) = &self.lapic {
+                let offset = address - LAPIC_BASE;
+                if input.len() == 4 {
+                    let value = u32::from_le_bytes([input[0], input[1], input[2], input[3]]);
+                    lapic.borrow_mut().write(offset, 4, value);
+                } else {
+                    let mut buffer = [0_u8; 4];
+                    buffer[..input.len().min(4)].copy_from_slice(&input[..input.len().min(4)]);
+                    let value = u32::from_le_bytes(buffer);
+                    lapic.borrow_mut().write(offset, input.len() as u8, value);
+                }
+                return Ok(());
+            }
+        }
         let end = address
             .checked_add(input.len() as u64)
             .ok_or(CpuError::GuestFault(format!(

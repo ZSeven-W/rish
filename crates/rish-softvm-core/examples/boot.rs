@@ -25,6 +25,7 @@ fn run() -> Result<u8, String> {
     );
     let mut memory_mib = 1024;
     let mut steps = 200_000_000_u64;
+    let mut progress_every = 100_000_u64;
     let args = env::args().skip(1).collect::<Vec<_>>();
     let mut index = 0;
     while index < args.len() {
@@ -54,6 +55,14 @@ fn run() -> Result<u8, String> {
                 steps = args
                     .get(index)
                     .ok_or("--steps needs a number")?
+                    .parse()
+                    .map_err(|error: std::num::ParseIntError| error.to_string())?;
+            }
+            "--progress-every" => {
+                index += 1;
+                progress_every = args
+                    .get(index)
+                    .ok_or("--progress-every needs a number")?
                     .parse()
                     .map_err(|error: std::num::ParseIntError| error.to_string())?;
             }
@@ -94,7 +103,7 @@ fn run() -> Result<u8, String> {
     );
 
     let mut console = Vec::new();
-    let progress_every = 10_000_000_u64;
+    let progress_every = progress_every.max(1);
     let mut last_report = 0_u64;
     for _ in 0..steps {
         if let Err(error) = cpu.step() {
@@ -118,6 +127,16 @@ fn run() -> Result<u8, String> {
         print_console(&console);
     }
     println!("budget exhausted after {steps} instructions without a gap");
+    let mut trace_text = String::new();
+    for (rip, rax, rbp, rsp, bytes) in &cpu.trace {
+        let line = format!(
+            "  {rip:#x}: rax={rax:#x} rbp={rbp:#x} rsp={rsp:#x} bytes={}",
+            hex(bytes)
+        );
+        trace_text.push_str(&line);
+        trace_text.push('\n');
+    }
+    let _ = fs::write("/tmp/rish-boot-trace.txt", trace_text);
     Ok(0)
 }
 
@@ -133,8 +152,18 @@ fn report_gap(error: &CpuError, cpu: &Cpu, console: &[u8]) {
         trace_text.push_str(&line);
         trace_text.push('\n');
     }
-    let _ = fs::write("/tmp/rish-boot-trace.txt", trace_text);
+    let _ = fs::write("/tmp/rish-boot-trace.txt", trace_text.clone());
+    let mut report = trace_text;
+    report.push_str("\n--- scan ---\n");
     // Where did the decompressed kernel land? Scan physical memory.
+    println!("kernel cr3={:#x}", cpu.regs.cr3);
+    println!("page walk for linear 0x1000000:");
+    walk_tables(cpu, 0x1000000);
+    println!("page walk for linear 0xcbad95c:");
+    walk_tables(cpu, 0xcbad95c);
+    println!("page walk for linear 0x100000:");
+    walk_tables(cpu, 0x100000);
+    println!("scanning for decompressed image:");
     println!("scanning for decompressed image:");
     scan_memory(cpu, b"\x7fELF");
     scan_memory(cpu, b"Linux version");
@@ -204,6 +233,7 @@ fn scan_memory(cpu: &Cpu, pattern: &[u8]) {
         while offset + pattern.len() <= chunk_len {
             if &buffer[offset..offset + pattern.len()] == pattern {
                 println!("  hit at {:#x}", base + offset);
+                // (also recorded by the caller via the report file)
                 hits += 1;
                 offset += pattern.len();
             } else {
@@ -212,6 +242,55 @@ fn scan_memory(cpu: &Cpu, pattern: &[u8]) {
         }
         base += chunk_len;
     }
+}
+
+fn walk_tables(cpu: &Cpu, linear: u64) {
+    // Walk the active 4-level tables, printing each entry.
+    let cr3 = cpu.regs.cr3 & 0x000F_FFFF_FFFF_F000;
+    let pml4_index = (linear >> 39) & 0x1FF;
+    let read_entry = |address: u64| -> u64 { cpu.memory.read_u64(address).unwrap_or(0) };
+    let pml4e = read_entry(cr3 + pml4_index * 8);
+    println!("  pml4[{pml4_index}] = {pml4e:#x}");
+    if pml4e & 1 == 0 {
+        println!("  (pml4 entry not present)");
+        return;
+    }
+    let pdpt_index = (linear >> 30) & 0x1FF;
+    let pdpte = read_entry((pml4e & 0x000F_FFFF_FFFF_F000) + pdpt_index * 8);
+    println!("  pdpt[{pdpt_index}] = {pdpte:#x}");
+    if pdpte & 1 == 0 {
+        return;
+    }
+    if pdpte & 0x80 != 0 {
+        println!(
+            "  (1 GiB page -> physical {:#x})",
+            (pdpte & !0x3FFF_FFFF) | (linear & 0x3FFF_FFFF)
+        );
+        return;
+    }
+    let pd_index = (linear >> 21) & 0x1FF;
+    let pde = read_entry((pdpte & 0x000F_FFFF_FFFF_F000) + pd_index * 8);
+    println!("  pd[{pd_index}] = {pde:#x}");
+    if pde & 1 == 0 {
+        return;
+    }
+    if pde & 0x80 != 0 {
+        println!(
+            "  (2 MiB page -> physical {:#x})",
+            (pde & !0x1F_FFFF) | (linear & 0x1F_FFFF)
+        );
+        return;
+    }
+    let pt_index = (linear >> 12) & 0x1FF;
+    let pte = read_entry((pde & 0x000F_FFFF_FFFF_F000) + pt_index * 8);
+    println!("  pt[{pt_index}] = {pte:#x}");
+    if pte & 1 == 0 {
+        return;
+    }
+    println!(
+        "  -> physical {:#x}",
+        (pte & 0x000F_FFFF_FFFF_F000) | (linear & 0xFFF)
+    );
 }
 
 fn hex(bytes: &[u8]) -> String {

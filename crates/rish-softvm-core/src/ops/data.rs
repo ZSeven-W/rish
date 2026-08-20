@@ -65,22 +65,24 @@ pub fn lea(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
 }
 
 pub fn movx(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
-    let code = instruction.code();
-    let source_size = match code {
-        iced_x86::Code::Movzx_r16_rm8
-        | iced_x86::Code::Movzx_r32_rm8
-        | iced_x86::Code::Movzx_r64_rm8
-        | iced_x86::Code::Movsx_r16_rm8
-        | iced_x86::Code::Movsx_r32_rm8
-        | iced_x86::Code::Movsx_r64_rm8 => 1,
-        _ => 2,
+    let mnemonic = instruction.mnemonic();
+    // Source width depends on the exact form: 8/16-bit rm, or 32-bit
+    // rm for movsxd r64/r32, r/m32.
+    let source_size = match mnemonic {
+        Mnemonic::Movzx | Mnemonic::Movsx => match instruction.memory_size() {
+            iced_x86::MemorySize::UInt8 => 1,
+            iced_x86::MemorySize::UInt16 => 2,
+            _ => 4,
+        },
+        Mnemonic::Movsxd => 4,
+        _ => 4,
     };
     let value = if instruction.op1_kind() == OpKind::Memory {
         cpu.read_operand(instruction, 1, source_size)?
     } else {
         read_register(&cpu.regs, instruction.op1_register(), source_size)
     };
-    let sign_extend = matches!(instruction.mnemonic(), Mnemonic::Movsx | Mnemonic::Movsxd);
+    let sign_extend = matches!(mnemonic, Mnemonic::Movsx | Mnemonic::Movsxd);
     let value = if sign_extend {
         let bits = u32::from(source_size) * 8;
         (((value as i64) << (64 - bits)) >> (64 - bits)) as u64
@@ -95,7 +97,6 @@ pub fn movx(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
     );
     Ok(())
 }
-
 pub fn xchg(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
     let size = operand_size(instruction, 0);
     let left = read_operand0(cpu, instruction)?;

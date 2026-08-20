@@ -1,6 +1,7 @@
 //! The interpreter core: fetch, dispatch, exceptions, and interrupts.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use iced_x86::{Decoder, DecoderOptions, Instruction, Register};
 
@@ -37,6 +38,7 @@ pub struct Cpu {
     pub fpu_status_word: u16,
     pub mxcsr: u32,
     pub trace: VecDeque<(u64, u64, u64, u64, [u8; 4])>,
+    pub lapic_queue: Arc<std::sync::Mutex<VecDeque<u8>>>,
     pending_interrupts: VecDeque<Deliverable>,
     in_exception: bool,
 }
@@ -50,7 +52,9 @@ struct Deliverable {
 
 impl Cpu {
     pub fn new(memory_mib: usize, boot_epoch_seconds: u64) -> Result<Self, CpuError> {
-        let memory = Memory::new(memory_mib)?;
+        let mut memory = Memory::new(memory_mib)?;
+        let lapic_queue = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+        memory.attach_lapic(Arc::clone(&lapic_queue));
         let ports = PortBus::default();
         Ok(Self {
             regs: Registers::default(),
@@ -71,6 +75,7 @@ impl Cpu {
             fpu_status_word: 0,
             mxcsr: 0x1F80,
             trace: VecDeque::new(),
+            lapic_queue,
             pending_interrupts: VecDeque::new(),
             in_exception: false,
         })
@@ -85,6 +90,7 @@ impl Cpu {
         self.execute_one()?;
         self.regs.instructions_retired = self.regs.instructions_retired.saturating_add(1);
         self.tsc = self.tsc.saturating_add(1);
+        self.memory.lapic_tick();
         Ok(())
     }
 
@@ -104,7 +110,7 @@ impl Cpu {
         let mut head = [0_u8; 4];
         let count = bytes.len().min(4);
         head[..count].copy_from_slice(&bytes[..count]);
-        if self.trace.len() >= 4096 {
+        if self.trace.len() >= 16384 {
             self.trace.pop_front();
         }
         self.trace.push_back((
@@ -575,6 +581,18 @@ impl Cpu {
         {
             if let Some(irq) = self.pic.pending_irq() {
                 let vector = self.pic.acknowledge(irq);
+                let handler = self.idt_gate(vector)?;
+                self.transfer_to_gate(handler, 0, false, false)?;
+                return Ok(());
+            }
+        }
+        {
+            let mut queue = self
+                .lapic_queue
+                .lock()
+                .map_err(|_| CpuError::GuestFault("lapic queue poisoned".to_owned()))?;
+            if let Some(vector) = queue.pop_front() {
+                drop(queue);
                 let handler = self.idt_gate(vector)?;
                 self.transfer_to_gate(handler, 0, false, false)?;
                 return Ok(());

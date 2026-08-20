@@ -49,16 +49,18 @@ pub fn load(
         )));
     }
 
-    // Compressed kernel payload at 1 MiB (the 64-bit entry is base + 0x200).
-    let payload_length = header.payload_length as usize;
-    let payload = if payload_length != 0
-        && setup_bytes.saturating_add(payload_length) <= kernel_image.len()
-    {
-        &kernel_image[setup_bytes..setup_bytes + payload_length]
+    // Compressed kernel payload at the kernel's preferred address
+    // (LOAD_PHYSICAL_ADDR): direct calls inside the image are linked against
+    // it. The 64-bit entry is base + 0x200.
+    let kernel_base = if header.pref_address != 0 {
+        header.pref_address
     } else {
-        &kernel_image[setup_bytes..]
+        KERNEL_BASE
     };
-    cpu.memory.write(KERNEL_BASE, payload)?;
+    // Copy the remainder of the image (payload, kernel_info, trailing
+    // sections) to EOF: the image contains linked code past payload_length.
+    let payload = &kernel_image[setup_bytes..];
+    cpu.memory.write(kernel_base, payload)?;
     // boot_params zero page: boot sector + setup sections.
     cpu.memory
         .write(ZERO_PAGE_BASE, &kernel_image[..setup_bytes])?;
@@ -106,12 +108,12 @@ pub fn load(
         write_u32(cpu, address + 16, *kind)?;
     }
 
-    enter_long_mode(cpu, params.memory_mib)?;
+    enter_long_mode(cpu, params.memory_mib, kernel_base)?;
     Ok(())
 }
 
 /// Builds the identity map and GDT and enters long mode at kernel_base+0x200.
-fn enter_long_mode(cpu: &mut Cpu, memory_mib: usize) -> Result<(), CpuError> {
+fn enter_long_mode(cpu: &mut Cpu, memory_mib: usize, kernel_base: u64) -> Result<(), CpuError> {
     // PML4[0] -> PDPT; PDPT[0..] -> PDs with 2 MiB identity pages over 4 GiB.
     cpu.memory.write_u64(PML4_BASE, 0x60000 | 0x3)?;
     let mut pdpt = 0x60000_u64;
@@ -186,7 +188,7 @@ fn enter_long_mode(cpu: &mut Cpu, memory_mib: usize) -> Result<(), CpuError> {
         ..SegmentRegister::default()
     };
     cpu.regs.gs = cpu.regs.fs;
-    cpu.regs.rip = KERNEL_BASE + KERNEL_ENTRY_OFFSET;
+    cpu.regs.rip = kernel_base + KERNEL_ENTRY_OFFSET;
     cpu.regs.set_rsp(STACK_BASE);
     cpu.regs.set_gpr(index::RSI, ZERO_PAGE_BASE);
     // Interrupts disabled at the 64-bit entry.
@@ -266,6 +268,7 @@ pub struct Header {
     pub init_size: u32,
     pub payload_offset: u32,
     pub payload_length: u32,
+    pub pref_address: u64,
 }
 
 impl Header {
@@ -313,6 +316,16 @@ impl Header {
             init_size: read_u32(0x1F1 + 0x6F),
             payload_offset: read_u32(0x1F1 + 0x57),
             payload_length: read_u32(0x1F1 + 0x5B),
+            pref_address: u64::from_le_bytes([
+                image[0x1F1 + 0x67],
+                image[0x1F1 + 0x68],
+                image[0x1F1 + 0x69],
+                image[0x1F1 + 0x6A],
+                image[0x1F1 + 0x6B],
+                image[0x1F1 + 0x6C],
+                image[0x1F1 + 0x6D],
+                image[0x1F1 + 0x6E],
+            ]),
         })
     }
 }

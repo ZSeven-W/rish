@@ -40,7 +40,17 @@ pub fn sub(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
 }
 
 pub fn cmp(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
-    binary(cpu, instruction, true, false)
+    // CMP computes flags only; it must not modify the destination operand.
+    let size = operand_size(instruction, 0);
+    let left = read_operand0(cpu, instruction)?;
+    let right = read_operand1(cpu, instruction)?;
+    let bits = u32::from(size) * 8;
+    let flags = crate::ops::sub_with_flags(left, right, false, bits);
+    set_szp(&mut cpu.regs, flags.result, bits);
+    set_carry(&mut cpu.regs, flags.carry);
+    set_overflow(&mut cpu.regs, flags.overflow);
+    set_adjust(&mut cpu.regs, flags.adjust);
+    Ok(())
 }
 
 pub fn adc_sbb(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
@@ -375,6 +385,15 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn cmp_does_not_modify_the_destination() {
+        let mut cpu = cpu();
+        cpu.regs.set_gpr(crate::arch::registers::index::RBP, 0x1000000);
+        // 48 81 fd 00 00 00 01: cmp rbp, 0x1000000
+        run(&mut cpu, 64, &[0x48, 0x81, 0xFD, 0x00, 0x00, 0x00, 0x01]).unwrap();
+        assert_eq!(cpu.regs.gpr(crate::arch::registers::index::RBP), 0x1000000);
+        assert!(cpu.regs.rflags.contains(RFlags::ZF));
+    }
     #[test]
     fn inc_does_not_touch_carry() {
         let mut cpu = cpu();
