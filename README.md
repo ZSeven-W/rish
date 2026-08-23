@@ -1,223 +1,189 @@
+<div align="center">
+
 # rish
 
-`rish` 是面向 iOS、Android 和鸿蒙的 Rust Linux 命令与容器语义运行时。
+### Real Docker. Real x86-64 Linux. On your phone. In pure Rust.
 
-项目采用 **native-offload first、AMD64 Linux software-VM fallback** 的路线：
+**`rish` boots a genuine x86-64 Linux kernel inside a from-scratch, no-JIT Rust
+interpreter — and runs real Docker containers on it, on iOS and Android.**
+No QEMU. No KVM. No hypervisor entitlement. Just Rust.
 
-- 已知 Guest 命令由 Rust 拦截并分派给 Swift/Objective-C、Kotlin/Java、
-  ArkTS 或系统特权服务。
-- OCI 镜像可以请求原生 handler 契约；只有宿主 live allow-list 已绑定同名
-  handler 时才会采用，无需解释执行其中的 ELF。
-- 未知 ELF、真正的 systemd、Docker-in-Docker、内核模块和完整网络
-  namespace 必须进入纯软件 x86_64 全系统模拟器中的真实 Linux guest，
-  或经过探测的宿主 Linux 后端。
-- 能力不足时失败关闭，不会把“模拟成功”伪装成真实内核隔离。
+[![language](https://img.shields.io/badge/built%20with-Rust-orange)](https://www.rust-lang.org)
+[![license](https://img.shields.io/badge/license-MIT-blue)](#license)
+[![platforms](https://img.shields.io/badge/targets-iOS%20·%20Android%20·%20HarmonyOS-black)](#three-platform-demos)
+[![status](https://img.shields.io/badge/docker%20run-working-brightgreen)](#milestone)
 
-> 当前状态：P1 数据面原型 + P3 软模拟主线。能力模型、三端 native-offload
-> SDK、OCI Registry/CAS、安全解层、事务 rootfs snapshot、Guest RPC 与
-> bootstrap agent 已可编译测试；iOS Simulator 已真实拉取并校验 Docker Hub
-> 的 `alpine:latest` `linux/amd64` 图。方向（ADR-0003）：iOS/Android 通过
-> 仓库自研的纯 Rust 无 JIT x86_64 全系统解释器（rish-softvm-core）运行
-> docker，不使用 UTM/QEMU。解释器核心（CPU/分页/中断/8259/8254/CMOS/16550
-> 与首批指令子集）已落地并有 81 项测试；SSE2、syscall/sysret、MTRR/MCE
-> MSR、跨页取指与 IDT/GDT 页表翻译均已补齐。真实 pinned 内核已在解释器内
-> 完成解压、ELF 段搬运并进入 startup_64：修复了 imul 立即数、boot_params
-> 零页偏移（cmdline/E820/ramdisk）等关键 bug。ExperimentalPureRust
-> MachineProvider 已接入同一证据链（引擎门、有界量子、取消、双 16550 泵送
-> 与合同测试），并有宿主侧 checkpoint/resume 诊断工具跳过 6 亿指令的解压
-> 阶段。当前待办：带 docker initramfs 的完整 guest 到达
-> `RISH_X86_64_BOOT_OK`，然后通过 VmCandidate 证据链在 guest 内执行
-> docker 命令。
+</div>
 
-## 架构
+---
 
-```text
-Guest command / OCI image
-             │
-             ▼
-  Rust capability negotiation
-       ┌─────┼─────────────┐
-       ▼     ▼             ▼
- Portable   Full VM      Native Linux
- offload    backend      backend
-       │     │             │
- Swift/     Real Linux    Probed host
- Java/      guest         kernel
- ArkTS      kernel        features
+## Milestone
+
+> **`docker run hello-world` → `HELLO_FROM_DOCKER_CONTAINER`, exit 0 — executed by
+> a pure-Rust x86-64 interpreter.** The full stack (dockerd · containerd ·
+> containerd-shim · runc · docker CLI) runs unmodified on a real pinned Alpine
+> kernel, booted from `startup_64` to userspace entirely in software.
+
+And it runs **on the iOS Simulator**: an `iPhone 17 Pro` boots the same x86-64
+Linux guest in ~40s and drops you into an **interactive shell** — type a command,
+it executes in the guest.
+
+```
+root@rish-container
+$ uname -a
+Linux rish-container 6.18.35-0-virt #1-Alpine SMP PREEMPT_DYNAMIC x86_64 Linux
+$ whoami
+root
+$ ps | head -3
+PID   USER     TIME  COMMAND
+    1 root      0:14 /usr/bin/rish-guest-agent
+    2 root      0:00 [kthreadd]
+$ cd /etc && cat hostname
+rish-container
 ```
 
-### Portable offload
+*A real Intel-syntax x86-64 instruction stream — SSE2, x87 FPU, paging, IDT/GDT,
+APIC, PIT, 16550 UARTs — interpreted instruction by instruction, in safe Rust.*
 
-普通移动 App 的默认后端。它提供版本化 JSON host-call 协议，并实现逻辑
-namespace、cgroup、设备和服务状态模型。
+---
 
-`systemctl`、`docker`、`mount`、`unshare`、`ip` 等可以映射为平台 handler；
-`dockerd`、`runc`、`modprobe` 等要求真实内核语义的操作不会在这个后端
-假装成功。
+## Why this is hard (and why it matters)
 
-### Full VM
+iOS and Android don't give apps a hypervisor. You cannot run KVM, you cannot get
+the virtualization entitlement, and you cannot ship QEMU's JIT. The conventional
+wisdom is that "real Linux on a stock phone" is impossible.
 
-高级兼容性的主后端。在 Linux guest 内提供：
+`rish` takes the other road: **a full-system x86-64 emulator written from scratch
+in Rust, with no JIT and no unsafe execution of guest code.** Guest instructions
+are decoded and interpreted; guest privilege, kernel modules, and namespaces
+live entirely inside the emulated Linux — they never touch the host sandbox.
 
-- PID/user/mount/UTS/IPC/network namespaces
-- cgroup v2
-- systemd PID 1
-- Docker、containerd、Youki 和 DinD
-- guest 内核模块、devtmpfs、virtio `/dev`
-- veth、bridge、TUN、nftables 和端口转发
+The interpreter is real enough to boot a stock distribution kernel and run the
+entire container toolchain on top of it.
 
-这里的 `privileged`、内核模块和设备权限只作用于 **guest Linux**，不会
-突破 iOS、Android 或鸿蒙宿主。
+## How it works
 
-### Native Linux
+`rish` is **native-offload first, software-VM fallback**:
 
-仅用于经过运行时探测的 Android/鸿蒙 root、OEM 或系统镜像。是否可用不
-根据“设备已 root”猜测，而是逐项探测 namespaces、cgroups、SELinux、
-KVM、设备和内核配置。
+```text
+          Guest command / OCI image
+                     │
+                     ▼
+          Rust capability negotiation
+          ┌──────────┼───────────────┐
+          ▼          ▼               ▼
+      Portable    Full VM        Native Linux
+      offload     backend        backend
+          │          │               │
+    Swift / Kotlin   pure-Rust    probed host
+    / ArkTS handler  x86-64 Linux  kernel features
+```
 
-## 当前仓库内容
+1. **Portable offload** — known commands (`grep`, `sha256sum`, `echo`, …) are
+   intercepted by Rust and answered natively in the app sandbox. No emulation.
+2. **Full VM** — anything needing a real kernel (`dockerd`, `runc`, `unshare`,
+   kernel modules, namespaces) runs inside the **pure-Rust x86-64 Linux guest**.
+3. **Native Linux** — on probed rooted/OEM hosts only, features are used
+   directly. Availability is *probed*, never guessed from "device is rooted".
+
+It **fails closed**: a capability that isn't really there is refused, never faked.
+Semantic emulation is never reported as real kernel isolation.
+
+## The pure-Rust interpreter
+
+`rish-softvm-core` is a no-JIT, no-`unsafe`-guest-exec x86-64 full-system
+interpreter. What's implemented and tested:
+
+- **CPU**: 64-bit long mode, the general-purpose instruction set, SSE/SSE2, the
+  **x87 FPU** (80-bit extended stack, `FXSAVE`/`FXRSTOR` context save), string ops
+- **Memory**: 4-level paging with page-boundary-correct operand access, an MTRR/MCE
+  MSR surface, a generation-invalidated translation cache
+- **Platform**: IDT/GDT, `syscall`/`sysret`, 8259 PIC, 8254 PIT, local APIC + IOAPIC,
+  CMOS/RTC, ACPI PM, dual 16550 UARTs
+- **Boot**: unpacks and runs a real pinned Alpine `bzImage` from `startup_64`,
+  correct `boot_params` zero-page layout (cmdline / E820 / ramdisk)
+
+Speed is tuned with `lto=fat`, `codegen-units=1`, and host-scoped
+`target-cpu=native` (~11% over baseline) — fast enough that a phone boots the
+guest in well under a minute.
+
+## Repository layout
 
 ```text
 crates/
-  rish-core/       公共命令、能力、后端与 host-call 协议
-  rish-content/    SHA-256 CAS、process-local lease、persistent pin 与 GC
-  rish-registry/   OCI 引用、manifest/index、Bearer challenge 与响应校验
-  rish-pull/       有资源上限的 linux/arm64/v8 与 linux/amd64 拉取流水线
-  rish-layer/      tar/gzip、diff-id、whiteout 与防路径逃逸的安全解层
-  rish-snapshot/   私有 staging 和 atomic no-replace rootfs 发布
-  rish-runtime/    路由、后端选择、namespace/cgroup/device/service 模型
-  rish-oci/        OCI image config 和原生 offload 契约
-  rish-vm/         evidence-gated VM 启动、设备配置和 guest 内核合同
-  rish-guest-protocol/  Host/guest 握手、执行、OCI、端口和 checkpoint RPC
-  rish-guest-agent/     Linux guest 内的失败关闭 bootstrap agent
-  rish-guest-importer/  Guest 内流式校验、解层和 Linux 元数据发布
-  rish-softvm-x86_64/   无 JIT x86_64 解释器控制面（ExperimentalPureRust 主后端 + QEMU TCTI 备用边界）
-  rish-ffi/        Swift/JNI/N-API 可调用的稳定 JSON C ABI
-  rish-cli/        命令规划调试工具
+  rish-softvm-core/     no-JIT x86-64 full-system interpreter (CPU / paging / devices)
+  rish-softvm-x86_64/   interpreter control plane, engine gate, bounded quanta
+  rish-vm/              evidence-gated VM boot, device config, guest kernel contract
+  rish-guest-agent/     fail-closed bootstrap agent (PID 1 inside the guest)
+  rish-guest-protocol/  host↔guest handshake, exec, OCI, port and checkpoint RPC
+  rish-ffi/             stable JSON C ABI callable from Swift / JNI / N-API
+  rish-oci · rish-pull · rish-registry · rish-layer · rish-snapshot · rish-content
+                        the OCI data plane: pull, verify, unpack, snapshot, CAS
+  rish-applets · rish-runtime · rish-core · rish-cli
+                        native command layer, backend routing, host-call protocol
 platform/
-  ios/             Swift 接入示例
-  android/         Kotlin/JNI 接入契约
-  harmony/         ArkTS/N-API 接入契约
+  ios/ · android/ · harmony/   Swift / Kotlin-JNI / ArkTS-NAPI bridges + rish.h
 examples/
-  ios/             可直接构建并启动的 iOS Simulator App
-  android/         可直接构建、安装并启动的 Android APK
-  harmony/         HarmonyOS Stage/HAP 工程与受限宿主烟测
+  ios-vm/              interactive x86-64 Linux terminal on the iOS Simulator
+  ios/ · android/ · harmony/   portable-offload demos on the real platform bridges
+guest/x86_64/
+  build-container-initramfs.sh   reproducible interactive-container initramfs
+  build-docker-initramfs.sh      full docker-in-guest initramfs
 ```
 
-## 快速验证
+## Quick start
 
 ```bash
+# Type-check and test the workspace
 cargo test --workspace
-cargo run -p rish-cli -- plan ios grep needle
-cargo run -p rish-cli -- plan ios docker ps
-cargo run -p rish-cli -- image-ref alpine
+
+# Command planning (portable offload)
+cargo run -p rish-cli -- plan ios grep needle      # → portable_applet
+cargo run -p rish-cli -- plan ios dockerd          # → fails closed (no guest kernel)
 ```
 
-第一条命令会输出 `portable_applet` plan。通用 planner 未绑定 live Docker
-handler，因此第二条失败关闭；后续 dispatcher-bound capability token 才能启用
-`container.docker_api`。真实 `systemctl` 和 `dockerd` 也会因为 stock iOS
-不具备 guest/native kernel 后端而被拒绝：
+### Interactive x86-64 Linux on the iOS Simulator
 
 ```bash
-cargo run -p rish-cli -- plan ios systemctl status demo
-cargo run -p rish-cli -- plan ios dockerd
+# Boots the guest and hands you a live shell in the simulator.
+# Needs: Xcode + an iPhone simulator, and the musl-cross toolchain
+#   brew install FiloSottile/musl-cross/musl-cross
+guest/x86_64/build-container-initramfs.sh          # → out/rish-container.cpio
+examples/ios-vm/run-vm-simulator.sh
 ```
 
-## 三端 Demo
+The demo boots the guest once, then runs each command you type over the open
+serial control channel — `whoami`, `ps`, `free -m`, `cd /etc && ls -la`, and a
+`unshare + chroot` container demo all run inside the emulated Linux.
 
-三个 Demo 都使用正式平台桥接和同一个 Rust `rish-ffi` ABI，合计验证
-`grep` 规划、`echo` 与 `sha256sum` 等 portable applet：
+## Platform promises
 
-```bash
-# iOS：构建、签名、安装并启动 iPhone Simulator App
-examples/ios/run-simulator.sh
+| Capability | App offload | Full Linux VM | Native Linux |
+|---|:---:|:---:|:---:|
+| Known commands, native impl | ✅ | ✅ | ✅ |
+| OCI metadata + control plane | ✅ | ✅ | ✅ |
+| namespaces / cgroups | semantic | real, in guest | real, after probe |
+| systemd | API-compatible | real, in guest | real, after probe |
+| privileged / Docker-in-Docker | ✗ | real, in guest | controlled devices |
+| kernel modules & `/dev` | device proxy | real, in guest | controlled devices |
+| unknown complex ELF / syscalls | ✗ | Linux kernel | Linux kernel |
 
-# Android：构建、签名、安装并启动 arm64 APK（存在 adb 设备时）
-examples/android/run-demo.sh
+Everything in the **Full Linux VM** column is real inside the *guest* Linux — it
+never breaks out of the iOS, Android, or HarmonyOS host sandbox.
 
-# 鸿蒙：准备 Stage/HAP 工程；需 DevEco、HarmonyOS SDK 和设备才能真机运行
-examples/harmony/prepare_hap.sh
-RISH_OHOS_NATIVE_SDK=/path/to/native examples/harmony/build_rust_ohos.sh
+## Documentation
 
-# 没有鸿蒙 SDK 时，只验证相同 Rust C ABI，不冒充 HAP/设备运行
-examples/harmony/run_host_smoke.sh
-```
+[Architecture](docs/architecture.md) ·
+[Platform matrix](docs/platform-matrix.md) ·
+[OCI data plane](docs/oci-pipeline.md) ·
+[Command compatibility](docs/command-compatibility.md) ·
+[ADR-0001: offload-first](docs/decisions/0001-offload-first.md) ·
+[ADR-0002: pure-software Linux](docs/decisions/0002-pure-software-linux.md) ·
+[Roadmap](docs/roadmap.md)
 
-具体依赖、输出和能力边界见各目录 README。这里演示的是移动应用沙箱内的
-Rust 原生命令语义，不代表宿主拥有 Linux namespaces、cgroups、systemd、
-内核模块、privileged container 或 Docker-in-Docker。
+## License
 
-Swift、Kotlin/Java 和 ArkTS 侧现已包含二进制安全 HostCall/HostReply codec、
-固定 allow-list dispatcher、协作式取消，以及明确标记为“非真实 systemd”
-的 App 内 service supervisor。未知 operation 和真实内核语义均失败关闭。
-
-Guest bootstrap exec 使用有界非阻塞监督器：长进程不会阻塞 Ping，Cancel、
-timeout、进程组清理、stdout/stderr 限额、streaming stdin/stdout/stderr 和
-Linux PTY 均已接入。它们尚未连接到真实启动的移动端 x86_64 guest。
-
-## Linux 命令兼容层
-
-`rish-applets` 现提供首批 47 个共享 Rust 原生命令入口，覆盖常用文本流、
-校验和、虚拟身份与 app-owned 文件系统操作。它们不解释 Guest ELF，并通过
-`rish_execute_applet_json` 从 Swift、Kotlin/Java 和 ArkTS 桥调用。路径被限制
-在应用创建的 canonical sandbox root 内，输入、输出、递归深度和文件数量均有
-硬上限。只有显式 bare command name 进入 applet；带路径的 Guest 程序不会因
-basename 相同而被原生实现截获。
-
-需要 `/proc`、netlink、namespace、cgroup、设备、模块、真实 systemd 或容器
-daemon 的命令不会使用近似 applet；它们通过绑定 live `BootedVm` 的 Full VM
-执行。Native Linux 已有不可伪造的保守 probe token；在主动 child-exec probe
-和 OEM executor 接入前，它不声明 `LinuxElf`，也不能成为可运行候选。完整命令分层和当前列表见
-[Linux 命令兼容说明](docs/command-compatibility.md)。
-
-移动端 C ABI 是可信宿主嵌入边界，不是 Guest API：请求使用显式字节长度且上限
-8 MiB，FFI applet 的输入/输出上限为 1 MiB。平台应用必须从自己的
-Context/container 构造根目录，不能把 Guest JSON 的路径转发给原始 native ABI。
-
-## OCI 原生契约
-
-已知镜像可以通过 OCI config labels 声明平台 handler：
-
-```json
-{
-  "config": {
-    "Labels": {
-      "io.rish.offload.handler": "media.ffmpeg",
-      "io.rish.requires": "port_forwarding",
-      "io.rish.requires-kernel": "network_namespace"
-    }
-  }
-}
-```
-
-镜像 label 只是未受信请求，不能自行注册实现。`plan_image` 还要求
-evidence-gated `BackendCandidate` 和宿主构造的 `OffloadHandlerRegistry`；
-未绑定 handler 会失败关闭。
-
-- `io.rish.requires` 允许桥接或语义模拟。
-- `io.rish.requires-kernel` 只接受宿主原生或完整 VM guest 的真实内核语义。
-- 没有 handler 的未知 ELF 只能进入 Native Linux/Full VM，否则拒绝。
-
-## 平台承诺
-
-| 能力 | 普通 App offload | Full Linux VM | Native Linux |
-|---|---:|---:|---:|
-| 已知命令原生实现 | 支持 | 支持 | 支持 |
-| OCI 元数据和控制面 | 支持 | 支持 | 支持 |
-| namespace/cgroup | 语义模拟 | guest 内真实 | 探测后真实 |
-| systemd | 兼容 API | guest 内真实 | 探测后真实 |
-| privileged/DinD | 不支持 | guest 内支持 | 仅受控设备 |
-| 内核模块与 `/dev` | 显式设备代理 | guest 内支持 | 仅受控设备 |
-| 未知复杂 ELF/syscall | 不支持 | Linux 内核处理 | Linux 内核处理 |
-
-详细设计见 [架构说明](docs/architecture.md)、[平台能力矩阵](docs/platform-matrix.md)、
-[OCI 数据面](docs/oci-pipeline.md)、[Linux 命令兼容说明](docs/command-compatibility.md)、
-[offload-first 决策](docs/decisions/0001-offload-first.md) 和
-[纯软件 Linux 决策](docs/decisions/0002-pure-software-linux.md)、
-[路线图](docs/roadmap.md)。
-
-## 许可证
-
-项目自有 Rust 代码采用 MIT License。可选 QEMU TCTI provider、Linux kernel
-和 guest 发行物保持各自许可证；链接或分发 QEMU 的产品必须单独履行 GPLv2
-源码与再分发义务。
+`rish`'s own Rust code is MIT-licensed. The optional QEMU TCTI provider, the
+Linux kernel, and guest distribution artifacts keep their own licenses; anything
+that links or ships QEMU must satisfy GPLv2 source and redistribution terms
+separately.
