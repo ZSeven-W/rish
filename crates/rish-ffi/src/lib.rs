@@ -8,6 +8,7 @@ use rish_runtime::{
 use serde::{Deserialize, Serialize};
 
 mod pull_ffi;
+pub mod vm_ffi;
 
 pub use pull_ffi::{RishRegistryFetchCallback, pull_image_json};
 
@@ -301,6 +302,99 @@ pub unsafe extern "C" fn rish_string_free(value: *mut c_char) {
     if !value.is_null() {
         // SAFETY: The caller guarantees ownership and provenance.
         drop(unsafe { CString::from_raw(value) });
+    }
+}
+
+/// Boots the pure-Rust x86_64 interpreter with an app-supplied kernel and
+/// initramfs and runs one command inside the guest (the full docker surface).
+///
+/// The operation is synchronous and boots a Linux guest, so it is slow and
+/// must run on a worker thread. Kernel and initramfs are named by path in the
+/// request JSON so the large binaries never cross the ABI as data.
+///
+/// # Safety
+///
+/// `input` must point to `input_len` readable bytes. The returned pointer must
+/// be released exactly once with [`rish_string_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rish_vm_run_docker_json(
+    input: *const c_char,
+    input_len: usize,
+) -> *mut c_char {
+    unsafe { invoke_json_abi(input, input_len, vm_ffi::vm_run_docker_json) }
+}
+
+/// Boots an interactive guest session and returns an opaque handle, or null on
+/// failure. Many commands then run over the same booted guest with
+/// [`rish_vm_session_exec_json`]; release the handle with
+/// [`rish_vm_session_free`]. Boots a Linux guest and blocks — call on a worker
+/// thread. The request JSON matches [`rish_vm_run_docker_json`] minus `command`.
+///
+/// # Safety
+///
+/// `input` must point to `input_len` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rish_vm_boot_session(
+    input: *const c_char,
+    input_len: usize,
+) -> *mut std::ffi::c_void {
+    if input.is_null() || input_len > MAX_ABI_REQUEST_BYTES {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: the caller guarantees `input_len` readable bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(input.cast::<u8>(), input_len) };
+    let Ok(request) = std::str::from_utf8(bytes) else {
+        return std::ptr::null_mut();
+    };
+    match vm_ffi::vm_boot_session(request) {
+        Ok(session) => Box::into_raw(session).cast::<std::ffi::c_void>(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Runs one command in a live session (from [`rish_vm_boot_session`]) and
+/// returns an owned JSON reply. The request is `{"command":["argv0",...]}`.
+///
+/// # Safety
+///
+/// `session` must be a live handle from [`rish_vm_boot_session`] that has not
+/// been freed. `input` must point to `input_len` readable bytes. The returned
+/// pointer must be released once with [`rish_string_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rish_vm_session_exec_json(
+    session: *mut std::ffi::c_void,
+    input: *const c_char,
+    input_len: usize,
+) -> *mut c_char {
+    if session.is_null() || input.is_null() || input_len > MAX_ABI_REQUEST_BYTES {
+        return CString::new(r#"{"protocol_version":1,"ok":false,"error":"invalid session call"}"#)
+            .expect("static JSON has no NUL")
+            .into_raw();
+    }
+    // SAFETY: the caller guarantees a live session handle and readable bytes.
+    let session = unsafe { &*(session.cast::<vm_ffi::VmSession>()) };
+    let bytes = unsafe { std::slice::from_raw_parts(input.cast::<u8>(), input_len) };
+    let response = match std::str::from_utf8(bytes) {
+        Ok(request) => vm_ffi::vm_session_exec_json(session, request),
+        Err(_) => r#"{"protocol_version":1,"ok":false,"error":"request is not UTF-8"}"#.to_owned(),
+    };
+    CString::new(response)
+        .expect("serialized JSON cannot contain an interior NUL")
+        .into_raw()
+}
+
+/// Releases a session handle from [`rish_vm_boot_session`], shutting the guest
+/// down.
+///
+/// # Safety
+///
+/// `session` must be null or a live handle from [`rish_vm_boot_session`] that
+/// has not already been freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rish_vm_session_free(session: *mut std::ffi::c_void) {
+    if !session.is_null() {
+        // SAFETY: the caller guarantees ownership and provenance.
+        drop(unsafe { Box::from_raw(session.cast::<vm_ffi::VmSession>()) });
     }
 }
 

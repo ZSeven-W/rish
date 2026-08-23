@@ -71,7 +71,43 @@ char *rish_pull_image_json(
     void *context
 );
 
-/** Releases a string returned by either JSON operation. */
+/**
+ * Boots the in-repository pure-Rust x86_64 interpreter with an app-supplied
+ * kernel and initramfs and runs one command inside the Linux guest — the full
+ * docker surface.
+ *
+ * Call this from a worker thread: it boots a Linux guest and is slow. The
+ * request is UTF-8 JSON with kernel_path, initrd_path, an optional
+ * root_disk_path, memory_mib, a command argv array, an optional command_line,
+ * and optional boot_budget_units / handshake_budget_units. The kernel and
+ * initramfs are named by path (staged as app bundle resources) so the large
+ * binaries never cross the ABI as data. The reply JSON carries ok, exit_code,
+ * stdout, stderr, and boot_units, or ok=false with an error. The returned
+ * string belongs to Rust and must be released with rish_string_free.
+ */
+char *rish_vm_run_docker_json(const char *input, size_t input_len);
+
+/**
+ * Boots an interactive guest session and returns an opaque handle (or NULL on
+ * failure). Run many commands over the same booted guest with
+ * rish_vm_session_exec_json, then release the handle with rish_vm_session_free.
+ * Boots a Linux guest and blocks, so call it from a worker thread. The request
+ * JSON matches rish_vm_run_docker_json without the command field.
+ */
+void *rish_vm_boot_session(const char *input, size_t input_len);
+
+/**
+ * Runs one command in a live session and returns an owned JSON reply
+ * ({ok, exit_code, stdout, stderr, ...}). The request is
+ * {"command":["argv0","argv1",...]}. The returned string belongs to Rust and
+ * must be released with rish_string_free.
+ */
+char *rish_vm_session_exec_json(void *session, const char *input, size_t input_len);
+
+/** Releases a session handle from rish_vm_boot_session, shutting the guest down. */
+void rish_vm_session_free(void *session);
+
+/** Releases a string returned by any JSON operation. */
 void rish_string_free(char *value);
 
 /** Returns the host protocol version implemented by this library. */

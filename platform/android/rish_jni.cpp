@@ -233,6 +233,15 @@ Java_dev_rish_runtime_RishBridge_executeAppletJson(
     return InvokeJson(env, request, rish_execute_applet_json);
 }
 
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_rish_runtime_RishBridge_vmRunDockerJson(
+    JNIEnv *env,
+    jclass,
+    jstring request
+) {
+    return InvokeJson(env, request, rish_vm_run_docker_json);
+}
+
 extern "C" JNIEXPORT jint JNICALL
 Java_dev_rish_runtime_RishBridge_protocolVersion(
     JNIEnv *,

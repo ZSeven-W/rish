@@ -5,6 +5,14 @@ import Foundation
 private func rish_plan_json(_ input: UnsafePointer<CChar>, _ count: Int) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("rish_execute_applet_json")
 private func rish_execute_applet_json(_ input: UnsafePointer<CChar>, _ count: Int) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("rish_vm_run_docker_json")
+private func rish_vm_run_docker_json(_ input: UnsafePointer<CChar>, _ count: Int) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("rish_vm_boot_session")
+private func rish_vm_boot_session(_ input: UnsafePointer<CChar>, _ count: Int) -> UnsafeMutableRawPointer?
+@_silgen_name("rish_vm_session_exec_json")
+private func rish_vm_session_exec_json(_ session: UnsafeMutableRawPointer, _ input: UnsafePointer<CChar>, _ count: Int) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("rish_vm_session_free")
+private func rish_vm_session_free(_ session: UnsafeMutableRawPointer?)
 @_silgen_name("rish_string_free")
 private func rish_string_free(_ value: UnsafeMutablePointer<CChar>?)
 @_silgen_name("rish_protocol_version")
@@ -788,11 +796,138 @@ public enum RishBridge {
         return try encodeHostReply(reply)
     }
 
+    /// A full-VM docker request. `kernelPath` and `initrdPath` name guest
+    /// binaries staged as app bundle resources; they never cross the ABI as
+    /// data. `command` is the argv run inside the booted Linux guest.
+    public struct RishVMRunRequest: Encodable, Sendable {
+        public var kernelPath: String
+        public var initrdPath: String
+        public var rootDiskPath: String?
+        public var memoryMib: UInt32
+        public var command: [String]
+        public var commandLine: String?
+        public var bootBudgetUnits: UInt64?
+        public var handshakeBudgetUnits: UInt64?
+
+        private enum CodingKeys: String, CodingKey {
+            case kernelPath = "kernel_path"
+            case initrdPath = "initrd_path"
+            case rootDiskPath = "root_disk_path"
+            case memoryMib = "memory_mib"
+            case command
+            case commandLine = "command_line"
+            case bootBudgetUnits = "boot_budget_units"
+            case handshakeBudgetUnits = "handshake_budget_units"
+        }
+
+        public init(
+            kernelPath: String,
+            initrdPath: String,
+            command: [String],
+            rootDiskPath: String? = nil,
+            memoryMib: UInt32 = 1024,
+            commandLine: String? = nil,
+            bootBudgetUnits: UInt64? = nil,
+            handshakeBudgetUnits: UInt64? = nil
+        ) {
+            self.kernelPath = kernelPath
+            self.initrdPath = initrdPath
+            self.command = command
+            self.rootDiskPath = rootDiskPath
+            self.memoryMib = memoryMib
+            self.commandLine = commandLine
+            self.bootBudgetUnits = bootBudgetUnits
+            self.handshakeBudgetUnits = handshakeBudgetUnits
+        }
+    }
+
+    /// The decoded reply from `rish_vm_run_docker_json`.
+    public struct RishVMRunResult: Decodable, Sendable {
+        public let protocolVersion: UInt32
+        public let ok: Bool
+        public let exitCode: Int32?
+        public let stdout: String?
+        public let stderr: String?
+        public let bootUnits: UInt64?
+        public let error: String?
+
+        private enum CodingKeys: String, CodingKey {
+            case protocolVersion = "protocol_version"
+            case ok
+            case exitCode = "exit_code"
+            case stdout, stderr
+            case bootUnits = "boot_units"
+            case error
+        }
+    }
+
+    /// Boots the pure-Rust x86_64 interpreter and runs one command inside the
+    /// guest — the full docker surface. This boots a Linux guest and blocks, so
+    /// call it from a background thread.
+    public static func runDockerVM(_ request: RishVMRunRequest) throws -> RishVMRunResult {
+        let encoded = try JSONEncoder().encode(request)
+        guard encoded.count <= 8 * 1_024 * 1_024,
+              let json = String(data: encoded, encoding: .utf8) else {
+            throw BridgeError.inputTooLarge
+        }
+        return try json.withCString { input in
+            guard let rawResponse = rish_vm_run_docker_json(input, json.utf8.count) else {
+                throw BridgeError.nullResponse
+            }
+            defer { rish_string_free(rawResponse) }
+            let data = Data(String(cString: rawResponse).utf8)
+            return try JSONDecoder().decode(RishVMRunResult.self, from: data)
+        }
+    }
+
     public enum BridgeError: Error {
         case invalidUTF8
         case nullResponse
         case inputTooLarge
         case plannerRejected(String)
         case notPortableApplet
+    }
+}
+
+/// A live interactive guest session: boot the x86-64 Linux guest once, then run
+/// many commands over the same open control channel. Every call blocks on the
+/// interpreter, so drive it from a background thread. Releasing the object shuts
+/// the guest down.
+public final class RishVMSession {
+    private let handle: UnsafeMutableRawPointer
+
+    private init(handle: UnsafeMutableRawPointer) {
+        self.handle = handle
+    }
+
+    /// Boots a guest and returns a session, or nil if the boot fails.
+    public static func boot(_ request: RishBridge.RishVMRunRequest) -> RishVMSession? {
+        guard let encoded = try? JSONEncoder().encode(request),
+              let json = String(data: encoded, encoding: .utf8) else { return nil }
+        return json.withCString { input in
+            guard let handle = rish_vm_boot_session(input, json.utf8.count) else { return nil }
+            return RishVMSession(handle: handle)
+        }
+    }
+
+    /// Runs one command in the live guest and returns the decoded result.
+    public func run(_ command: [String]) throws -> RishBridge.RishVMRunResult {
+        struct ExecRequest: Encodable { let command: [String] }
+        let encoded = try JSONEncoder().encode(ExecRequest(command: command))
+        guard let json = String(data: encoded, encoding: .utf8) else {
+            throw RishBridge.BridgeError.invalidUTF8
+        }
+        return try json.withCString { input in
+            guard let raw = rish_vm_session_exec_json(handle, input, json.utf8.count) else {
+                throw RishBridge.BridgeError.nullResponse
+            }
+            defer { rish_string_free(raw) }
+            let data = Data(String(cString: raw).utf8)
+            return try JSONDecoder().decode(RishBridge.RishVMRunResult.self, from: data)
+        }
+    }
+
+    deinit {
+        rish_vm_session_free(handle)
     }
 }

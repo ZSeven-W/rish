@@ -86,6 +86,15 @@ napi_value ExecuteAppletJson(napi_env env, napi_callback_info info) {
     );
 }
 
+napi_value VmRunDockerJson(napi_env env, napi_callback_info info) {
+    return InvokeJson(
+        env,
+        info,
+        "vmRunDockerJson expects one JSON string",
+        rish_vm_run_docker_json
+    );
+}
+
 napi_value ProtocolVersion(napi_env env, napi_callback_info) {
     napi_value result = nullptr;
     napi_create_uint32(env, rish_protocol_version(), &result);
@@ -99,6 +108,16 @@ napi_value Init(napi_env env, napi_value exports) {
             "executeAppletJson",
             nullptr,
             ExecuteAppletJson,
+            nullptr,
+            nullptr,
+            nullptr,
+            napi_default,
+            nullptr,
+        },
+        {
+            "vmRunDockerJson",
+            nullptr,
+            VmRunDockerJson,
             nullptr,
             nullptr,
             nullptr,

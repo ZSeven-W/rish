@@ -618,6 +618,17 @@ object RishBridge {
     external fun protocolVersion(): Int
 
     /**
+     * Boots the in-repository pure-Rust x86_64 interpreter with an app-supplied
+     * kernel and initramfs and runs one command inside the Linux guest — the
+     * full docker surface. Call from a background thread: it boots a Linux guest
+     * and blocks. The request JSON carries kernel_path, initrd_path, an optional
+     * root_disk_path, memory_mib, a command argv array, an optional
+     * command_line, and optional boot/handshake budgets. Reply JSON carries ok,
+     * exit_code, stdout, stderr, and boot_units, or ok=false with an error.
+     */
+    external fun vmRunDockerJson(request: String): String
+
+    /**
      * Builds its own Android/app-sandbox plan and invokes Rust only when the
      * returned plan is exactly the matching portable applet.
      */
