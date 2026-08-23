@@ -9,7 +9,8 @@ mod manifest;
 
 use std::{
     env, fs,
-    io::{Read, Write},
+    io::{Read, Seek, Write},
+    ops::{Deref, DerefMut},
     os::unix::net::{UnixListener, UnixStream},
     path::PathBuf,
     process::{Child, Command, ExitCode, Stdio},
@@ -23,6 +24,30 @@ use rish_guest_protocol::{
 };
 
 const ADVANCE_POLL: Duration = Duration::from_millis(50);
+const CONTROL_WRITE_CHUNK: usize = 16;
+
+struct KillOnDrop(Child);
+
+impl Deref for KillOnDrop {
+    type Target = Child;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for KillOnDrop {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
 
 struct Options {
     manifest_path: PathBuf,
@@ -134,6 +159,8 @@ fn run() -> Result<u8, String> {
     );
 
     let _ = fs::remove_file(&options.socket_path);
+    let console_path = options.socket_path.with_extension("console.log");
+    let _ = fs::remove_file(&console_path);
     let socket_dir = options
         .socket_path
         .parent()
@@ -161,24 +188,38 @@ fn run() -> Result<u8, String> {
         .arg("-append")
         .arg(&manifest.boot.command_line)
         .arg("-serial")
-        .arg("stdio")
+        // Keep the console output-only. A stdio serial backend exits as soon
+        // as the intentionally-null stdin reaches EOF.
+        .arg(format!("file:{}", console_path.display()))
         .arg("-serial")
         .arg(format!("unix:{}", options.socket_path.display()))
         .arg("-netdev")
         .arg("user,id=n0,hostfwd=tcp:127.0.0.1:2375-:2375")
         .arg("-device")
         .arg("virtio-net-pci,netdev=n0")
+        .arg("-object")
+        .arg("rng-random,id=rng0,filename=/dev/urandom")
+        .arg("-device")
+        .arg("virtio-rng-pci,rng=rng0")
         .arg("-no-reboot")
         .arg("-display")
         .arg("none")
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    let mut child = qemu_command
-        .spawn()
-        .map_err(|error| format!("failed to spawn {}: {error}", options.qemu.display()))?;
+    let mut child = KillOnDrop(
+        qemu_command
+            .spawn()
+            .map_err(|error| format!("failed to spawn {}: {error}", options.qemu.display()))?,
+    );
 
     let stream = wait_for_guest_connection(&listener, &options.timeout, &mut child)?;
+    wait_for_console_marker(
+        &console_path,
+        &manifest.boot.control_ready_serial_marker,
+        &options.timeout,
+        &mut child,
+    )?;
     let socket_io = SocketIo::new(stream);
     let advances = (options.timeout.as_millis() / ADVANCE_POLL.as_millis()).max(1) as u64;
     let mut client = SessionClient::new(advances).map_err(|error| error.to_string())?;
@@ -252,6 +293,61 @@ fn run() -> Result<u8, String> {
     Ok(u8::try_from(outcome.exit_code.unwrap_or(1) & 0xff).unwrap_or(1))
 }
 
+fn wait_for_console_marker(
+    console_path: &std::path::Path,
+    marker: &str,
+    timeout: &Duration,
+    child: &mut Child,
+) -> Result<(), String> {
+    if marker.is_empty() {
+        return Err("control-ready serial marker must not be empty".to_owned());
+    }
+
+    let deadline = std::time::Instant::now() + *timeout;
+    let mut offset = 0_u64;
+    let mut observed = Vec::new();
+    loop {
+        if let Ok(mut console) = fs::File::open(console_path) {
+            console
+                .seek(std::io::SeekFrom::Start(offset))
+                .map_err(|error| error.to_string())?;
+            let mut chunk = Vec::new();
+            console
+                .read_to_end(&mut chunk)
+                .map_err(|error| error.to_string())?;
+            if !chunk.is_empty() {
+                offset = offset.saturating_add(chunk.len() as u64);
+                std::io::stdout()
+                    .write_all(&chunk)
+                    .map_err(|error| error.to_string())?;
+                std::io::stdout()
+                    .flush()
+                    .map_err(|error| error.to_string())?;
+                observed.extend_from_slice(&chunk);
+                if observed
+                    .windows(marker.len())
+                    .any(|window| window == marker.as_bytes())
+                {
+                    return Ok(());
+                }
+            }
+        }
+
+        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+            return Err(format!(
+                "qemu exited before the guest reported {marker} (status {status})"
+            ));
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            return Err(format!(
+                "timed out waiting for guest console marker {marker}"
+            ));
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn run_text(client: &mut SessionClient, io: &SocketIo, argv: &[&str]) -> Result<String, String> {
     let outcome = client
         .execute(
@@ -285,6 +381,13 @@ fn wait_for_guest_connection(
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
+                // macOS may preserve the listener's nonblocking flag on an
+                // accepted Unix stream. Session budgets assume one empty
+                // advance represents ADVANCE_POLL, so restore blocking mode
+                // before installing the bounded read timeout.
+                stream
+                    .set_nonblocking(false)
+                    .map_err(|error| error.to_string())?;
                 stream
                     .set_read_timeout(Some(ADVANCE_POLL))
                     .map_err(|error| error.to_string())?;
@@ -328,7 +431,11 @@ impl SessionIo for SocketIo {
             .stream
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        stream.write(bytes).unwrap_or_default()
+        // Match one 16550 FIFO. QEMU's socket chardev does not guarantee that
+        // a full protocol frame written before the guest drains the UART will
+        // remain buffered, so SessionClient advances between bounded chunks.
+        let accepted = bytes.len().min(CONTROL_WRITE_CHUNK);
+        stream.write(&bytes[..accepted]).unwrap_or_default()
     }
 
     fn advance(&self) -> Result<Vec<u8>, String> {
@@ -336,18 +443,31 @@ impl SessionIo for SocketIo {
             .stream
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let mut buffer = [0_u8; 65536];
-        match stream.read(&mut buffer) {
-            Ok(read) => Ok(buffer[..read].to_vec()),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                Ok(Vec::new())
+        let deadline = std::time::Instant::now() + ADVANCE_POLL;
+        let mut output = Vec::with_capacity(65536);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() || output.len() == 65536 {
+                return Ok(output);
             }
-            Err(error) => Err(error.to_string()),
+            stream
+                .set_read_timeout(Some(remaining))
+                .map_err(|error| error.to_string())?;
+            let spare = 65536 - output.len();
+            let mut buffer = [0_u8; 65536];
+            match stream.read(&mut buffer[..spare]) {
+                Ok(0) => return Err("guest control socket closed".to_owned()),
+                Ok(read) => output.extend_from_slice(&buffer[..read]),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return Ok(output);
+                }
+                Err(error) => return Err(error.to_string()),
+            }
         }
     }
 

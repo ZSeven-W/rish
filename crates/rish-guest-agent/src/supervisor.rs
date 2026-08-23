@@ -15,7 +15,7 @@ use rish_guest_protocol::{
     ResponsePayload, StreamAction, StreamChannel, StreamRequest,
 };
 
-use crate::{HandlerEvent, HandlerReply, OperationHandler};
+use crate::{HandlerEvent, HandlerReply, OperationHandler, oci_runtime::OciRuntimeBackend};
 #[cfg(target_os = "linux")]
 use config::ABSOLUTE_MAX_STREAM_OUTPUT;
 use platform::{
@@ -39,6 +39,7 @@ pub struct NativeOperationHandler {
     next_execution_id: u64,
     executions: BTreeMap<String, Execution>,
     pending_events: VecDeque<HandlerEvent>,
+    oci_backend: Option<OciRuntimeBackend>,
 }
 
 impl Default for NativeOperationHandler {
@@ -59,7 +60,25 @@ impl NativeOperationHandler {
             next_execution_id: 1,
             executions: BTreeMap::new(),
             pending_events: VecDeque::with_capacity(event_capacity),
+            oci_backend: None,
         })
+    }
+
+    /// Installs the evidence-gated OCI lifecycle backend discovered by the
+    /// guest bootstrap probe. The backend itself still validates every
+    /// request and every bundle boundary before invoking the runtime.
+    pub fn with_oci_backend(
+        config: NativeExecutionConfig,
+        backend: OciRuntimeBackend,
+    ) -> Result<Self, RemoteError> {
+        let mut handler = Self::new(config)?;
+        handler.oci_backend = Some(backend);
+        Ok(handler)
+    }
+
+    #[must_use]
+    pub fn has_oci_backend(&self) -> bool {
+        self.oci_backend.is_some()
     }
 
     #[must_use]
@@ -365,9 +384,20 @@ impl OperationHandler for NativeOperationHandler {
             Operation::OciPrepare(_)
             | Operation::OciRun(_)
             | Operation::OciStop(_)
-            | Operation::OciDelete(_)
-            | Operation::PortForward(_)
-            | Operation::Checkpoint(_) => Err(RemoteError::new(
+            | Operation::OciDelete(_) => {
+                let backend = self.oci_backend.as_mut().ok_or_else(|| {
+                    RemoteError::new(
+                        ErrorCode::CapabilityUnavailable,
+                        "OCI lifecycle backend is not available in this guest",
+                    )
+                })?;
+                let reply = backend.dispatch(operation)?;
+                Ok(HandlerReply {
+                    response: reply.response,
+                    events: reply.events,
+                })
+            }
+            Operation::PortForward(_) | Operation::Checkpoint(_) => Err(RemoteError::new(
                 ErrorCode::UnsupportedOperation,
                 "operation is not enabled in the bootstrap guest agent",
             )),

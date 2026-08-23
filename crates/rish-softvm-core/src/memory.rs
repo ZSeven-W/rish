@@ -1,10 +1,6 @@
 //! Physical guest memory with bounds-checked access.
 
-use std::{
-    cell::RefCell,
-    collections::VecDeque,
-    sync::{Arc, Mutex},
-};
+use std::cell::RefCell;
 
 use crate::CpuError;
 use crate::devices::ioapic::{IOAPIC_BASE, IOAPIC_SIZE, IoApic};
@@ -90,14 +86,28 @@ impl Memory {
         false
     }
 
-    pub fn attach_lapic(&mut self, queue: Arc<Mutex<VecDeque<u8>>>) {
-        self.lapic = Some(RefCell::new(LocalApic::new(queue)));
+    pub fn attach_lapic(&mut self) {
+        self.lapic = Some(RefCell::new(LocalApic::new()));
+    }
+
+    /// Removes the next LAPIC vector ready for delivery to the CPU.
+    pub fn lapic_pop_interrupt(&mut self) -> Option<u8> {
+        self.lapic
+            .as_mut()
+            .and_then(|lapic| lapic.get_mut().pop_interrupt())
+    }
+
+    #[cfg(test)]
+    pub fn lapic_enqueue_interrupt(&self, vector: u8) {
+        if let Some(lapic) = &self.lapic {
+            lapic.borrow_mut().enqueue_interrupt(vector);
+        }
     }
 
     /// Advances the local APIC timer by a batch of guest instructions.
-    pub fn lapic_tick(&self, instructions: u32) {
-        if let Some(lapic) = &self.lapic {
-            lapic.borrow_mut().tick(instructions);
+    pub fn lapic_tick(&mut self, instructions: u32) {
+        if let Some(lapic) = &mut self.lapic {
+            lapic.get_mut().tick(instructions);
         }
     }
 

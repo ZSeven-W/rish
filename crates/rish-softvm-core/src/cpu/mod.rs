@@ -1,7 +1,6 @@
 //! The interpreter core: fetch, dispatch, exceptions, and interrupts.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
 
 use iced_x86::{Instruction, Register};
 
@@ -23,7 +22,7 @@ pub use interrupts::{
     VECTOR_INVALID_OPCODE, VECTOR_PAGE_FAULT,
 };
 
-use decode::DecodeCache;
+use decode::{DecodeCache, DecodeMapping};
 use tlb::Tlb;
 
 /// Guest nanoseconds charged per retired instruction, for the PIT and CMOS.
@@ -128,7 +127,6 @@ pub struct Cpu {
     /// Recent exceptions and interrupts. Bounded; always on, because the
     /// record is one small struct per fault and faults are rare.
     pub fault_log: VecDeque<FaultEvent>,
-    pub lapic_queue: Arc<std::sync::Mutex<VecDeque<u8>>>,
     pub(crate) pending_interrupts: VecDeque<Deliverable>,
     pub(crate) in_exception: bool,
     pub(crate) in_double_fault: bool,
@@ -150,8 +148,7 @@ pub struct Cpu {
 impl Cpu {
     pub fn new(memory_mib: usize, boot_epoch_seconds: u64) -> Result<Self, CpuError> {
         let mut memory = Memory::new(memory_mib)?;
-        let lapic_queue = Arc::new(std::sync::Mutex::new(VecDeque::new()));
-        memory.attach_lapic(Arc::clone(&lapic_queue));
+        memory.attach_lapic();
         let trace_capacity = std::env::var("RISH_TRACE")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
@@ -189,7 +186,6 @@ impl Cpu {
             interrupts_delivered: 0,
             exceptions_raised: 0,
             fault_log: VecDeque::new(),
-            lapic_queue,
             pending_interrupts: VecDeque::new(),
             in_exception: false,
             in_double_fault: false,
@@ -336,8 +332,8 @@ impl Cpu {
     fn execute_one(&mut self) -> Result<(), CpuError> {
         loop {
             self.instruction_start = self.regs.rip;
-            let (instruction, bytes) = match self.fetch() {
-                Ok(pair) => pair,
+            let instruction = match self.fetch() {
+                Ok(instruction) => instruction,
                 Err(CpuError::PageFault { linear, error_code }) => {
                     // Instruction fetch fault: deliver through the guest IDT;
                     // the handler maps the page and the fetch is retried.
@@ -348,6 +344,7 @@ impl Cpu {
                 Err(error) => return Err(error),
             };
             if self.trace_capacity != 0 {
+                let bytes = self.read_fetch_window(self.instruction_start)?;
                 self.record_trace(&bytes);
             }
             // An instruction that faults part-way through must leave no
@@ -384,6 +381,9 @@ impl Cpu {
                     continue;
                 }
                 Err(CpuError::UnimplementedInstruction { code, address, .. }) => {
+                    let bytes = self
+                        .read_fetch_window(self.instruction_start)
+                        .unwrap_or([0; MAX_INSTRUCTION_BYTES]);
                     return Err(CpuError::UnimplementedInstruction {
                         code,
                         address,
@@ -426,20 +426,45 @@ impl Cpu {
 
     /// Reads and decodes the instruction at RIP, reusing a cached decode when
     /// the same bytes still live at the same physical address.
-    fn fetch(&mut self) -> Result<(Instruction, [u8; MAX_INSTRUCTION_BYTES]), CpuError> {
+    fn fetch(&mut self) -> Result<Instruction, CpuError> {
         let (bitness, ip) = self.decode_environment();
         let linear = self.regs.code_base().wrapping_add(ip);
+        let translation_epoch = self.tlb.epoch();
+        let execution_context = self.decode_execution_context(bitness);
+        if !tlb_disabled()
+            && let Some(cached) = self.decoded.lookup_mapped(
+                &self.memory,
+                ip,
+                linear,
+                translation_epoch,
+                execution_context,
+            )
+        {
+            return Ok(cached);
+        }
         let mut window = [0_u8; MAX_INSTRUCTION_BYTES];
         let first = self.translate(linear, AccessKind::Execute)?;
         let in_page = (4096 - (first & 0xFFF)) as usize;
         let single_page = in_page >= MAX_INSTRUCTION_BYTES;
+        let cacheable =
+            single_page && first <= self.memory.len().saturating_sub(MAX_INSTRUCTION_BYTES) as u64;
         // A single-page instruction lies entirely within `first`'s page, so its
         // page write counter validates the whole cached decode. Check the cache
         // before touching guest memory: a hit needs no read and no byte compare.
         if single_page {
             let generation = self.memory.page_generation(first);
-            if let Some((instruction, bytes)) = self.decoded.lookup(ip, first, generation) {
-                return Ok((instruction, bytes));
+            if cacheable {
+                let mapping = DecodeMapping {
+                    ip,
+                    linear,
+                    physical: first,
+                    page_generation: generation,
+                    translation_epoch,
+                    execution_context,
+                };
+                if let Some(instruction) = self.decoded.lookup(mapping) {
+                    return Ok(instruction);
+                }
             }
             self.memory.read(first, &mut window)?;
         } else {
@@ -465,12 +490,55 @@ impl Cpu {
                 bytes: window.to_vec(),
             });
         }
-        if single_page {
+        if cacheable {
             let generation = self.memory.page_generation(first);
-            self.decoded
-                .insert(ip, first, generation, &window, instruction);
+            self.decoded.insert(
+                DecodeMapping {
+                    ip,
+                    linear,
+                    physical: first,
+                    page_generation: generation,
+                    translation_epoch,
+                    execution_context,
+                },
+                instruction,
+            );
         }
-        Ok((instruction, window))
+        Ok(instruction)
+    }
+
+    /// Re-reads the current instruction bytes only for tracing or fatal error
+    /// diagnostics. Normal execution receives just the decoded instruction, so
+    /// a cache hit does not copy a 15-byte window through the hot return path.
+    fn read_fetch_window(
+        &mut self,
+        instruction_pointer: u64,
+    ) -> Result<[u8; MAX_INSTRUCTION_BYTES], CpuError> {
+        let bitness = self.decode_environment().0;
+        let ip = match bitness {
+            16 => instruction_pointer & 0xFFFF,
+            32 => instruction_pointer & 0xFFFF_FFFF,
+            _ => instruction_pointer,
+        };
+        let linear = self.regs.code_base().wrapping_add(ip);
+        let first = self.translate(linear, AccessKind::Execute)?;
+        let mut window = [0_u8; MAX_INSTRUCTION_BYTES];
+        let in_page = (4096 - (first & 0xFFF)) as usize;
+        if in_page >= MAX_INSTRUCTION_BYTES {
+            self.memory.read(first, &mut window)?;
+            return Ok(window);
+        }
+        self.memory.read(first, &mut window[..in_page])?;
+        let mut fetched = in_page;
+        while fetched < MAX_INSTRUCTION_BYTES {
+            let physical =
+                self.translate(linear.wrapping_add(fetched as u64), AccessKind::Execute)?;
+            let count = (MAX_INSTRUCTION_BYTES - fetched).min(4096 - (physical & 0xFFF) as usize);
+            self.memory
+                .read(physical, &mut window[fetched..fetched + count])?;
+            fetched += count;
+        }
+        Ok(window)
     }
 
     fn decode_environment(&self) -> (u32, u64) {
@@ -479,6 +547,21 @@ impl Cpu {
             CpuMode::Protected32 => (32, self.regs.rip & 0xFFFF_FFFF),
             CpuMode::Long => (64, self.regs.rip),
         }
+    }
+
+    #[inline]
+    fn decode_execution_context(&self, bitness: u32) -> u32 {
+        let mut context = bitness | (u32::from(self.regs.cpl()) << 8);
+        if self.regs.cr0.contains(crate::arch::registers::Cr0::PG) {
+            context |= 1 << 10;
+        }
+        if self.regs.cr4.contains(crate::arch::registers::Cr4::SMEP) {
+            context |= 1 << 11;
+        }
+        if self.regs.efer.contains(crate::arch::registers::Efer::NXE) {
+            context |= 1 << 12;
+        }
+        context
     }
 
     // ---- address translation ----
@@ -1074,6 +1157,38 @@ mod tests {
     }
 
     #[test]
+    fn tracing_reloads_exact_bytes_on_decode_cache_hits() {
+        let mut cpu = long_mode_cpu();
+        cpu.memory.write(0x1000, &[0x31, 0xC0]).unwrap(); // xor eax, eax
+        cpu.set_trace_capacity(2);
+
+        for _ in 0..2 {
+            cpu.regs.rip = 0x1000;
+            cpu.step().unwrap();
+        }
+
+        assert_eq!(cpu.trace.len(), 2);
+        for entry in &cpu.trace {
+            assert_eq!(entry.0, 0x1000);
+            assert_eq!(&entry.17[..2], &[0x31, 0xC0]);
+        }
+    }
+
+    #[test]
+    fn an_unimplemented_instruction_still_reports_its_bytes() {
+        let mut cpu = long_mode_cpu();
+        let encoded = [0xC5, 0xF8, 0x77]; // vzeroupper
+        cpu.memory.write(0x1000, &encoded).unwrap();
+        cpu.regs.rip = 0x1000;
+
+        let error = cpu.step().unwrap_err();
+        let CpuError::UnimplementedInstruction { bytes, .. } = error else {
+            panic!("expected unimplemented instruction, got {error}");
+        };
+        assert_eq!(&bytes[..encoded.len()], &encoded);
+    }
+
+    #[test]
     fn a_push_that_faults_on_the_store_leaves_rsp_unchanged() {
         // x86 faults are restartable: a push whose store page-faults must roll
         // RSP back so the retried push writes the same slot, not one eight
@@ -1257,7 +1372,7 @@ mod tests {
         cpu.regs.set_rsp(0x8000);
         cpu.regs.rflags -= crate::arch::registers::RFlags::IF;
         // The interrupt is already pending before sti executes.
-        cpu.lapic_queue.lock().unwrap().push_back(0x30);
+        cpu.memory.lapic_enqueue_interrupt(0x30);
         cpu.step().unwrap(); // sti retires; delivery is shadowed
         assert_eq!(cpu.regs.rip, 0x1001);
         cpu.step().unwrap(); // hlt retires and the CPU goes to sleep

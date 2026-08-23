@@ -5,6 +5,7 @@
 //! completion, output, cancellation, and deadlines through [`GuestAgent::poll`].
 
 mod oci_runtime;
+mod probe;
 mod supervisor;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -22,6 +23,8 @@ pub use supervisor::{
     DEFAULT_MAX_CONCURRENT_EXEC, DEFAULT_STREAM_CHUNK_SIZE, DEFAULT_STREAM_OUTPUT_LIMIT,
     NativeExecutionConfig, NativeOperationHandler,
 };
+
+use probe::GuestProbe;
 
 const MAX_REQUESTED_CAPABILITIES: usize = 64;
 const MAX_CAPABILITY_NAME_LENGTH: usize = 128;
@@ -397,65 +400,109 @@ fn required_capability(operation: &Operation) -> Option<&'static str> {
 
 #[must_use]
 pub fn bootstrap_agent() -> GuestAgent<NativeOperationHandler> {
+    build_agent(GuestProbe::conservative())
+}
+
+/// Builds the agent used by the guest PID 1 process.
+///
+/// Unlike [`bootstrap_agent`], this constructor reads the guest's live
+/// `/proc`, `/sys`, and `/run` mounts. A capability is advertised only after
+/// those observations and the runtime executable pass the same fail-closed
+/// policy used by the handler.
+#[must_use]
+pub fn bootstrap_guest_agent() -> GuestAgent<NativeOperationHandler> {
+    build_agent(GuestProbe::detect())
+}
+
+fn build_agent(probe: GuestProbe) -> GuestAgent<NativeOperationHandler> {
     let execution_config = NativeExecutionConfig::default();
-    let features = [
-        (capability_name::EXEC, CapabilityStatus::Available, None),
-        (
-            capability_name::OCI,
+    let (handler, oci_status, oci_reason, oci_attributes) = match probe.oci_runtime.as_ref() {
+        Some(runtime) => {
+            let config = OciRuntimeConfig::new(&runtime.path, &runtime.bundle_root)
+                .with_runtime_root(&runtime.runtime_root);
+            match OciRuntimeBackend::new(config) {
+                Ok(backend) => (
+                    NativeOperationHandler::with_oci_backend(execution_config.clone(), backend)
+                        .expect("validated OCI backend configuration must be accepted"),
+                    CapabilityStatus::Available,
+                    None,
+                    BTreeMap::from([
+                        ("runtime".to_owned(), runtime.name.clone().into()),
+                        (
+                            "runtime_path".to_owned(),
+                            runtime.path.display().to_string().into(),
+                        ),
+                        ("supports_attach".to_owned(), false.into()),
+                    ]),
+                ),
+                Err(error) => (
+                    NativeOperationHandler::new(execution_config.clone())
+                        .expect("default native execution configuration is valid"),
+                    CapabilityStatus::Unavailable,
+                    Some(format!(
+                        "OCI runtime backend initialization failed: {error:?}"
+                    )),
+                    BTreeMap::new(),
+                ),
+            }
+        }
+        None => (
+            NativeOperationHandler::new(execution_config.clone())
+                .expect("default native execution configuration is valid"),
             CapabilityStatus::Unavailable,
-            Some("Youki/containerd integration is not installed"),
+            Some(probe.oci_reason.clone()),
+            BTreeMap::new(),
         ),
-        (
-            capability_name::SYSTEMD,
-            CapabilityStatus::Unavailable,
-            Some("systemd capability probe is not implemented"),
-        ),
-        (
-            capability_name::NESTED_CONTAINERS,
-            CapabilityStatus::Unavailable,
-            Some("nested container runtime is not installed"),
-        ),
-    ]
-    .into_iter()
-    .map(|(name, status, reason)| Capability {
-        name: name.to_owned(),
+    };
+
+    let mut features = Vec::with_capacity(7);
+    features.push(Capability {
+        name: capability_name::EXEC.to_owned(),
         version: 1,
-        status,
-        attributes: if name == capability_name::EXEC {
-            BTreeMap::from([
-                ("execution_mode".to_owned(), "supervised_async".into()),
-                ("supports_cancel".to_owned(), true.into()),
-                ("supports_timeout".to_owned(), true.into()),
-                ("supports_stdin_stream".to_owned(), cfg!(unix).into()),
-                ("supports_tty".to_owned(), cfg!(target_os = "linux").into()),
-                (
-                    "tty_stream_channel".to_owned(),
-                    if cfg!(target_os = "linux") {
-                        "console"
-                    } else {
-                        "unavailable"
-                    }
-                    .into(),
-                ),
-                (
-                    "max_stdout_bytes".to_owned(),
-                    execution_config.max_stdout_bytes.into(),
-                ),
-                (
-                    "max_stderr_bytes".to_owned(),
-                    execution_config.max_stderr_bytes.into(),
-                ),
-            ])
+        status: CapabilityStatus::Available,
+        attributes: execution_attributes(&execution_config),
+        reason: None,
+    });
+    features.push(feature(
+        capability_name::NAMESPACES,
+        probe.namespaces_available,
+        "required Linux namespace handles are unavailable",
+        BTreeMap::new(),
+    ));
+    features.push(feature(
+        capability_name::CGROUPS_V2,
+        probe.cgroup_version == Some(2),
+        "cgroup v2 is not mounted and readable",
+        BTreeMap::from([("version".to_owned(), 2.into())]),
+    ));
+    features.push(Capability {
+        name: capability_name::OCI.to_owned(),
+        version: 1,
+        status: oci_status,
+        attributes: oci_attributes,
+        reason: oci_reason,
+    });
+    features.push(Capability {
+        name: capability_name::SYSTEMD.to_owned(),
+        version: 1,
+        status: if probe.systemd_available {
+            CapabilityStatus::Available
         } else {
-            BTreeMap::new()
+            CapabilityStatus::Unavailable
         },
-        reason: reason.map(str::to_owned),
-    })
-    .collect();
+        attributes: BTreeMap::from([("pid1".to_owned(), probe.init_system.clone().into())]),
+        reason: (!probe.systemd_available).then_some(probe.systemd_reason.clone()),
+    });
+    features.push(Capability {
+        name: capability_name::NESTED_CONTAINERS.to_owned(),
+        version: 1,
+        status: CapabilityStatus::Unavailable,
+        attributes: BTreeMap::new(),
+        reason: Some("nested container dispatch is not implemented".to_owned()),
+    });
 
     GuestAgent::new(
-        NativeOperationHandler::new(execution_config.clone())
-            .expect("default native execution configuration is valid"),
+        handler,
         PeerInfo {
             name: "rish-guest-agent".to_owned(),
             version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -463,11 +510,11 @@ pub fn bootstrap_agent() -> GuestAgent<NativeOperationHandler> {
             architecture: std::env::consts::ARCH.to_owned(),
         },
         GuestCapabilities {
-            kernel_release: "unprobed".to_owned(),
+            kernel_release: probe.kernel_release,
             architecture: std::env::consts::ARCH.to_owned(),
-            init_system: "unprobed".to_owned(),
-            cgroup_version: None,
-            container_runtimes: Vec::new(),
+            init_system: probe.init_system,
+            cgroup_version: probe.cgroup_version,
+            container_runtimes: probe.installed_runtimes,
             features,
         },
         GuestLimits {
@@ -478,6 +525,52 @@ pub fn bootstrap_agent() -> GuestAgent<NativeOperationHandler> {
         },
         "bootstrap-session".to_owned(),
     )
+}
+
+fn execution_attributes(config: &NativeExecutionConfig) -> BTreeMap<String, serde_json::Value> {
+    BTreeMap::from([
+        ("execution_mode".to_owned(), "supervised_async".into()),
+        ("supports_cancel".to_owned(), true.into()),
+        ("supports_timeout".to_owned(), true.into()),
+        ("supports_stdin_stream".to_owned(), cfg!(unix).into()),
+        ("supports_tty".to_owned(), cfg!(target_os = "linux").into()),
+        (
+            "tty_stream_channel".to_owned(),
+            if cfg!(target_os = "linux") {
+                "console"
+            } else {
+                "unavailable"
+            }
+            .into(),
+        ),
+        (
+            "max_stdout_bytes".to_owned(),
+            config.max_stdout_bytes.into(),
+        ),
+        (
+            "max_stderr_bytes".to_owned(),
+            config.max_stderr_bytes.into(),
+        ),
+    ])
+}
+
+fn feature(
+    name: &str,
+    available: bool,
+    unavailable_reason: &str,
+    attributes: BTreeMap<String, serde_json::Value>,
+) -> Capability {
+    Capability {
+        name: name.to_owned(),
+        version: 1,
+        status: if available {
+            CapabilityStatus::Available
+        } else {
+            CapabilityStatus::Unavailable
+        },
+        attributes,
+        reason: (!available).then(|| unavailable_reason.to_owned()),
+    }
 }
 
 #[cfg(test)]

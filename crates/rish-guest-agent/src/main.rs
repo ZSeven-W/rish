@@ -2,7 +2,7 @@ use std::io;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use rish_guest_agent::{GuestAgent, NativeOperationHandler, bootstrap_agent};
+use rish_guest_agent::{GuestAgent, NativeOperationHandler, bootstrap_guest_agent};
 use rish_guest_protocol::{Envelope, FrameDecoder, FrameEncoder};
 
 const INPUT_CHUNK_SIZE: usize = 64 * 1024;
@@ -13,9 +13,15 @@ const INPUT_CHUNK_SIZE: usize = 64 * 1024;
 /// its receive-interrupt path — the two places that stall it.
 const CONTROL_PORT: u16 = 0x2F8;
 const REG_DATA: u16 = 0; // receive buffer / transmit holding register
+const REG_INTERRUPT_ENABLE: u16 = 1;
+const REG_FIFO_CONTROL: u16 = 2;
+const REG_LINE_CONTROL: u16 = 3;
+const REG_MODEM_CONTROL: u16 = 4;
 const REG_LINE_STATUS: u16 = 5;
 const LSR_DATA_READY: u8 = 1 << 0;
 const LSR_THR_EMPTY: u8 = 1 << 5;
+const CONTROL_READY_MARKER: &str = "RISH_GUEST_AGENT_READY";
+const CONTROL_TX_BURST: usize = 16;
 
 fn main() -> ExitCode {
     match run() {
@@ -100,6 +106,21 @@ unsafe fn outb(_port: u16, _value: u8) {
 #[cfg(not(target_arch = "x86_64"))]
 fn request_control_port_access() {}
 
+/// Places the control UART in a deterministic polling configuration instead
+/// of inheriting whichever register state the unused kernel tty driver left
+/// behind. The divisor 1 configuration is 115200 baud with an 8N1 frame.
+fn initialize_control_port() {
+    unsafe {
+        outb(CONTROL_PORT + REG_LINE_CONTROL, 0x80); // DLAB
+        outb(CONTROL_PORT + REG_DATA, 0x01); // divisor low
+        outb(CONTROL_PORT + REG_INTERRUPT_ENABLE, 0x00); // divisor high
+        outb(CONTROL_PORT + REG_LINE_CONTROL, 0x03); // 8N1
+        outb(CONTROL_PORT + REG_INTERRUPT_ENABLE, 0x00); // polling only
+        outb(CONTROL_PORT + REG_FIFO_CONTROL, 0x07); // enable/reset FIFOs
+        outb(CONTROL_PORT + REG_MODEM_CONTROL, 0x03); // DTR + RTS
+    }
+}
+
 /// Drains every byte the control UART currently holds into `buffer`, returning
 /// how many were read. Bounded by the buffer length.
 fn read_available(buffer: &mut [u8]) -> usize {
@@ -118,7 +139,8 @@ fn read_available(buffer: &mut [u8]) -> usize {
 /// the written prefix. Returns whether any byte was sent.
 fn write_available(pending: &mut Vec<u8>) -> bool {
     let mut sent = 0;
-    while sent < pending.len() {
+    let burst = pending.len().min(CONTROL_TX_BURST);
+    while sent < burst {
         if unsafe { inb(CONTROL_PORT + REG_LINE_STATUS) } & LSR_THR_EMPTY == 0 {
             break;
         }
@@ -142,11 +164,19 @@ fn write_available(pending: &mut Vec<u8>) -> bool {
 /// does not spin the guest CPU.
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     request_control_port_access();
+    initialize_control_port();
     let mut decoder = FrameDecoder::default();
     let mut encoder = FrameEncoder::default();
-    let mut agent = bootstrap_agent();
+    let mut agent = bootstrap_guest_agent();
     let mut pending_output: Vec<u8> = Vec::new();
     let mut read_buffer = vec![0_u8; INPUT_CHUNK_SIZE];
+
+    // The host must not send a framed Hello until the agent is polling the
+    // UART: the 16550 receive FIFO is too small to retain a complete frame
+    // during boot. This console-only marker gives diagnostic boot harnesses a
+    // synchronization point without putting unframed bytes on the control
+    // channel.
+    eprintln!("{CONTROL_READY_MARKER} transport=direct-uart");
 
     loop {
         let mut progressed = false;
@@ -171,7 +201,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             progressed = true;
         }
 
-        if !progressed {
+        if !progressed && pending_output.is_empty() {
             std::thread::sleep(Duration::from_millis(1));
         }
     }

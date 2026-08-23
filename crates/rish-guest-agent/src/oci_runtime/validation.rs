@@ -46,6 +46,12 @@ pub(super) fn validate_runtime_path(path: &Path) -> Result<PathBuf, RemoteError>
             "OCI runtime path must identify an executable regular file",
         ));
     }
+    if is_group_or_world_writable(&metadata) {
+        return Err(RemoteError::new(
+            ErrorCode::PermissionDenied,
+            "OCI runtime executable must not be group or world writable",
+        ));
+    }
     Ok(canonical)
 }
 

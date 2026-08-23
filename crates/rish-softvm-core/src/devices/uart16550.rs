@@ -23,6 +23,10 @@ const LSR_DATA_READY: u8 = 1 << 0;
 const LSR_THR_EMPTY: u8 = 1 << 5;
 const LSR_TX_EMPTY: u8 = 1 << 6;
 const IIR_NO_INTERRUPT: u8 = 1;
+const LCR_DLAB: u8 = 1 << 7;
+const FCR_ENABLE_FIFO: u8 = 1 << 0;
+const FCR_CLEAR_RX: u8 = 1 << 1;
+const FCR_CLEAR_TX: u8 = 1 << 2;
 
 pub struct Uart16550 {
     base: u16,
@@ -31,6 +35,7 @@ pub struct Uart16550 {
     input_capacity: usize,
     output_capacity: usize,
     dropped_output: u64,
+    divisor: u16,
     ier: u8,
     fifo_enabled: bool,
     lcr: u8,
@@ -48,6 +53,7 @@ impl Uart16550 {
             input_capacity,
             output_capacity,
             dropped_output: 0,
+            divisor: 1,
             ier: 0,
             fifo_enabled: false,
             lcr: 0b11,
@@ -127,7 +133,9 @@ impl PortDevice for Uart16550 {
     fn read(&mut self, port: u16, size: u8) -> Result<u32, CpuError> {
         let _ = size;
         match port - self.base {
+            REG_THR_RBR if self.lcr & LCR_DLAB != 0 => Ok(u32::from(self.divisor as u8)),
             REG_THR_RBR => Ok(u32::from(self.input.pop_front().unwrap_or(0))),
+            REG_IER if self.lcr & LCR_DLAB != 0 => Ok(u32::from((self.divisor >> 8) as u8)),
             REG_IER => Ok(u32::from(self.ier)),
             REG_IIR_FCR => {
                 // Report the highest-priority pending source: received data
@@ -164,6 +172,9 @@ impl PortDevice for Uart16550 {
         let _ = size;
         let value = value as u8;
         match port - self.base {
+            REG_THR_RBR if self.lcr & LCR_DLAB != 0 => {
+                self.divisor = (self.divisor & 0xFF00) | u16::from(value);
+            }
             REG_THR_RBR => {
                 if self.output.len() < self.output_capacity {
                     self.output.push_back(value);
@@ -171,8 +182,20 @@ impl PortDevice for Uart16550 {
                     self.dropped_output = self.dropped_output.saturating_add(1);
                 }
             }
+            REG_IER if self.lcr & LCR_DLAB != 0 => {
+                self.divisor = (self.divisor & 0x00FF) | (u16::from(value) << 8);
+            }
             REG_IER => self.ier = value & 0xF,
-            REG_IIR_FCR => self.fifo_enabled = value & 1 != 0,
+            REG_IIR_FCR => {
+                self.fifo_enabled = value & FCR_ENABLE_FIFO != 0;
+                if value & FCR_CLEAR_RX != 0 {
+                    self.input.clear();
+                }
+                // THR writes are transmitted into the host-visible wire queue
+                // immediately, so FCR_CLEAR_TX has no pending UART FIFO left
+                // to discard. Already transmitted bytes must remain visible.
+                let _ = value & FCR_CLEAR_TX;
+            }
             REG_LCR => self.lcr = value,
             REG_MCR => self.mcr = value,
             REG_SCR => self.scr = value,
@@ -193,6 +216,45 @@ mod tests {
         uart.write(0x3F8, 1, b'B'.into()).unwrap();
         assert_eq!(uart.drain_output(), b"AB");
         assert!(uart.drain_output().is_empty());
+    }
+
+    #[test]
+    fn divisor_latch_access_does_not_emit_serial_data() {
+        let mut uart = Uart16550::new(0x2F8, 16, 16);
+        uart.push_input(b"x");
+
+        uart.write(0x2F8 + REG_LCR, 1, u32::from(LCR_DLAB | 0b11))
+            .unwrap();
+        uart.write(0x2F8 + REG_THR_RBR, 1, 0x34).unwrap();
+        uart.write(0x2F8 + REG_IER, 1, 0x12).unwrap();
+
+        assert_eq!(uart.read(0x2F8 + REG_THR_RBR, 1).unwrap(), 0x34);
+        assert_eq!(uart.read(0x2F8 + REG_IER, 1).unwrap(), 0x12);
+        assert!(uart.drain_output().is_empty());
+        assert_eq!(uart.ier, 0);
+
+        uart.write(0x2F8 + REG_LCR, 1, 0b11).unwrap();
+        assert_eq!(uart.read(0x2F8 + REG_THR_RBR, 1).unwrap() as u8, b'x');
+        uart.write(0x2F8 + REG_THR_RBR, 1, u32::from(b'A')).unwrap();
+        assert_eq!(uart.drain_output(), b"A");
+    }
+
+    #[test]
+    fn fifo_reset_clears_receive_but_not_already_transmitted_bytes() {
+        let mut uart = Uart16550::new(0x3F8, 16, 16);
+        uart.push_input(b"in");
+        uart.write(0x3F8 + REG_THR_RBR, 1, u32::from(b'o')).unwrap();
+
+        uart.write(
+            0x3F8 + REG_IIR_FCR,
+            1,
+            u32::from(FCR_ENABLE_FIFO | FCR_CLEAR_RX | FCR_CLEAR_TX),
+        )
+        .unwrap();
+
+        assert!(uart.fifo_enabled);
+        assert_eq!(uart.read(0x3F8 + REG_THR_RBR, 1).unwrap(), 0);
+        assert_eq!(uart.drain_output(), b"o");
     }
 
     #[test]

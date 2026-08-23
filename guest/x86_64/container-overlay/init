@@ -7,10 +7,10 @@
 export HOME=/root
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
-mkdir -p /proc /sys /dev /tmp /root
-mount -t proc proc /proc 2>/dev/null
-mount -t sysfs sysfs /sys 2>/dev/null
-mount -t devtmpfs devtmpfs /dev 2>/dev/null
+/bin/busybox mkdir -p /proc /sys /dev /tmp /root
+/bin/busybox mount -t proc proc /proc 2>/dev/null
+/bin/busybox mount -t sysfs sysfs /sys 2>/dev/null
+/bin/busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null
 
 # The rootfs ships only the busybox binary; materialise the applet links.
 /bin/busybox --install -s /bin 2>/dev/null

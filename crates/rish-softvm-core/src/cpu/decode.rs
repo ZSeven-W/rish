@@ -1,13 +1,15 @@
 //! Instruction fetch and the decoded-instruction cache.
 //!
 //! Decoding dominates interpreter cost, so a decoded instruction is kept and
-//! reused when the guest executes the same address again. A hit re-checks the
-//! physical address and the containing page's write counter, so self-modifying
-//! code, page remapping, and code patched through an alias all invalidate
-//! themselves without an explicit flush — and a hit costs a single counter
-//! compare instead of re-reading and comparing the instruction bytes.
+//! reused when the guest executes the same address again. A mapped hit checks
+//! the TLB invalidation epoch, execution-permission context, and containing
+//! physical page's write counter before skipping translation and guest-memory
+//! reads. Thus `invlpg`, CR3 changes, permission-mode changes, self-modifying
+//! code, and code patched through an alias still invalidate the fast path.
 
 use iced_x86::{Decoder, DecoderOptions, Instruction};
+
+use crate::Memory;
 
 pub const MAX_INSTRUCTION_BYTES: usize = 15;
 
@@ -20,12 +22,28 @@ const INVALID: u64 = u64::MAX;
 struct Entry {
     /// Linear instruction pointer, or `INVALID` for an empty slot.
     tag: u64,
+    /// Linear fetch address after applying the current code-segment base.
+    linear: u64,
     /// Physical address the bytes were decoded from.
     physical: u64,
     /// The containing page's write counter at decode time.
     generation: u32,
-    bytes: [u8; MAX_INSTRUCTION_BYTES],
+    /// Explicit TLB invalidation generation at the last validated mapping.
+    translation_epoch: u64,
+    /// Bitness/CPL and execute-permission control bits at validation time.
+    execution_context: u32,
     instruction: Instruction,
+}
+
+/// One fully validated instruction-fetch mapping.
+#[derive(Clone, Copy)]
+pub struct DecodeMapping {
+    pub ip: u64,
+    pub linear: u64,
+    pub physical: u64,
+    pub page_generation: u32,
+    pub translation_epoch: u64,
+    pub execution_context: u32,
 }
 
 pub struct DecodeCache {
@@ -39,9 +57,11 @@ impl DecodeCache {
     pub fn new() -> Self {
         let empty = Entry {
             tag: INVALID,
+            linear: 0,
             physical: 0,
             generation: 0,
-            bytes: [0; MAX_INSTRUCTION_BYTES],
+            translation_epoch: 0,
+            execution_context: 0,
             instruction: Instruction::default(),
         };
         Self {
@@ -57,46 +77,62 @@ impl DecodeCache {
         ((mixed >> 33) as usize) & (ENTRIES - 1)
     }
 
-    /// Returns the cached instruction and its bytes when the entry still maps
-    /// the same physical address and its page has not been written since it was
-    /// decoded. Returning the cached bytes lets the caller skip re-reading guest
-    /// memory on a hit; they are only needed for tracing and error reporting.
+    /// Returns an instruction without repeating translation when every fact
+    /// that can invalidate its already-approved execute mapping is unchanged.
     #[inline]
-    pub fn lookup(
+    pub fn lookup_mapped(
         &mut self,
+        memory: &Memory,
         ip: u64,
-        physical: u64,
-        generation: u32,
-    ) -> Option<(Instruction, [u8; MAX_INSTRUCTION_BYTES])> {
+        linear: u64,
+        translation_epoch: u64,
+        execution_context: u32,
+    ) -> Option<Instruction> {
         let entry = &self.entries[Self::slot(ip)];
-        if entry.tag != ip || entry.physical != physical || entry.generation != generation {
-            self.misses = self.misses.wrapping_add(1);
+        if entry.tag != ip
+            || entry.linear != linear
+            || entry.translation_epoch != translation_epoch
+            || entry.execution_context != execution_context
+            || memory.page_generation(entry.physical) != entry.generation
+        {
             return None;
         }
         self.hits = self.hits.wrapping_add(1);
-        Some((entry.instruction, entry.bytes))
+        Some(entry.instruction)
+    }
+
+    /// Returns a cached decode after the caller has translated the address.
+    /// A successful fallback refreshes the fast-path mapping context.
+    #[inline]
+    pub fn lookup(&mut self, mapping: DecodeMapping) -> Option<Instruction> {
+        let entry = &mut self.entries[Self::slot(mapping.ip)];
+        if entry.tag != mapping.ip
+            || entry.linear != mapping.linear
+            || entry.physical != mapping.physical
+            || entry.generation != mapping.page_generation
+            || entry.execution_context != mapping.execution_context
+        {
+            self.misses = self.misses.wrapping_add(1);
+            return None;
+        }
+        entry.translation_epoch = mapping.translation_epoch;
+        entry.execution_context = mapping.execution_context;
+        self.hits = self.hits.wrapping_add(1);
+        Some(entry.instruction)
     }
 
     #[inline]
-    pub fn insert(
-        &mut self,
-        ip: u64,
-        physical: u64,
-        generation: u32,
-        bytes: &[u8],
-        instruction: Instruction,
-    ) {
-        let length = instruction.len();
-        if length > MAX_INSTRUCTION_BYTES || length > bytes.len() {
+    pub fn insert(&mut self, mapping: DecodeMapping, instruction: Instruction) {
+        if instruction.len() > MAX_INSTRUCTION_BYTES {
             return;
         }
-        let mut stored = [0_u8; MAX_INSTRUCTION_BYTES];
-        stored[..length].copy_from_slice(&bytes[..length]);
-        self.entries[Self::slot(ip)] = Entry {
-            tag: ip,
-            physical,
-            generation,
-            bytes: stored,
+        self.entries[Self::slot(mapping.ip)] = Entry {
+            tag: mapping.ip,
+            linear: mapping.linear,
+            physical: mapping.physical,
+            generation: mapping.page_generation,
+            translation_epoch: mapping.translation_epoch,
+            execution_context: mapping.execution_context,
             instruction,
         };
     }
@@ -130,15 +166,30 @@ mod tests {
     // inc eax
     const INC: [u8; 2] = [0xFF, 0xC0];
 
+    fn mapping(ip: u64, linear: u64, physical: u64, page_generation: u32) -> DecodeMapping {
+        DecodeMapping {
+            ip,
+            linear,
+            physical,
+            page_generation,
+            translation_epoch: 3,
+            execution_context: 64,
+        }
+    }
+
     #[test]
     fn reuses_a_decode_for_the_same_address_and_generation() {
         let mut cache = DecodeCache::new();
         let window = [XOR[0], XOR[1], 0x90, 0x90];
         let decoded = decode_window(64, &window, 0x1000);
-        cache.insert(0x1000, 0x5000, 7, &window, decoded);
-        let (found, bytes) = cache.lookup(0x1000, 0x5000, 7).expect("hit");
+        let mapping = mapping(0x1000, 0x1000, 0x5000, 7);
+        cache.insert(mapping, decoded);
+        let found = cache.lookup(mapping).expect("hit");
         assert_eq!(found.mnemonic(), iced_x86::Mnemonic::Xor);
-        assert_eq!(&bytes[..2], &XOR);
+
+        let mut changed_context = mapping;
+        changed_context.execution_context = 32;
+        assert!(cache.lookup(changed_context).is_none());
     }
 
     #[test]
@@ -146,10 +197,10 @@ mod tests {
         let mut cache = DecodeCache::new();
         let window = [XOR[0], XOR[1], 0x90, 0x90];
         let decoded = decode_window(64, &window, 0x1000);
-        cache.insert(0x1000, 0x5000, 7, &window, decoded);
+        cache.insert(mapping(0x1000, 0x1000, 0x5000, 7), decoded);
         // A write to the page bumps its counter; the stale entry must miss so
         // self-modified or patched code is re-decoded.
-        assert!(cache.lookup(0x1000, 0x5000, 8).is_none());
+        assert!(cache.lookup(mapping(0x1000, 0x1000, 0x5000, 8)).is_none());
         let _ = INC;
     }
 
@@ -158,8 +209,8 @@ mod tests {
         let mut cache = DecodeCache::new();
         let window = [XOR[0], XOR[1], 0x90, 0x90];
         let decoded = decode_window(64, &window, 0x1000);
-        cache.insert(0x1000, 0x5000, 0, &window, decoded);
-        assert!(cache.lookup(0x1000, 0x9000, 0).is_none());
+        cache.insert(mapping(0x1000, 0x1000, 0x5000, 0), decoded);
+        assert!(cache.lookup(mapping(0x1000, 0x1000, 0x9000, 0)).is_none());
     }
 
     #[test]
@@ -173,8 +224,47 @@ mod tests {
             second.ip_rel_memory_address()
         );
         let mut cache = DecodeCache::new();
-        cache.insert(0x1000, 0x5000, 0, &window, first);
+        cache.insert(mapping(0x1000, 0x1000, 0x5000, 0), first);
         // A different instruction pointer never reads the 0x1000 entry.
-        assert!(cache.lookup(0x2000, 0x5000, 0).is_none());
+        assert!(cache.lookup(mapping(0x2000, 0x2000, 0x5000, 0)).is_none());
+    }
+
+    #[test]
+    fn mapped_lookup_requires_the_same_epoch_context_and_code_page() {
+        let mut memory = Memory::new(1).unwrap();
+        let mut cache = DecodeCache::new();
+        let window = [XOR[0], XOR[1], 0x90, 0x90];
+        memory.write(0x5000, &window).unwrap();
+        let generation = memory.page_generation(0x5000);
+        let decoded = decode_window(64, &window, 0x1000);
+        cache.insert(mapping(0x1000, 0x1000, 0x5000, generation), decoded);
+
+        assert!(
+            cache
+                .lookup_mapped(&memory, 0x1000, 0x1000, 3, 64)
+                .is_some()
+        );
+        assert!(
+            cache
+                .lookup_mapped(&memory, 0x1000, 0x2000, 3, 64)
+                .is_none()
+        );
+        assert!(
+            cache
+                .lookup_mapped(&memory, 0x1000, 0x1000, 4, 64)
+                .is_none()
+        );
+        assert!(
+            cache
+                .lookup_mapped(&memory, 0x1000, 0x1000, 3, 32)
+                .is_none()
+        );
+
+        memory.write_u8(0x5003, 0xCC).unwrap();
+        assert!(
+            cache
+                .lookup_mapped(&memory, 0x1000, 0x1000, 3, 64)
+                .is_none()
+        );
     }
 }

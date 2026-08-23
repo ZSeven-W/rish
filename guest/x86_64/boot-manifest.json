@@ -36,6 +36,7 @@
     "command_line": "console=ttyS0,115200n8 rdinit=/init panic=-1 oops=panic nokaslr cgroup_no_v1=all",
     "expected_serial_marker": "RISH_X86_64_BOOT_OK",
     "failure_serial_marker": "RISH_X86_64_BOOT_FAILED",
+    "control_ready_serial_marker": "RISH_GUEST_AGENT_READY",
     "guest_agent_path": "/usr/bin/rish-guest-agent",
     "control_serial_device": "ttyS1"
   },
@@ -79,8 +80,8 @@
     {
       "id": "rish-alpine-docker-initramfs",
       "kind": "derived_initramfs_newc",
-      "size": 285961728,
-      "sha256": "036d8f99f7cb8888df6a8311cebb5dcaea14d8f0f6cc31d007445a1f85571fc8"
+      "size": 285680128,
+      "sha256": "023593f5af064054998e14d290eaea0072efcbc9d6fc68e58fab55876d4047e1"
     }
   ],
   "engine_requirements": [

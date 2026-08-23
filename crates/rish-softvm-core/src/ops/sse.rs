@@ -147,7 +147,7 @@ enum Op {
     Xor,
 }
 
-fn read_xmm(regs: &crate::arch::registers::Registers, register: Register) -> u128 {
+pub(super) fn read_xmm(regs: &crate::arch::registers::Registers, register: Register) -> u128 {
     match register {
         Register::XMM0 => regs.xmm[0],
         Register::XMM1 => regs.xmm[1],
@@ -169,7 +169,11 @@ fn read_xmm(regs: &crate::arch::registers::Registers, register: Register) -> u12
     }
 }
 
-fn write_xmm(regs: &mut crate::arch::registers::Registers, register: Register, value: u128) {
+pub(super) fn write_xmm(
+    regs: &mut crate::arch::registers::Registers,
+    register: Register,
+    value: u128,
+) {
     match register {
         Register::XMM0 => regs.xmm[0] = value,
         Register::XMM1 => regs.xmm[1] = value,
@@ -191,7 +195,11 @@ fn write_xmm(regs: &mut crate::arch::registers::Registers, register: Register, v
     }
 }
 
-fn read_mem128(cpu: &mut Cpu, instruction: &Instruction, operand: u32) -> Result<u128, CpuError> {
+pub(super) fn read_mem128(
+    cpu: &mut Cpu,
+    instruction: &Instruction,
+    operand: u32,
+) -> Result<u128, CpuError> {
     let linear = cpu.effective_address(instruction, operand);
     let mut bytes = [0_u8; 16];
     cpu.read_linear_bytes(linear, &mut bytes)?;
@@ -762,7 +770,7 @@ fn packed_arith(
 }
 
 /// Reads a scalar float memory operand of `bytes` width into the low bits.
-fn read_scalar_mem(
+pub(super) fn read_scalar_mem(
     cpu: &mut Cpu,
     instruction: &Instruction,
     operand: u32,

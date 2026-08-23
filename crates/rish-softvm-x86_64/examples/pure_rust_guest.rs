@@ -20,6 +20,7 @@ use rish_vm::{
 
 const BOOT_OK_MARKER: &[u8] = b"RISH_X86_64_BOOT_OK";
 const BOOT_FAILED_MARKER: &[u8] = b"RISH_X86_64_BOOT_FAILED";
+const AGENT_READY_MARKER: &[u8] = b"RISH_GUEST_AGENT_READY";
 
 struct Options {
     kernel: PathBuf,
@@ -195,14 +196,14 @@ fn run() -> Result<(), String> {
         executed += report.executed_units;
         console.extend_from_slice(&report.console);
         // Print only the newly arrived bytes; keep the full buffer so the boot
-        // marker is still detectable even when it spans two run chunks.
+        // markers are still detectable even when one spans two run chunks.
         print_console(&console, &mut printed);
         if contains(&console, BOOT_FAILED_MARKER) {
             return Err("guest init reported RISH_X86_64_BOOT_FAILED".to_owned());
         }
-        if contains(&console, BOOT_OK_MARKER) {
+        if contains(&console, BOOT_OK_MARKER) && contains(&console, AGENT_READY_MARKER) {
             println!(
-                "[pure-rust-guest] boot ok marker after {executed} units in {:?}",
+                "[pure-rust-guest] boot and agent ready after {executed} units in {:?}",
                 started.elapsed()
             );
             break;
@@ -218,7 +219,7 @@ fn run() -> Result<(), String> {
         }
         if executed > options.boot_budget_units {
             return Err(format!(
-                "boot budget exhausted after {executed} units without the boot ok marker"
+                "boot budget exhausted after {executed} units without boot and agent readiness"
             ));
         }
     }

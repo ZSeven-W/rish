@@ -9,10 +9,7 @@
 //! so a handler that has not written EOI cannot be preempted by an equal or
 //! lower priority vector, which is what the Linux entry code assumes.
 
-use std::{
-    collections::VecDeque,
-    sync::{Arc, Mutex},
-};
+use std::collections::VecDeque;
 
 pub const LAPIC_BASE: u64 = 0xFEE0_0000;
 pub const LAPIC_SIZE: u64 = 0x1000;
@@ -84,12 +81,15 @@ pub struct LocalApic {
     irr: [u32; 8],
     /// In-service register: vectors delivered and awaiting EOI.
     isr: [u32; 8],
-    interrupt_queue: Arc<Mutex<VecDeque<u8>>>,
+    /// Vectors accepted for the owning CPU. The whole device model runs on
+    /// that CPU's interpreter thread, so sharing this queue would only add a
+    /// lock to every interrupt-recognition boundary.
+    interrupt_queue: VecDeque<u8>,
 }
 
 impl LocalApic {
     #[must_use]
-    pub fn new(interrupt_queue: Arc<Mutex<VecDeque<u8>>>) -> Self {
+    pub fn new() -> Self {
         Self {
             id: 0,
             svr: 0xFF,
@@ -112,7 +112,7 @@ impl LocalApic {
             timer_fractional: 0,
             irr: [0; 8],
             isr: [0; 8],
-            interrupt_queue,
+            interrupt_queue: VecDeque::new(),
         }
     }
 
@@ -198,10 +198,8 @@ impl LocalApic {
         let bit = 1 << (u32::from(vector) % 32);
         self.irr[index] &= !bit;
         self.isr[index] |= bit;
-        if let Ok(mut queue) = self.interrupt_queue.lock() {
-            if queue.len() < QUEUE_LIMIT {
-                queue.push_back(vector);
-            }
+        if self.interrupt_queue.len() < QUEUE_LIMIT {
+            self.interrupt_queue.push_back(vector);
         }
     }
 
@@ -228,10 +226,14 @@ impl LocalApic {
         retired
     }
 
-    /// Returns the timer vector queue shared with the CPU.
-    #[must_use]
-    pub fn interrupt_queue(&self) -> Arc<Mutex<VecDeque<u8>>> {
-        Arc::clone(&self.interrupt_queue)
+    /// Removes the next vector accepted for delivery to the CPU.
+    pub fn pop_interrupt(&mut self) -> Option<u8> {
+        self.interrupt_queue.pop_front()
+    }
+
+    #[cfg(test)]
+    pub fn enqueue_interrupt(&mut self, vector: u8) {
+        self.interrupt_queue.push_back(vector);
     }
 
     pub fn read(&mut self, offset: u64, size: u8) -> u32 {
@@ -349,6 +351,12 @@ impl LocalApic {
     }
 }
 
+impl Default for LocalApic {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Divide configuration register encoding to a divisor.
 fn divisor(configuration: u32) -> u64 {
     match configuration & 0b1011 {
@@ -368,11 +376,10 @@ fn divisor(configuration: u32) -> u64 {
 mod tests {
     use super::*;
 
-    fn lapic() -> (LocalApic, Arc<Mutex<VecDeque<u8>>>) {
-        let queue = Arc::new(Mutex::new(VecDeque::new()));
-        let mut lapic = LocalApic::new(Arc::clone(&queue));
+    fn lapic() -> LocalApic {
+        let mut lapic = LocalApic::new();
         lapic.write(LAPIC_SVR, 4, 0x1FF);
-        (lapic, queue)
+        lapic
     }
 
     fn periodic(vector: u8) -> u32 {
@@ -381,44 +388,44 @@ mod tests {
 
     #[test]
     fn reports_version_and_id() {
-        let (mut lapic, _) = lapic();
+        let mut lapic = lapic();
         assert_eq!(lapic.read(LAPIC_VERSION, 4), 0x0005_0014);
         assert_eq!(lapic.read(LAPIC_ID, 4), 0);
     }
 
     #[test]
     fn periodic_timer_reloads_and_keeps_firing() {
-        let (mut lapic, queue) = lapic();
+        let mut lapic = lapic();
         lapic.write(LAPIC_LVT_TIMER, 4, periodic(0x20));
         lapic.write(LAPIC_TIMER_DIVIDE, 4, 0b1011); // divide by 1
         lapic.write(LAPIC_TIMER_INITIAL, 4, 3);
         lapic.tick(2);
-        assert!(queue.lock().unwrap().is_empty());
+        assert!(lapic.interrupt_queue.is_empty());
         lapic.tick(1);
-        assert_eq!(queue.lock().unwrap().pop_front(), Some(0x20));
+        assert_eq!(lapic.pop_interrupt(), Some(0x20));
         lapic.write(LAPIC_EOI, 4, 0);
         lapic.tick(3);
-        assert_eq!(queue.lock().unwrap().pop_front(), Some(0x20));
+        assert_eq!(lapic.pop_interrupt(), Some(0x20));
     }
 
     #[test]
     fn one_shot_timer_fires_exactly_once() {
-        let (mut lapic, queue) = lapic();
+        let mut lapic = lapic();
         lapic.write(LAPIC_LVT_TIMER, 4, 0x20); // one-shot, unmasked
         lapic.write(LAPIC_TIMER_DIVIDE, 4, 0b1011);
         lapic.write(LAPIC_TIMER_INITIAL, 4, 4);
         lapic.tick(4);
-        assert_eq!(queue.lock().unwrap().pop_front(), Some(0x20));
+        assert_eq!(lapic.pop_interrupt(), Some(0x20));
         lapic.write(LAPIC_EOI, 4, 0);
         lapic.tick(100);
-        assert!(queue.lock().unwrap().is_empty());
+        assert!(lapic.interrupt_queue.is_empty());
         assert_eq!(lapic.read(LAPIC_TIMER_CURRENT, 4), 0);
     }
 
     #[test]
     fn a_batched_tick_matches_the_same_number_of_single_ticks() {
-        let (mut batched, batched_queue) = lapic();
-        let (mut single, single_queue) = lapic();
+        let mut batched = lapic();
+        let mut single = lapic();
         for lapic in [&mut batched, &mut single] {
             lapic.write(LAPIC_LVT_TIMER, 4, periodic(0x30));
             lapic.write(LAPIC_TIMER_DIVIDE, 4, 0b0000); // divide by 2
@@ -432,85 +439,84 @@ mod tests {
             batched.read(LAPIC_TIMER_CURRENT, 4),
             single.read(LAPIC_TIMER_CURRENT, 4)
         );
-        assert!(!batched_queue.lock().unwrap().is_empty());
-        assert!(!single_queue.lock().unwrap().is_empty());
+        assert!(!batched.interrupt_queue.is_empty());
+        assert!(!single.interrupt_queue.is_empty());
     }
 
     #[test]
     fn masked_timer_does_not_fire() {
-        let (mut lapic, queue) = lapic();
+        let mut lapic = lapic();
         lapic.write(LAPIC_LVT_TIMER, 4, LVT_MASKED | 0x20);
         lapic.write(LAPIC_TIMER_DIVIDE, 4, 0b1011);
         lapic.write(LAPIC_TIMER_INITIAL, 4, 2);
         lapic.tick(2);
-        assert!(queue.lock().unwrap().is_empty());
+        assert!(lapic.interrupt_queue.is_empty());
     }
 
     #[test]
     fn a_software_disabled_apic_delivers_nothing() {
-        let queue = Arc::new(Mutex::new(VecDeque::new()));
-        let mut lapic = LocalApic::new(Arc::clone(&queue));
+        let mut lapic = LocalApic::new();
         lapic.write(LAPIC_LVT_TIMER, 4, periodic(0x20));
         lapic.write(LAPIC_TIMER_DIVIDE, 4, 0b1011);
         lapic.write(LAPIC_TIMER_INITIAL, 4, 1);
         lapic.tick(4);
-        assert!(queue.lock().unwrap().is_empty());
+        assert!(lapic.interrupt_queue.is_empty());
     }
 
     #[test]
     fn in_service_vector_blocks_an_equal_priority_request_until_eoi() {
-        let (mut lapic, queue) = lapic();
+        let mut lapic = lapic();
         lapic.request(0x30);
         lapic.tick(0);
-        assert_eq!(queue.lock().unwrap().pop_front(), Some(0x30));
+        assert_eq!(lapic.pop_interrupt(), Some(0x30));
         // Same priority class (0x3x) must wait for EOI.
         lapic.request(0x31);
         lapic.tick(0);
-        assert!(queue.lock().unwrap().is_empty());
+        assert!(lapic.interrupt_queue.is_empty());
         lapic.write(LAPIC_EOI, 4, 0);
-        assert_eq!(queue.lock().unwrap().pop_front(), Some(0x31));
+        assert_eq!(lapic.pop_interrupt(), Some(0x31));
     }
 
     #[test]
     fn a_higher_priority_request_preempts_one_in_service() {
-        let (mut lapic, queue) = lapic();
+        let mut lapic = lapic();
         lapic.request(0x30);
         lapic.tick(0);
-        assert_eq!(queue.lock().unwrap().pop_front(), Some(0x30));
+        assert_eq!(lapic.pop_interrupt(), Some(0x30));
         lapic.request(0x50);
         lapic.tick(0);
-        assert_eq!(queue.lock().unwrap().pop_front(), Some(0x50));
+        assert_eq!(lapic.pop_interrupt(), Some(0x50));
     }
 
     #[test]
     fn task_priority_holds_off_lower_vectors() {
-        let (mut lapic, queue) = lapic();
+        let mut lapic = lapic();
         lapic.write(LAPIC_TPR, 4, 0x40);
         lapic.request(0x30);
         lapic.tick(0);
-        assert!(queue.lock().unwrap().is_empty());
+        assert!(lapic.interrupt_queue.is_empty());
         lapic.write(LAPIC_TPR, 4, 0x00);
-        assert_eq!(queue.lock().unwrap().pop_front(), Some(0x30));
+        assert_eq!(lapic.pop_interrupt(), Some(0x30));
     }
 
     #[test]
     fn self_ipi_delivers_its_vector() {
-        let (mut lapic, queue) = lapic();
+        let mut lapic = lapic();
         lapic.write(LAPIC_ICR_LO, 4, ICR_SHORTHAND_SELF | 0xF2);
-        assert_eq!(queue.lock().unwrap().pop_front(), Some(0xF2));
+        assert_eq!(lapic.pop_interrupt(), Some(0xF2));
     }
 
     #[test]
     fn a_physical_ipi_to_another_apic_is_dropped() {
-        let (mut lapic, queue) = lapic();
+        let mut lapic = lapic();
         lapic.write(LAPIC_ICR_HI, 4, 3 << 24);
         lapic.write(LAPIC_ICR_LO, 4, 0xF2);
-        assert!(queue.lock().unwrap().is_empty());
+        assert!(lapic.interrupt_queue.is_empty());
     }
 
     #[test]
     fn in_service_register_is_readable_and_cleared_by_eoi() {
-        let (mut lapic, _queue) = lapic();
+        let mut lapic = lapic();
         lapic.request(0x30);
         lapic.tick(0);
         assert_eq!(lapic.read(LAPIC_ISR_BASE + 0x10, 4), 1 << 16);

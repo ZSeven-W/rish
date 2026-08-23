@@ -1,6 +1,8 @@
 use rish_guest_protocol::{ErrorCode, RemoteError};
 
-pub const DEFAULT_STREAM_CHUNK_SIZE: u32 = 32 * 1024;
+/// One output event stays small enough for the guest's UART control transport
+/// while still amortizing the versioned JSON envelope and base64 overhead.
+pub const DEFAULT_STREAM_CHUNK_SIZE: u32 = 1024;
 pub const DEFAULT_STREAM_OUTPUT_LIMIT: u64 = 4 * 1024 * 1024;
 pub const DEFAULT_MAX_CONCURRENT_EXEC: u32 = 4;
 

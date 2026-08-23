@@ -26,6 +26,10 @@ pub struct Tlb {
     entries: Box<[Entry]>,
     hits: u64,
     misses: u64,
+    /// Changes whenever software explicitly invalidates translations. Decode
+    /// entries use this to avoid repeating instruction-fetch translation while
+    /// still observing `invlpg`, CR3 reloads, and paging-mode changes.
+    epoch: u64,
 }
 
 impl Tlb {
@@ -45,6 +49,7 @@ impl Tlb {
             entries: vec![empty; ENTRIES].into_boxed_slice(),
             hits: 0,
             misses: 0,
+            epoch: 0,
         }
     }
 
@@ -80,6 +85,7 @@ impl Tlb {
 
     /// Invalidates every entry, as a CR3 reload or a paging-mode change does.
     pub fn flush(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
         for entry in self.entries.iter_mut() {
             entry.tag = INVALID;
         }
@@ -90,6 +96,9 @@ impl Tlb {
     /// A large-page mapping is cached under each 4 KiB page it covers, so a
     /// single-page invalidation is enough for the address the guest names.
     pub fn invalidate(&mut self, linear: u64) {
+        // Bump even when the direct-mapped TLB no longer holds this address:
+        // the decode cache may still retain its instruction translation.
+        self.epoch = self.epoch.wrapping_add(1);
         let page = linear >> 12;
         let slot = Self::slot(page);
         if self.entries[slot].tag == page {
@@ -101,6 +110,13 @@ impl Tlb {
     #[must_use]
     pub fn counters(&self) -> (u64, u64) {
         (self.hits, self.misses)
+    }
+
+    /// Current explicit-invalidation generation.
+    #[inline]
+    #[must_use]
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 }
 
@@ -136,9 +152,11 @@ mod tests {
     #[test]
     fn flush_drops_every_entry() {
         let mut tlb = Tlb::new();
+        let epoch = tlb.epoch();
         tlb.insert(0x1000, translation(0x5000));
         tlb.insert(0x9000, translation(0x6000));
         tlb.flush();
+        assert_eq!(tlb.epoch(), epoch.wrapping_add(1));
         assert!(tlb.lookup(0x1000).is_none());
         assert!(tlb.lookup(0x9000).is_none());
     }
@@ -146,9 +164,11 @@ mod tests {
     #[test]
     fn invalidate_drops_only_the_named_page() {
         let mut tlb = Tlb::new();
+        let epoch = tlb.epoch();
         tlb.insert(0x1000, translation(0x5000));
         tlb.insert(0x9000, translation(0x6000));
         tlb.invalidate(0x1abc);
+        assert_eq!(tlb.epoch(), epoch.wrapping_add(1));
         assert!(tlb.lookup(0x1000).is_none());
         assert!(tlb.lookup(0x9000).is_some());
     }

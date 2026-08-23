@@ -272,6 +272,17 @@ fn unsafe_ids_paths_digests_and_rootfs_are_rejected_before_runtime_dispatch() {
     assert!(handle.calls.lock().unwrap().is_empty());
 }
 
+#[cfg(unix)]
+#[test]
+fn group_writable_runtime_is_rejected_before_backend_creation() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let harness = Harness::new();
+    fs::set_permissions(&harness.runtime, fs::Permissions::from_mode(0o775)).unwrap();
+    let error = OciRuntimeBackend::new(harness.config()).unwrap_err();
+    assert_eq!(error.code, ErrorCode::PermissionDenied);
+}
+
 #[test]
 fn terminal_specs_and_attach_fail_closed_until_console_streaming_exists() {
     let harness = Harness::new();

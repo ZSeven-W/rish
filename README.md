@@ -25,8 +25,8 @@ No QEMU. No KVM. No hypervisor entitlement. Just Rust.
 > kernel, booted from `startup_64` to userspace entirely in software.
 
 And it runs **on the iOS Simulator**: an `iPhone 17 Pro` boots the same x86-64
-Linux guest in ~40s and drops you into an **interactive shell** — type a command,
-it executes in the guest.
+Linux guest in well under a minute and drops you into an **interactive shell** —
+type a command, it executes in the guest.
 
 ```
 root@rish-container
@@ -94,8 +94,11 @@ Semantic emulation is never reported as real kernel isolation.
 `rish-softvm-core` is a no-JIT, no-`unsafe`-guest-exec x86-64 full-system
 interpreter. What's implemented and tested:
 
-- **CPU**: 64-bit long mode, the general-purpose instruction set, SSE/SSE2, the
-  **x87 FPU** (80-bit extended stack, `FXSAVE`/`FXRSTOR` context save), string ops
+- **CPU**: 64-bit long mode, the general-purpose instruction set, SSE/SSE2, and
+  the SSE3/SSSE3/SSE4.1 subset exercised by Bun 1.4.0; complete post-SSE2
+  extension sets are not advertised through CPUID. The **x87 FPU** provides an
+  80-bit extended stack plus `FXSAVE`/`FXRSTOR` context save; string ops are
+  interpreted as well.
 - **Memory**: 4-level paging with page-boundary-correct operand access, an MTRR/MCE
   MSR surface, a generation-invalidated translation cache
 - **Platform**: IDT/GDT, `syscall`/`sysret`, 8259 PIC, 8254 PIT, local APIC + IOAPIC,
@@ -103,9 +106,15 @@ interpreter. What's implemented and tested:
 - **Boot**: unpacks and runs a real pinned Alpine `bzImage` from `startup_64`,
   correct `boot_params` zero-page layout (cmdline / E820 / ramdisk)
 
-Speed is tuned with `lto=fat`, `codegen-units=1`, and host-scoped
-`target-cpu=native` (~11% over baseline) — fast enough that a phone boots the
-guest in well under a minute.
+Speed is tuned with `lto=fat`, `codegen-units=1`, host-scoped
+`target-cpu=native`, and a mapped decode fast path. A cached instruction skips
+redundant fetch translation only while its TLB invalidation epoch, execution
+permission context, exact linear address, and physical code-page generation all
+remain unchanged; `invlpg`, CR3/control changes, and code writes still force the
+validated slow path. Cache hits return only decoded semantics; raw instruction
+bytes are re-read for tracing or fatal diagnostics instead of crossing every
+hot return path. LAPIC-to-CPU delivery stays in the owning interpreter thread,
+avoiding cross-thread synchronization at every interrupt-recognition boundary.
 
 ## Repository layout
 

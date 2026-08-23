@@ -41,6 +41,7 @@ pub struct ManifestBoot {
     pub kernel: String,
     pub initramfs: String,
     pub command_line: String,
+    pub control_ready_serial_marker: String,
 }
 
 #[derive(Debug, Deserialize)]

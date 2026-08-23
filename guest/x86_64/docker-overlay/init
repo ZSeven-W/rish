@@ -2,6 +2,9 @@
 
 export HOME=/root
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+# Moby maps this documented ramdisk signal to runc v2's NoPivotRoot option.
+# Linux cannot pivot away from the special initramfs rootfs mount.
+export DOCKER_RAMDISK=1
 
 fail() {
     echo "RISH_X86_64_BOOT_FAILED: $1"
@@ -54,11 +57,40 @@ fi
 
 # Container stack modules. Missing modules are reported but not fatal: the
 # guest agent capability probe decides what the session may actually use.
-for module in overlay virtio_net virtio_pci virtio_ring veth bridge \
+for module in overlay virtio_net virtio_pci virtio_ring rng_core virtio_rng \
+    veth bridge \
     br_netfilter nf_tables nf_conntrack nf_defrag_ipv4 ip_tables \
     iptable_nat iptable_filter x_tables; do
     modprobe "$module" 2>/dev/null || echo "module $module unavailable"
 done
+
+command_line=" $(cat /proc/cmdline) "
+diagnostic_proxy=""
+for argument in $command_line; do
+    case "$argument" in
+        rish.diagnostic_proxy=*)
+            diagnostic_proxy=${argument#rish.diagnostic_proxy=}
+            ;;
+    esac
+done
+if [ -n "$diagnostic_proxy" ]; then
+    case "$diagnostic_proxy" in
+        *[!A-Za-z0-9.:-]*) fail "invalid diagnostic proxy endpoint" ;;
+    esac
+    HTTP_PROXY="http://$diagnostic_proxy"
+    HTTPS_PROXY=$HTTP_PROXY
+    NO_PROXY="127.0.0.1,localhost,10.0.2.0/24"
+    export HTTP_PROXY HTTPS_PROXY NO_PROXY
+    export http_proxy=$HTTP_PROXY https_proxy=$HTTPS_PROXY no_proxy=$NO_PROXY
+    echo "RISH_DOCKERD_PROXY endpoint=$diagnostic_proxy"
+fi
+
+case "$command_line" in
+    *" rish.diagnostic_network=dhcp "*)
+        ip link set eth0 up || fail "cannot bring up diagnostic network"
+        udhcpc -i eth0 -q -n -t 5 || fail "diagnostic DHCP failed"
+        ;;
+esac
 
 echo "RISH_X86_64_BOOT_OK"
 echo "Linux $(uname -r) on $(uname -m); cgroup v2, devpts and the docker module set are up."
@@ -66,10 +98,32 @@ echo "Linux $(uname -r) on $(uname -m); cgroup v2, devpts and the docker module 
 # Start the container engine before handing PID 1 to the guest agent. For
 # this diagnostic the daemon runs on the guest host network with bridge and
 # iptables disabled (see /etc/docker/daemon.json).
-(
-    dockerd > /run/dockerd.log 2>&1 &
-)
+case "$command_line" in
+    *" rish.diagnostic_docker_tcp=1 "*)
+        # The QEMU harness forwards this port from host loopback only. Never
+        # expose this unauthenticated diagnostic API in the product boot path.
+        dockerd \
+            --tls=false \
+            --host=unix:///var/run/docker.sock \
+            --host=tcp://0.0.0.0:2375 \
+            > /run/dockerd.log 2>&1 &
+        dockerd_pid=$!
+        (
+            sleep 3
+            if kill -0 "$dockerd_pid" 2>/dev/null; then
+                echo "RISH_DOCKERD_RUNNING"
+            else
+                echo "RISH_DOCKERD_EXITED"
+                cat /run/dockerd.log
+            fi
+        ) &
+        ;;
+    *)
+        dockerd > /run/dockerd.log 2>&1 &
+        ;;
+esac
 
-# The versioned guest protocol owns this serial port from here on; console
+# Do not open ttyS1 through the kernel serial driver: its receive interrupt
+# would race the agent's direct UART polling for control bytes. Console
 # diagnostics stay on ttyS0.
-exec /usr/bin/rish-guest-agent < /dev/ttyS1 > /dev/ttyS1 2> /dev/ttyS0
+exec /usr/bin/rish-guest-agent </dev/null >/dev/null 2>/dev/ttyS0

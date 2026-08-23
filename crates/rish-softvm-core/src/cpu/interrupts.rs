@@ -93,7 +93,7 @@ impl Cpu {
         if !self.regs.rflags.contains(RFlags::IF) {
             return Ok(());
         }
-        if let Some(vector) = self.next_lapic_vector()? {
+        if let Some(vector) = self.next_lapic_vector() {
             self.deliver_gate(vector, 0, false, false)?;
             self.waiting_for_interrupt = false;
             return Ok(());
@@ -106,12 +106,8 @@ impl Cpu {
         Ok(())
     }
 
-    fn next_lapic_vector(&mut self) -> Result<Option<u8>, CpuError> {
-        let mut queue = self
-            .lapic_queue
-            .lock()
-            .map_err(|_| CpuError::GuestFault("lapic queue poisoned".to_owned()))?;
-        Ok(queue.pop_front())
+    fn next_lapic_vector(&mut self) -> Option<u8> {
+        self.memory.lapic_pop_interrupt()
     }
 
     fn deliver_gate(

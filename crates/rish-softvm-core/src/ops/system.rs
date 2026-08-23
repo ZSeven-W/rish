@@ -73,10 +73,10 @@ fn cpuid_leaf(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
             u32::from_le_bytes(*b"ineI"),
         ),
         0x0000_0001 => {
-            // Family 6 model 158, no hyperthreads exposed. Only features this
-            // interpreter actually implements are advertised: a guest that
-            // dispatches on CPUID must never be handed an instruction the
-            // interpreter would fault on.
+            // Family 6 model 158, no hyperthreads exposed. Only complete
+            // feature groups are advertised: individual newer instructions
+            // may exist for a pinned workload, but their CPUID bit stays clear
+            // until the interpreter satisfies the whole extension contract.
             let eax = 0x0009_0600;
             // EBX: brand index 0, CLFLUSH line size in 8-byte units, one
             // logical processor, initial APIC id 0. A zero CLFLUSH size makes
@@ -1168,8 +1168,10 @@ mod tests {
         let (_, _, ecx, edx) = cpuid_leaf(1, 0);
         assert_ne!(edx & (1 << 26), 0, "SSE2 is implemented");
         assert_ne!(ecx & (1 << 13), 0, "cmpxchg16b is implemented");
-        assert_eq!(ecx & (1 << 19), 0, "SSE4.1 is not implemented");
-        assert_eq!(ecx & (1 << 20), 0, "SSE4.2 is not implemented");
+        assert_eq!(ecx & (1 << 0), 0, "complete SSE3 is not implemented");
+        assert_eq!(ecx & (1 << 9), 0, "complete SSSE3 is not implemented");
+        assert_eq!(ecx & (1 << 19), 0, "complete SSE4.1 is not implemented");
+        assert_eq!(ecx & (1 << 20), 0, "complete SSE4.2 is not implemented");
         assert_eq!(ecx & (1 << 22), 0, "MOVBE is not implemented");
         let (_, ebx7, _, _) = cpuid_leaf(7, 0);
         assert_eq!(ebx7, 0, "no BMI, ERMS, or AVX-512 is implemented");
