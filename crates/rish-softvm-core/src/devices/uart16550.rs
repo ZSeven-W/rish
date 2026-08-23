@@ -56,6 +56,30 @@ impl Uart16550 {
         }
     }
 
+    /// Returns true when a serial interrupt edge should be pulsed onto the IRQ
+    /// line this service tick. Both the receive-data-available and
+    /// transmit-holding-register-empty conditions persist here (buffered input
+    /// stays until drained; the THR is always empty because writes transmit
+    /// instantly), and the 8250 ISA IRQ is edge triggered, so a held level
+    /// would deliver a single interrupt and strand the rest of a multi-batch
+    /// transfer. Re-arming an edge every tick while the condition holds keeps
+    /// the transfer flowing; the guest driver masks the interrupt as soon as it
+    /// has drained its side, which stops the pulses.
+    #[must_use]
+    pub fn poll_interrupt_edge(&mut self) -> bool {
+        // Both the receive-data-available and transmit-holding-register-empty
+        // conditions persist here (buffered input stays until drained; the THR
+        // is always empty because writes transmit instantly). The 8250 ISA IRQ
+        // is edge triggered, so a held level would deliver a single interrupt
+        // and leave the rest of a multi-batch transfer stranded. Re-arm an edge
+        // every service tick while the condition holds; the guest driver masks
+        // the interrupt as soon as it has drained its side, which stops the
+        // pulses.
+        let rx_now = self.ier & 0b0001 != 0 && !self.input.is_empty();
+        let tx_now = self.ier & 0b0010 != 0;
+        rx_now || tx_now
+    }
+
     /// Queues host-to-guest bytes. Excess bytes are dropped and counted.
     pub fn push_input(&mut self, bytes: &[u8]) -> usize {
         let mut accepted = 0;
@@ -83,8 +107,12 @@ impl Uart16550 {
 
     #[must_use]
     pub fn has_pending_interrupt(&self) -> bool {
-        // Receiver-line interrupt when enabled and data is buffered.
-        self.ier & 1 != 0 && !self.input.is_empty()
+        // Receiver-data interrupt when enabled and data is buffered, or the
+        // transmitter-holding-register-empty interrupt when enabled. The THR
+        // is always empty here because writes drain into the output queue
+        // immediately, so an enabled TX interrupt is always pending until the
+        // driver clears IER bit 1 once it has nothing left to send.
+        (self.ier & 0b0001 != 0 && !self.input.is_empty()) || self.ier & 0b0010 != 0
     }
     pub fn irq_line(&self) -> u8 {
         match self.base {
@@ -102,12 +130,18 @@ impl PortDevice for Uart16550 {
             REG_THR_RBR => Ok(u32::from(self.input.pop_front().unwrap_or(0))),
             REG_IER => Ok(u32::from(self.ier)),
             REG_IIR_FCR => {
-                let value = if self.input.is_empty() {
-                    IIR_NO_INTERRUPT
-                } else {
+                // Report the highest-priority pending source: received data
+                // available (0b100) outranks THR empty (0b010). The FIFO-enabled
+                // bits (6-7) mirror the FCR so the driver keeps FIFO mode.
+                let source = if self.ier & 0b0001 != 0 && !self.input.is_empty() {
                     0b100
+                } else if self.ier & 0b0010 != 0 {
+                    0b010
+                } else {
+                    IIR_NO_INTERRUPT
                 };
-                Ok(u32::from(value))
+                let fifo_bits = if self.fifo_enabled { 0b1100_0000 } else { 0 };
+                Ok(u32::from(source | fifo_bits))
             }
             REG_LCR => Ok(u32::from(self.lcr)),
             REG_MCR => Ok(u32::from(self.mcr)),
@@ -171,6 +205,36 @@ mod tests {
         let lsr = uart.read(0x3F8 + 5, 1).unwrap() as u8;
         assert_ne!(lsr & LSR_DATA_READY, 0);
         assert_eq!(uart.read(0x3F8, 1).unwrap() as u8, b'x');
+    }
+
+    #[test]
+    fn transmit_interrupt_re_arms_every_tick_while_enabled() {
+        let mut uart = Uart16550::new(0x2F8, 16, 16);
+        // No interrupt sources enabled yet.
+        assert!(!uart.poll_interrupt_edge());
+        // Enabling the transmit interrupt makes the edge fire on every tick
+        // (the THR is always empty), so a multi-batch transfer keeps flowing.
+        uart.write(0x2F8 + 1, 1, 0b0010).unwrap();
+        assert!(uart.poll_interrupt_edge());
+        assert!(uart.poll_interrupt_edge());
+        // Masking the transmit interrupt stops the pulses.
+        uart.write(0x2F8 + 1, 1, 0).unwrap();
+        assert!(!uart.poll_interrupt_edge());
+    }
+
+    #[test]
+    fn receive_interrupt_holds_until_the_buffer_drains() {
+        let mut uart = Uart16550::new(0x2F8, 16, 16);
+        uart.write(0x2F8 + 1, 1, 0b0001).unwrap(); // enable receive interrupt
+        assert!(!uart.poll_interrupt_edge()); // no data yet
+        uart.push_input(b"ab");
+        // The edge keeps re-arming while data is buffered, so an edge-triggered
+        // controller keeps delivering until the guest has read every byte.
+        assert!(uart.poll_interrupt_edge());
+        assert_eq!(uart.read(0x2F8, 1).unwrap() as u8, b'a');
+        assert!(uart.poll_interrupt_edge());
+        assert_eq!(uart.read(0x2F8, 1).unwrap() as u8, b'b');
+        assert!(!uart.poll_interrupt_edge());
     }
 
     #[test]

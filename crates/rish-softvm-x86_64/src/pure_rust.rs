@@ -261,6 +261,9 @@ impl ProviderMachine for PureRustMachine {
                         "\n[rish-softvm pure-Rust fault after {} instructions at {:#x}: {error}]\n",
                         self.cpu.regs.instructions_retired, self.cpu.regs.rip
                     );
+                    if std::env::var_os("RISH_DBG_FAULT").is_some() {
+                        eprint!("{message}");
+                    }
                     self.io.write_console(message.as_bytes());
                     break;
                 }

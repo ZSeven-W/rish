@@ -214,6 +214,18 @@ pub fn call(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
             cpu.push_native(cpu.regs.rip)?;
             set_rip(cpu, target)
         }
+        OpKind::Register => {
+            // Register-indirect near call, e.g. `call rax`. The compiler
+            // emits these for every indirect call and vtable dispatch, so the
+            // return address must be pushed before the target is taken.
+            let target = read_register(
+                &cpu.regs,
+                instruction.op0_register(),
+                operand_size(instruction, 0),
+            );
+            cpu.push_native(cpu.regs.rip)?;
+            set_rip(cpu, target)
+        }
         _ => Err(CpuError::UnimplementedInstruction {
             code: "call".to_owned(),
             address: cpu.regs.rip,
@@ -271,7 +283,16 @@ pub fn flag_ops(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError
         Mnemonic::Cld => cpu.regs.rflags -= RFlags::DF,
         Mnemonic::Std => cpu.regs.rflags |= RFlags::DF,
         Mnemonic::Cli => cpu.regs.rflags -= RFlags::IF,
-        Mnemonic::Sti => cpu.regs.rflags |= RFlags::IF,
+        Mnemonic::Sti => {
+            // STI has a one-instruction interrupt shadow: the instruction
+            // after it (usually hlt) retires before anything is delivered.
+            // Without the shadow, a one-shot timer wake can land between
+            // sti and hlt and the guest sleeps forever.
+            if !cpu.regs.rflags.contains(RFlags::IF) {
+                cpu.interrupt_shadow = true;
+            }
+            cpu.regs.rflags |= RFlags::IF;
+        }
         Mnemonic::Sahf => {
             let ah = read_register(&cpu.regs, Register::AH, 1);
             cpu.regs.rflags = (cpu.regs.rflags
@@ -305,6 +326,7 @@ fn set_rip(cpu: &mut Cpu, target: u64) -> Result<(), CpuError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arch::registers::index;
 
     fn cpu() -> Cpu {
         Cpu::new(1, 0).unwrap()
@@ -409,5 +431,19 @@ mod tests {
         assert!(!cpu.regs.rflags.contains(RFlags::CF));
         run(&mut cpu, 64, &[0xF5], 0x1000).unwrap(); // cmc
         assert!(cpu.regs.rflags.contains(RFlags::CF));
+    }
+    #[test]
+    fn call_rax_is_a_register_indirect_near_call() {
+        // Userspace (musl/busybox) emits raw `call rax` (ff d0) for indirect
+        // calls; the kernel hides them behind retpoline thunks, so this only
+        // surfaces once /init runs.
+        let mut cpu = cpu();
+        cpu.regs.set_gpr(index::RAX, 0x4000);
+        cpu.regs.set_rsp(0x8000);
+        run(&mut cpu, 64, &[0xFF, 0xD0], 0x1000).unwrap();
+        assert_eq!(cpu.regs.rip, 0x4000);
+        // The return address (the instruction after the call) is on the stack.
+        assert_eq!(cpu.memory.read_u64(0x8000 - 8).unwrap(), 0x1002);
+        assert_eq!(cpu.regs.rsp(), 0x8000 - 8);
     }
 }

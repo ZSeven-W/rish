@@ -22,6 +22,10 @@ pub struct Pic8259 {
     slave: Pic,
     /// Line-level inputs including the slave cascade on master line 2.
     inputs: u16,
+    /// Edge-latched requests: set on a rising edge or an explicit pulse and
+    /// cleared when the interrupt is acknowledged, which is how the 8259
+    /// edge-triggered mode actually behaves.
+    latched: u16,
     initialized: bool,
 }
 
@@ -41,6 +45,7 @@ impl Pic8259 {
             master: Pic::default(),
             slave: Pic::default(),
             inputs: 0,
+            latched: 0,
             initialized: false,
         }
     }
@@ -51,8 +56,9 @@ impl Pic8259 {
         if !self.initialized {
             return None;
         }
-        let slave_bits = (self.inputs >> 8) as u8 & !self.slave.mask & !self.slave.in_service;
-        let direct = (self.inputs as u8) & !self.master.mask & !self.master.in_service & !(1 << 2);
+        let requests = self.inputs | self.latched;
+        let slave_bits = (requests >> 8) as u8 & !self.slave.mask & !self.slave.in_service;
+        let direct = (requests as u8) & !self.master.mask & !self.master.in_service & !(1 << 2);
         let cascade = if slave_bits != 0 { 1 << 2 } else { 0 };
         let master_pending = direct | cascade;
         if master_pending == 0 {
@@ -73,6 +79,7 @@ impl Pic8259 {
         if !self.initialized {
             return 0;
         }
+        self.latched &= !(1 << irq);
         if irq >= 8 {
             self.slave.in_service |= 1 << (irq - 8);
             self.master.in_service |= 1 << 2;
@@ -80,6 +87,13 @@ impl Pic8259 {
         } else {
             self.master.in_service |= 1 << irq;
             self.master.vector_offset + irq
+        }
+    }
+
+    /// Latches a one-shot edge on a line, as a timer output pulse does.
+    pub fn pulse(&mut self, line: u8) {
+        if line < 16 {
+            self.latched |= 1 << line;
         }
     }
 
@@ -93,6 +107,9 @@ impl Pic8259 {
     }
 
     pub fn set_input(&mut self, lines: InterruptLines) {
+        // Rising edges latch a request even if the level later drops before
+        // the CPU enables interrupts again.
+        self.latched |= lines.asserted & !self.inputs;
         self.inputs = lines.asserted;
     }
 

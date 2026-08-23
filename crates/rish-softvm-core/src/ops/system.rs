@@ -4,6 +4,7 @@ use iced_x86::{Instruction, Mnemonic, OpKind, Register};
 
 use crate::arch::registers::{Cr0, Cr4, Efer, index};
 use crate::arch::segments::SegmentSelector;
+use crate::cpu::VECTOR_GENERAL_PROTECTION;
 use crate::ops::{
     operand_size, read_operand0, read_operand1, read_register, write_operand0, write_register,
 };
@@ -72,18 +73,19 @@ fn cpuid_leaf(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
             u32::from_le_bytes(*b"ineI"),
         ),
         0x0000_0001 => {
-            // Family 6 model 158, no hyperthreads exposed; conservative but
-            // complete feature set for a stock x86_64 kernel.
+            // Family 6 model 158, no hyperthreads exposed. Only features this
+            // interpreter actually implements are advertised: a guest that
+            // dispatches on CPUID must never be handed an instruction the
+            // interpreter would fault on.
             let eax = 0x0009_0600;
-            let ecx = (1 << 0)  // SSE3
-                | (1 << 9)      // SSSE3
-                | (1 << 13)     // CX16
-                | (1 << 19)     // SSE4.1
-                | (1 << 20)     // SSE4.2
-                | (1 << 22)     // MOVBE
-                | (1 << 23)     // POPCNT
-                | (1 << 30); // RDRAND
+            // EBX: brand index 0, CLFLUSH line size in 8-byte units, one
+            // logical processor, initial APIC id 0. A zero CLFLUSH size makes
+            // the kernel compute a zero cache-line size.
+            let ebx = (8 << 8) | (1 << 16);
+            let ecx = (1 << 13)  // CX16 (cmpxchg16b)
+                | (1 << 23); // POPCNT
             let edx = (1 << 0)  // FPU
+                | (1 << 3)      // PSE: 4 MiB and 2 MiB large pages
                 | (1 << 4)      // TSC
                 | (1 << 5)      // MSR
                 | (1 << 6)      // PAE
@@ -92,18 +94,20 @@ fn cpuid_leaf(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
                 | (1 << 11)     // SEP
                 | (1 << 13)     // PGE
                 | (1 << 15)     // CMOV
+                | (1 << 16)     // PAT
                 | (1 << 19)     // CLFSH
                 | (1 << 23)     // MMX
                 | (1 << 24)     // FXSR
                 | (1 << 25)     // SSE
-                | (1 << 26)     // SSE2
-                | (1 << 28); // HTT
-            (eax, 0, ecx, edx)
+                | (1 << 26); // SSE2
+            (eax, ebx, ecx, edx)
         }
-        0x0000_0007 if subleaf == 0 => {
-            let ebx = (1 << 3) | (1 << 8) | (1 << 18);
-            (0, ebx, 0, 0)
-        }
+        // Structured extended features: BMI1, BMI2, ERMS, AVX and the
+        // AVX-512 family are all unimplemented, so none are advertised.
+        // EDX bit 29 exposes IA32_ARCH_CAPABILITIES, which is how this CPU
+        // reports that it has none of the speculative-execution defects: an
+        // in-order interpreter never executes past a fault or a branch.
+        0x0000_0007 if subleaf == 0 => (0, 0, 0, 1 << 29),
         0x0000_0007 => (0, 0, 0, 0),
         0x0000_000B | 0x0000_001F => (0, 0, 0, 0),
         0x0000_000D if subleaf == 0 => (0x3, 0, 0, 0),
@@ -129,8 +133,8 @@ pub fn rdtsc(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
     write_register(&mut cpu.regs, Register::EAX, 4, tsc & 0xFFFF_FFFF);
     write_register(&mut cpu.regs, Register::EDX, 4, tsc >> 32);
     if instruction.mnemonic() == Mnemonic::Rdtscp {
-        // TSC_AUX = 0.
-        write_register(&mut cpu.regs, Register::ECX, 4, 0);
+        let aux = cpu.msr_tsc_aux;
+        write_register(&mut cpu.regs, Register::ECX, 4, aux);
     }
     Ok(())
 }
@@ -139,7 +143,12 @@ pub fn system_op(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuErro
     match instruction.mnemonic() {
         Mnemonic::Rdmsr => {
             let address = read_register(&cpu.regs, Register::ECX, 4) as u32;
-            let value = msr_read(cpu, address)?;
+            // An unimplemented MSR raises #GP, exactly as hardware does for a
+            // reserved address. Linux probes optional MSRs with rdmsr_safe and
+            // relies on that fault being recoverable.
+            let Some(value) = msr_read(cpu, address) else {
+                return cpu.raise(VECTOR_GENERAL_PROTECTION, 0, true);
+            };
             write_register(&mut cpu.regs, Register::EAX, 4, value & 0xFFFF_FFFF);
             write_register(&mut cpu.regs, Register::EDX, 4, value >> 32);
         }
@@ -147,7 +156,9 @@ pub fn system_op(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuErro
             let address = read_register(&cpu.regs, Register::ECX, 4) as u32;
             let value = read_register(&cpu.regs, Register::EAX, 4)
                 | read_register(&cpu.regs, Register::EDX, 4) << 32;
-            msr_write(cpu, address, value)?;
+            if !msr_write(cpu, address, value) {
+                return cpu.raise(VECTOR_GENERAL_PROTECTION, 0, true);
+            }
         }
         Mnemonic::Rdpmc => {
             let value = cpu.tsc;
@@ -199,7 +210,7 @@ pub fn system_op(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuErro
             cpu.regs.ldtr = if selector.0 == 0 {
                 crate::arch::segments::SegmentRegister::default()
             } else {
-                cpu.load_segment_from_table(selector)?
+                cpu.load_system_descriptor(selector)?
             };
         }
         Mnemonic::Sldt => {
@@ -212,7 +223,9 @@ pub fn system_op(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuErro
         }
         Mnemonic::Ltr => {
             let selector = SegmentSelector(read_operand0(cpu, instruction)? as u16);
-            let loaded = cpu.load_segment_from_table(selector)?;
+            // A 64-bit TSS descriptor is sixteen bytes: the upper half holds
+            // bits 63:32 of the base, which an eight-byte load would drop.
+            let loaded = cpu.load_system_descriptor(selector)?;
             cpu.regs.tr = loaded;
             cpu.regs.tr_base = loaded.base;
         }
@@ -252,9 +265,11 @@ pub fn system_op(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuErro
                 8 => cpu.regs.cr8 = value,
                 _ => return cpu.raise(13, 0, true),
             }
-            // MOV to CR0 updates the paging/cache consistency model.
-            if cr == 0 && cpu.regs.cr0.contains(Cr0::PG) {
-                cpu.regs.cr0 |= Cr0::WP;
+            // Loading CR3, or changing how CR0/CR4 drive paging, invalidates
+            // every cached translation. This is the only point at which the
+            // guest expects stale entries to disappear.
+            if matches!(cr, 0 | 3 | 4) {
+                cpu.flush_tlb();
             }
         }
         Mnemonic::Mov if is_debug_register(instruction.op1_register()) => {
@@ -281,31 +296,17 @@ pub fn system_op(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuErro
                 write_register(&mut cpu.regs, instruction.op0_register(), 2, value);
             }
         }
-        Mnemonic::Invlpg => {}
+        // SMAP gates: stac raises RFLAGS.AC to permit supervisor access to
+        // user pages, clac drops it again.
+        Mnemonic::Stac => cpu.regs.rflags |= crate::arch::registers::RFlags::AC,
+        Mnemonic::Clac => cpu.regs.rflags -= crate::arch::registers::RFlags::AC,
+        Mnemonic::Invlpg => {
+            let linear = cpu.effective_address(instruction, 0);
+            cpu.invalidate_page(linear);
+        }
         Mnemonic::Wbinvd | Mnemonic::Invd => {}
         Mnemonic::Lfence | Mnemonic::Sfence | Mnemonic::Mfence => {}
-        Mnemonic::Iret | Mnemonic::Iretq | Mnemonic::Iretd => {
-            let target = cpu.pop_native()?;
-            let selector = SegmentSelector(cpu.pop_native()? as u16);
-            let flags = cpu.pop_native()?;
-            cpu.regs.rflags = crate::arch::registers::RFlags::from_bits_truncate(flags)
-                | (cpu.regs.rflags & crate::arch::registers::RFlags::VM);
-            cpu.regs.cs = match cpu.regs.mode() {
-                crate::arch::registers::CpuMode::Real
-                | crate::arch::registers::CpuMode::Protected16 => {
-                    crate::arch::segments::SegmentRegister::real_mode(selector)
-                }
-                _ => cpu.load_segment_from_table(selector)?,
-            };
-            if cpu.regs.mode() == crate::arch::registers::CpuMode::Long {
-                // Same-privilege return: RSP and SS follow on the frame.
-                let rsp = cpu.pop_native()?;
-                let ss = SegmentSelector(cpu.pop_native()? as u16);
-                cpu.regs.set_rsp(rsp);
-                cpu.regs.ss = cpu.load_segment_from_table(ss)?;
-            }
-            cpu.regs.rip = target;
-        }
+        Mnemonic::Iret | Mnemonic::Iretq | Mnemonic::Iretd => return iret(cpu),
         Mnemonic::Int3 | Mnemonic::Int => {
             let vector = if instruction.mnemonic() == Mnemonic::Int3 {
                 3
@@ -386,28 +387,60 @@ pub fn extra_op(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError
         | Mnemonic::Prefetchw
         | Mnemonic::Clflush
         | Mnemonic::Clflushopt
-        | Mnemonic::Clac
-        | Mnemonic::Stac
         | Mnemonic::Endbr64
         | Mnemonic::Endbr32 => {}
-        Mnemonic::Fxsave => {
+        Mnemonic::Fxsave | Mnemonic::Fxsave64 => {
             let linear = cpu.effective_address(instruction, 0);
-            let physical = cpu.translate(linear, crate::arch::paging::AccessKind::Write)?;
-            let mut region = [0_u8; 512];
-            region[0..2].copy_from_slice(&cpu.fpu_control_word.to_le_bytes());
-            region[2..4].copy_from_slice(&cpu.fpu_status_word.to_le_bytes());
-            region[4..6].copy_from_slice(&0xFFFF_u16.to_le_bytes());
-            region[24..28].copy_from_slice(&cpu.mxcsr.to_le_bytes());
-            cpu.memory.write(physical, &region)?;
+            save_legacy_fpu_area(cpu, linear)?;
         }
-        Mnemonic::Fxrstor => {
+        Mnemonic::Fxrstor | Mnemonic::Fxrstor64 => {
             let linear = cpu.effective_address(instruction, 0);
-            let physical = cpu.translate(linear, crate::arch::paging::AccessKind::Read)?;
-            let mut region = [0_u8; 512];
-            cpu.memory.read(physical, &mut region)?;
-            cpu.fpu_control_word = u16::from_le_bytes([region[0], region[1]]);
-            cpu.fpu_status_word = u16::from_le_bytes([region[2], region[3]]);
-            cpu.mxcsr = u32::from_le_bytes([region[24], region[25], region[26], region[27]]);
+            restore_legacy_fpu_area(cpu, linear)?;
+        }
+        Mnemonic::Xsave
+        | Mnemonic::Xsave64
+        | Mnemonic::Xsaveopt
+        | Mnemonic::Xsaveopt64
+        | Mnemonic::Xsavec
+        | Mnemonic::Xsavec64
+        | Mnemonic::Xsaves
+        | Mnemonic::Xsaves64 => {
+            // XCR0 is x87|SSE only, so every XSAVE variant reduces to the
+            // 512-byte legacy area plus the 64-byte header. The compacted
+            // forms (xsavec/xsaves) set the compaction bit in XCOMP_BV.
+            let linear = cpu.effective_address(instruction, 0);
+            save_legacy_fpu_area(cpu, linear)?;
+            let compacted = matches!(
+                instruction.mnemonic(),
+                Mnemonic::Xsavec | Mnemonic::Xsavec64 | Mnemonic::Xsaves | Mnemonic::Xsaves64
+            );
+            let xstate_bv: u64 = 0x3;
+            let xcomp_bv: u64 = if compacted { (1 << 63) | 0x3 } else { 0 };
+            let header = cpu.translate(
+                linear.wrapping_add(512),
+                crate::arch::paging::AccessKind::Write,
+            )?;
+            cpu.memory.write_u64(header, xstate_bv)?;
+            cpu.memory.write_u64(header + 8, xcomp_bv)?;
+            let zero = [0_u8; 48];
+            cpu.memory.write(header + 16, &zero)?;
+        }
+        Mnemonic::Xrstor | Mnemonic::Xrstor64 | Mnemonic::Xrstors | Mnemonic::Xrstors64 => {
+            let linear = cpu.effective_address(instruction, 0);
+            let header = cpu.translate(
+                linear.wrapping_add(512),
+                crate::arch::paging::AccessKind::Read,
+            )?;
+            let xstate_bv = cpu.memory.read_u64(header)?;
+            if xstate_bv & 0x3 != 0 {
+                restore_legacy_fpu_area(cpu, linear)?;
+            } else {
+                // Components marked absent return to their init state.
+                cpu.fpu_control_word = 0x037F;
+                cpu.fpu_status_word = 0;
+                cpu.mxcsr = 0x1F80;
+                cpu.regs.xmm = [0; crate::arch::registers::XMM_REGISTERS];
+            }
         }
         Mnemonic::Fninit => {
             cpu.fpu_control_word = 0x037F;
@@ -501,6 +534,66 @@ fn shld_shrd(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
     Ok(())
 }
 
+/// Returns from an interrupt or exception.
+///
+/// In long mode the frame always carries SS and RSP, so a return that lowers
+/// the privilege level restores the interrupted user stack from the frame
+/// rather than keeping the kernel stack. Legacy modes only pop SS:ESP when
+/// the frame's code selector names a less privileged ring.
+fn iret(cpu: &mut Cpu) -> Result<(), CpuError> {
+    use crate::arch::registers::{CpuMode, RFlags};
+
+    let mode = cpu.regs.mode();
+    let target = cpu.pop_native()?;
+    let selector = SegmentSelector(cpu.pop_native()? as u16);
+    let flags = cpu.pop_native()?;
+    let old_cpl = cpu.regs.cpl();
+    let new_cpl = match mode {
+        CpuMode::Real => 0,
+        _ => selector.rpl(),
+    };
+    let returns_outward = new_cpl > old_cpl;
+    // The stack pointer and stack selector are read before CS changes, so the
+    // reads still happen at the privilege level that owns the current stack.
+    let outer_stack = if mode == CpuMode::Long || returns_outward {
+        let rsp = cpu.pop_native()?;
+        let ss = SegmentSelector(cpu.pop_native()? as u16);
+        Some((rsp, ss))
+    } else {
+        None
+    };
+    // Ring 3 cannot grant itself IOPL, VM, or the virtual interrupt bits.
+    let mut restored = RFlags::from_bits_truncate(flags);
+    if old_cpl > 0 {
+        let protected =
+            RFlags::IOPL_LOW | RFlags::IOPL_HIGH | RFlags::VM | RFlags::VIF | RFlags::VIP;
+        restored = (restored - protected) | (cpu.regs.rflags & protected);
+    }
+    cpu.regs.cs = match mode {
+        CpuMode::Real | CpuMode::Protected16 => {
+            crate::arch::segments::SegmentRegister::real_mode(selector)
+        }
+        _ => cpu.load_segment_from_table(selector)?,
+    };
+    if let Some((rsp, ss)) = outer_stack {
+        cpu.regs.set_rsp(rsp);
+        cpu.regs.ss = match mode {
+            CpuMode::Real | CpuMode::Protected16 => {
+                crate::arch::segments::SegmentRegister::real_mode(ss)
+            }
+            _ => cpu.load_segment_from_table(ss)?,
+        };
+    }
+    cpu.regs.rflags = restored;
+    if returns_outward {
+        // Data segments that the outer ring may not use are dropped, as
+        // hardware does on a privilege-lowering return.
+        cpu.drop_inaccessible_data_segments(new_cpl);
+    }
+    cpu.regs.rip = target;
+    Ok(())
+}
+
 fn syscall(cpu: &mut Cpu) -> Result<(), CpuError> {
     use crate::arch::registers::index;
     // RCX := next RIP, R11 := RFLAGS, switch to the kernel segments from
@@ -526,6 +619,90 @@ fn sysret(cpu: &mut Cpu) -> Result<(), CpuError> {
     let user_base = (cpu.msr_star >> 48) as u16;
     cpu.regs.cs = cpu.load_segment_from_table(SegmentSelector(user_base.wrapping_add(16) | 3))?;
     cpu.regs.ss = cpu.load_segment_from_table(SegmentSelector(user_base.wrapping_add(8) | 3))?;
+    Ok(())
+}
+
+/// Writes the 512-byte FXSAVE legacy area: control words, MXCSR, all sixteen
+/// XMM registers, and the eight x87 stack registers (as 80-bit extended). The
+/// x87 state is load-bearing: the guest kernel context-switches threads with
+/// fxsave/fxrstor, so dropping it corrupts x87-using threads (dockerd's cgo).
+fn save_legacy_fpu_area(cpu: &mut Cpu, linear: u64) -> Result<(), CpuError> {
+    let mut region = [0_u8; 512];
+    // The status word carries the stack top in bits 11..13.
+    let status = (cpu.fpu_status_word & !0x3800) | ((u16::from(cpu.fpu_top) & 7) << 11);
+    region[0..2].copy_from_slice(&cpu.fpu_control_word.to_le_bytes());
+    region[2..4].copy_from_slice(&status.to_le_bytes());
+    // Abridged tag word: every physical register is valid (we always hold a
+    // value in each slot), so the reconstructed full tag never marks a live
+    // register empty.
+    region[4] = 0xFF;
+    region[24..28].copy_from_slice(&cpu.mxcsr.to_le_bytes());
+    region[28..32].copy_from_slice(&0x0000_FFFF_u32.to_le_bytes()); // MXCSR_MASK
+    // x87 registers R0..R7 sit at offset 32, sixteen bytes apart (ten used).
+    for (index, value) in cpu.fpu_stack.iter().enumerate() {
+        let offset = 32 + index * 16;
+        region[offset..offset + 10].copy_from_slice(&crate::ops::x87::f64_to_extended80(*value));
+    }
+    for (index, value) in cpu.regs.xmm.iter().enumerate() {
+        let offset = 160 + index * 16;
+        region[offset..offset + 16].copy_from_slice(&value.to_le_bytes());
+    }
+    // The area may cross a page boundary; write page by page.
+    write_linear(cpu, linear, &region)
+}
+
+/// Restores the state written by [`save_legacy_fpu_area`].
+fn restore_legacy_fpu_area(cpu: &mut Cpu, linear: u64) -> Result<(), CpuError> {
+    let mut region = [0_u8; 512];
+    read_linear(cpu, linear, &mut region)?;
+    let status = u16::from_le_bytes([region[2], region[3]]);
+    cpu.fpu_control_word = u16::from_le_bytes([region[0], region[1]]);
+    cpu.fpu_status_word = status;
+    cpu.fpu_top = ((status >> 11) & 7) as u8;
+    cpu.mxcsr = u32::from_le_bytes([region[24], region[25], region[26], region[27]]);
+    for index in 0..8 {
+        let offset = 32 + index * 16;
+        let bytes: [u8; 10] = region[offset..offset + 10]
+            .try_into()
+            .expect("slice is ten bytes");
+        cpu.fpu_stack[index] = crate::ops::x87::extended80_to_f64(&bytes);
+    }
+    for index in 0..crate::arch::registers::XMM_REGISTERS {
+        let offset = 160 + index * 16;
+        cpu.regs.xmm[index] = u128::from_le_bytes(
+            region[offset..offset + 16]
+                .try_into()
+                .expect("slice is sixteen bytes"),
+        );
+    }
+    Ok(())
+}
+
+/// Writes a buffer at a linear address, translating each page separately.
+fn write_linear(cpu: &mut Cpu, linear: u64, bytes: &[u8]) -> Result<(), CpuError> {
+    let mut written = 0_usize;
+    while written < bytes.len() {
+        let address = linear.wrapping_add(written as u64);
+        let physical = cpu.translate(address, crate::arch::paging::AccessKind::Write)?;
+        let in_page = (4096 - (physical & 0xFFF) as usize).min(bytes.len() - written);
+        cpu.memory
+            .write(physical, &bytes[written..written + in_page])?;
+        written += in_page;
+    }
+    Ok(())
+}
+
+/// Reads a buffer at a linear address, translating each page separately.
+fn read_linear(cpu: &mut Cpu, linear: u64, bytes: &mut [u8]) -> Result<(), CpuError> {
+    let mut read = 0_usize;
+    while read < bytes.len() {
+        let address = linear.wrapping_add(read as u64);
+        let physical = cpu.translate(address, crate::arch::paging::AccessKind::Read)?;
+        let in_page = (4096 - (physical & 0xFFF) as usize).min(bytes.len() - read);
+        cpu.memory
+            .read(physical, &mut bytes[read..read + in_page])?;
+        read += in_page;
+    }
     Ok(())
 }
 
@@ -582,6 +759,25 @@ const MSR_STAR: u32 = 0xC000_0081;
 const MSR_LSTAR: u32 = 0xC000_0082;
 const MSR_CSTAR: u32 = 0xC000_0083;
 const MSR_FMASK: u32 = 0xC000_0084;
+const MSR_TSC_AUX: u32 = 0xC000_0103;
+const MSR_IA32_XSS: u32 = 0xDA0;
+const MSR_IA32_ARCH_CAPABILITIES: u32 = 0x10A;
+
+/// This machine executes one instruction at a time, in order, with no cache
+/// or store buffer, so every speculative-execution "no" bit is truthful:
+/// RDCL_NO, SSB_NO, MDS_NO, PSCHANGE_MC_NO, TAA_NO, SBDR_SSDP_NO, FBSDP_NO,
+/// PSDP_NO, BHI_NO, GDS_NO and RFDS_NO.
+const ARCH_CAPABILITIES: u64 = (1 << 0)
+    | (1 << 4)
+    | (1 << 5)
+    | (1 << 6)
+    | (1 << 8)
+    | (1 << 13)
+    | (1 << 14)
+    | (1 << 15)
+    | (1 << 20)
+    | (1 << 26)
+    | (1 << 27);
 const MSR_IA32_TSC_ADJUST: u32 = 0x3B;
 const MSR_IA32_BIOS_SIGN_ID: u32 = 0x8B;
 const MSR_IA32_PLATFORM_ID: u32 = 0x17;
@@ -598,23 +794,31 @@ const MSR_MTRR_FIX_LAST: u32 = 0x25F;
 const MSR_IA32_MC_FIRST: u32 = 0x400;
 const MSR_IA32_MC_LAST: u32 = 0x403;
 
-fn msr_read(cpu: &Cpu, address: u32) -> Result<u64, CpuError> {
+/// Reads a model-specific register. `None` means the address is not
+/// implemented, which the caller turns into #GP.
+fn msr_read(cpu: &Cpu, address: u32) -> Option<u64> {
     match address {
-        MSR_EFER => Ok(cpu.regs.efer.bits()),
-        MSR_IA32_APIC_BASE => Ok(0xFEE0_0000 | (1 << 11) | (1 << 8)),
-        MSR_IA32_TSC => Ok(cpu.tsc),
-        MSR_IA32_MTRR_DEF_TYPE => Ok(0x6),
-        MSR_IA32_MTRRCAP => Ok(0x508),
-        MSR_IA32_MCG_CAP => Ok(0x100),
-        MSR_IA32_MISC_ENABLE => Ok(0),
-        MSR_IA32_PAT => Ok(0x0007_0406_0007_0406),
-        MSR_FS_BASE => Ok(cpu.regs.fs.base),
-        MSR_GS_BASE => Ok(cpu.regs.gs.base),
-        MSR_KERNEL_GS_BASE => Ok(cpu.kernel_gs_base),
-        MSR_STAR => Ok(cpu.msr_star),
-        MSR_LSTAR => Ok(cpu.msr_lstar),
-        MSR_CSTAR => Ok(cpu.msr_cstar),
-        MSR_FMASK => Ok(cpu.msr_fmask),
+        MSR_EFER => Some(cpu.regs.efer.bits()),
+        MSR_IA32_APIC_BASE => Some(0xFEE0_0000 | (1 << 11) | (1 << 8)),
+        MSR_IA32_TSC => Some(cpu.tsc),
+        MSR_IA32_MTRR_DEF_TYPE => Some(0x6),
+        MSR_IA32_MTRRCAP => Some(0x508),
+        MSR_IA32_MCG_CAP => Some(0x100),
+        // Bit 0 is the fast-string enable that Intel parts ship set; leaving
+        // it clear makes Linux turn off REP_GOOD and ERMS.
+        MSR_IA32_MISC_ENABLE => Some(1),
+        MSR_IA32_PAT => Some(0x0007_0406_0007_0406),
+        MSR_FS_BASE => Some(cpu.regs.fs.base),
+        MSR_GS_BASE => Some(cpu.regs.gs.base),
+        MSR_KERNEL_GS_BASE => Some(cpu.kernel_gs_base),
+        MSR_STAR => Some(cpu.msr_star),
+        MSR_LSTAR => Some(cpu.msr_lstar),
+        MSR_CSTAR => Some(cpu.msr_cstar),
+        MSR_FMASK => Some(cpu.msr_fmask),
+        MSR_TSC_AUX => Some(cpu.msr_tsc_aux),
+        MSR_IA32_ARCH_CAPABILITIES => Some(ARCH_CAPABILITIES),
+        // Supervisor xstate mask: no supervisor components exist.
+        MSR_IA32_XSS => Some(0),
         MSR_IA32_TSC_ADJUST
         | MSR_IA32_BIOS_SIGN_ID
         | MSR_IA32_PLATFORM_ID
@@ -627,17 +831,18 @@ fn msr_read(cpu: &Cpu, address: u32) -> Result<u64, CpuError> {
         | MSR_IA32_SYSENTER_EIP
         | MSR_MTRR_PHYS_BASE_FIRST..=MSR_MTRR_PHYS_BASE_LAST
         | MSR_MTRR_FIX_FIRST..=MSR_MTRR_FIX_LAST
-        | MSR_IA32_MC_FIRST..=MSR_IA32_MC_LAST => Ok(0),
-        _ => Err(CpuError::GuestFault(format!(
-            "unimplemented MSR read {address:#x}"
-        ))),
+        | MSR_IA32_MC_FIRST..=MSR_IA32_MC_LAST => Some(0),
+        _ => None,
     }
 }
 
-fn msr_write(cpu: &mut Cpu, address: u32, value: u64) -> Result<(), CpuError> {
+/// Writes a model-specific register. `false` means the address is not
+/// implemented, which the caller turns into #GP.
+fn msr_write(cpu: &mut Cpu, address: u32, value: u64) -> bool {
     match address {
         MSR_EFER => {
             cpu.regs.efer = Efer::from_bits_truncate(value);
+            cpu.flush_tlb();
         }
         MSR_FS_BASE => cpu.regs.fs.base = value,
         MSR_GS_BASE => cpu.regs.gs.base = value,
@@ -646,6 +851,10 @@ fn msr_write(cpu: &mut Cpu, address: u32, value: u64) -> Result<(), CpuError> {
         MSR_LSTAR => cpu.msr_lstar = value,
         MSR_CSTAR => cpu.msr_cstar = value,
         MSR_FMASK => cpu.msr_fmask = value,
+        // RDTSCP and RDPID return the low 32 bits, which Linux packs with the
+        // CPU and NUMA node identifiers.
+        MSR_TSC_AUX => cpu.msr_tsc_aux = value & 0xFFFF_FFFF,
+        MSR_IA32_XSS => {}
         MSR_IA32_APIC_BASE => {
             // BSP bit and enable bit only; relocation ignored for now.
         }
@@ -667,13 +876,9 @@ fn msr_write(cpu: &mut Cpu, address: u32, value: u64) -> Result<(), CpuError> {
         | MSR_MTRR_PHYS_BASE_FIRST..=MSR_MTRR_PHYS_BASE_LAST
         | MSR_MTRR_FIX_FIRST..=MSR_MTRR_FIX_LAST
         | MSR_IA32_MC_FIRST..=MSR_IA32_MC_LAST => {}
-        _ => {
-            return Err(CpuError::GuestFault(format!(
-                "unimplemented MSR write {address:#x}"
-            )));
-        }
+        _ => return false,
     }
-    Ok(())
+    true
 }
 
 #[allow(dead_code)]
@@ -922,6 +1127,60 @@ mod tests {
     }
 
     #[test]
+    fn an_unimplemented_msr_raises_general_protection() {
+        // rdmsr_safe expects a recoverable #GP, not a dead interpreter.
+        assert_eq!(msr_read(&cpu(), 0x0000_00CE), None);
+        assert!(!msr_write(&mut cpu(), 0x0000_00CE, 0));
+    }
+
+    #[test]
+    fn arch_capabilities_reports_no_speculation_defects() {
+        // Without RDCL_NO the kernel turns on page-table isolation, which
+        // this machine has no reason to pay for.
+        let value = msr_read(&cpu(), MSR_IA32_ARCH_CAPABILITIES).expect("implemented");
+        assert_ne!(value & 1, 0, "RDCL_NO");
+        let (_, _, _, edx) = cpuid_leaf(7, 0);
+        assert_ne!(edx & (1 << 29), 0, "ARCH_CAPABILITIES is advertised");
+    }
+
+    #[test]
+    fn tsc_aux_round_trips_and_reaches_rdtscp() {
+        let mut cpu = cpu();
+        cpu.regs.set_gpr(index::RCX, u64::from(MSR_TSC_AUX));
+        cpu.regs.set_gpr(index::RAX, 0x0000_1234);
+        cpu.regs.set_gpr(index::RDX, 0);
+        run(&mut cpu, 64, &[0x0F, 0x30]).unwrap(); // wrmsr
+        assert_eq!(cpu.msr_tsc_aux, 0x1234);
+        run(&mut cpu, 64, &[0x0F, 0x01, 0xF9]).unwrap(); // rdtscp
+        assert_eq!(cpu.regs.gpr(index::RCX) & 0xFFFF_FFFF, 0x1234);
+    }
+
+    #[test]
+    fn cpuid_reports_large_pages_and_a_cache_line_size() {
+        let (_, ebx, _, edx) = cpuid_leaf(1, 0);
+        assert_ne!(edx & (1 << 3), 0, "PSE gates the kernel's large-page map");
+        assert_eq!((ebx >> 8) & 0xFF, 8, "CLFLUSH line size in 8-byte units");
+        assert_eq!((ebx >> 16) & 0xFF, 1, "one logical processor");
+    }
+
+    #[test]
+    fn cpuid_advertises_only_implemented_features() {
+        let (_, _, ecx, edx) = cpuid_leaf(1, 0);
+        assert_ne!(edx & (1 << 26), 0, "SSE2 is implemented");
+        assert_ne!(ecx & (1 << 13), 0, "cmpxchg16b is implemented");
+        assert_eq!(ecx & (1 << 19), 0, "SSE4.1 is not implemented");
+        assert_eq!(ecx & (1 << 20), 0, "SSE4.2 is not implemented");
+        assert_eq!(ecx & (1 << 22), 0, "MOVBE is not implemented");
+        let (_, ebx7, _, _) = cpuid_leaf(7, 0);
+        assert_eq!(ebx7, 0, "no BMI, ERMS, or AVX-512 is implemented");
+    }
+
+    #[test]
+    fn misc_enable_reports_fast_strings_on() {
+        assert_eq!(msr_read(&cpu(), MSR_IA32_MISC_ENABLE), Some(1));
+    }
+
+    #[test]
     fn mov_to_cr0_enables_protected_mode() {
         let mut cpu = cpu();
         cpu.regs.set_gpr(index::RAX, Cr0::PE.bits());
@@ -945,5 +1204,39 @@ mod tests {
         run(&mut cpu, 64, &[0xF4]).unwrap();
         assert!(cpu.halted);
         assert!(matches!(cpu.step(), Err(CpuError::Halted)));
+    }
+    #[test]
+    fn fxsave_round_trips_the_xmm_registers() {
+        // Context switches rely on fxsave/fxrstor carrying the full SSE
+        // state; losing XMM registers corrupts userspace silently.
+        let mut cpu = cpu();
+        cpu.regs.xmm[0] = 0x1111_2222_3333_4444_5555_6666_7777_8888;
+        cpu.regs.xmm[15] = 0xAAAA_BBBB_CCCC_DDDD_EEEE_FFFF_0000_1111;
+        cpu.mxcsr = 0x1F90;
+        cpu.regs.set_gpr(index::RSI, 0x2000);
+        run(&mut cpu, 64, &[0x48, 0x0F, 0xAE, 0x06]).unwrap(); // fxsave64 [rsi]
+        cpu.regs.xmm = [0; 16];
+        cpu.mxcsr = 0;
+        run(&mut cpu, 64, &[0x48, 0x0F, 0xAE, 0x0E]).unwrap(); // fxrstor64 [rsi]
+        assert_eq!(cpu.regs.xmm[0], 0x1111_2222_3333_4444_5555_6666_7777_8888);
+        assert_eq!(cpu.regs.xmm[15], 0xAAAA_BBBB_CCCC_DDDD_EEEE_FFFF_0000_1111);
+        assert_eq!(cpu.mxcsr, 0x1F90);
+    }
+
+    #[test]
+    fn xsaves_round_trips_through_xrstors() {
+        let mut cpu = cpu();
+        cpu.regs.xmm[3] = 0xDEAD_BEEF;
+        cpu.regs.set_gpr(index::RSI, 0x2000);
+        // xsaves64 needs EDX:EAX as the instruction mask.
+        cpu.regs.set_gpr(index::RAX, 0x3);
+        cpu.regs.set_gpr(index::RDX, 0);
+        run(&mut cpu, 64, &[0x48, 0x0F, 0xC7, 0x2E]).unwrap(); // xsaves64 [rsi]
+        // Header: XSTATE_BV=3, XCOMP_BV has the compaction bit.
+        assert_eq!(cpu.memory.read_u64(0x2000 + 512).unwrap(), 0x3);
+        assert_ne!(cpu.memory.read_u64(0x2000 + 520).unwrap() & (1 << 63), 0);
+        cpu.regs.xmm[3] = 0;
+        run(&mut cpu, 64, &[0x48, 0x0F, 0xC7, 0x1E]).unwrap(); // xrstors64 [rsi]
+        assert_eq!(cpu.regs.xmm[3], 0xDEAD_BEEF);
     }
 }

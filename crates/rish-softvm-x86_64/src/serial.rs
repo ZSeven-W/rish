@@ -93,17 +93,21 @@ impl ControlBuffer {
 pub struct ControlChannel {
     input: Mutex<ControlBuffer>,
     output: Mutex<ControlBuffer>,
-    dropped_input: AtomicU64,
-    dropped_output: AtomicU64,
+    dropped_input: Arc<AtomicU64>,
+    dropped_output: Arc<AtomicU64>,
 }
 
 impl ControlChannel {
     pub fn new(capacity: usize) -> Self {
+        // The counters must be the same cells the buffers increment, or the
+        // transport's fail-closed drop check never observes anything.
+        let dropped_input = Arc::new(AtomicU64::new(0));
+        let dropped_output = Arc::new(AtomicU64::new(0));
         Self {
-            input: Mutex::new(ControlBuffer::new(capacity, Arc::new(AtomicU64::new(0)))),
-            output: Mutex::new(ControlBuffer::new(capacity, Arc::new(AtomicU64::new(0)))),
-            dropped_input: AtomicU64::new(0),
-            dropped_output: AtomicU64::new(0),
+            input: Mutex::new(ControlBuffer::new(capacity, Arc::clone(&dropped_input))),
+            output: Mutex::new(ControlBuffer::new(capacity, Arc::clone(&dropped_output))),
+            dropped_input,
+            dropped_output,
         }
     }
 
@@ -225,5 +229,24 @@ impl ProviderIo {
     #[must_use]
     pub fn should_cancel(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_channel_drop_counters_observe_overflow() {
+        let channel = ControlChannel::new(4);
+        assert_eq!(channel.write_input(b"123456"), 4);
+        assert_eq!(channel.dropped_input(), 2);
+        assert_eq!(channel.write_output(b"abcdefgh"), 4);
+        assert_eq!(channel.dropped_output(), 4);
+        // Draining frees capacity; new writes fit and the counter holds.
+        let mut sink = [0_u8; 4];
+        assert_eq!(channel.read_input(&mut sink), 4);
+        assert_eq!(channel.write_input(b"78"), 2);
+        assert_eq!(channel.dropped_input(), 2);
     }
 }

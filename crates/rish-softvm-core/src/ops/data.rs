@@ -89,12 +89,22 @@ pub fn movx(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
     let mnemonic = instruction.mnemonic();
     // Source width depends on the exact form: 8/16-bit rm, or 32-bit
     // rm for movsxd r64/r32, r/m32.
+    // MOVZX memory operands decode as UInt8/UInt16, but MOVSX reports the
+    // signed sizes Int8/Int16; both mean the same access width. Falling
+    // through to a wider read would drag neighboring struct fields into the
+    // sign extension.
     let source_size = match mnemonic {
-        Mnemonic::Movzx | Mnemonic::Movsx => match instruction.memory_size() {
-            iced_x86::MemorySize::UInt8 => 1,
-            iced_x86::MemorySize::UInt16 => 2,
-            _ => 4,
-        },
+        Mnemonic::Movzx | Mnemonic::Movsx => {
+            if instruction.op1_kind() == OpKind::Register {
+                crate::ops::register_size(instruction.op1_register())
+            } else {
+                match instruction.memory_size() {
+                    iced_x86::MemorySize::UInt8 | iced_x86::MemorySize::Int8 => 1,
+                    iced_x86::MemorySize::UInt16 | iced_x86::MemorySize::Int16 => 2,
+                    _ => 4,
+                }
+            }
+        }
         Mnemonic::Movsxd => 4,
         _ => 4,
     };
@@ -326,5 +336,42 @@ mod tests {
         assert!(!cpu.regs.rflags.contains(crate::arch::registers::RFlags::ZF));
         assert_eq!(cpu.regs.gpr(index::RAX), 0x1234);
         assert_eq!(cpu.regs.gpr(index::RDX), 0xCAFE);
+    }
+    #[test]
+    fn movsx_from_a_16_bit_memory_operand_reads_only_two_bytes() {
+        // The console index load in the kernel: movswq 0x4a(%rdi), %rdi.
+        // Reading four bytes drags the neighboring field into the result.
+        let mut cpu = cpu();
+        cpu.memory.write_u64(0x2000, 0x1CB2_0000_0000_8001).unwrap();
+        cpu.regs.set_gpr(index::RSI, 0x2000);
+        // movsx rdi, word [rsi]
+        run(&mut cpu, &[0x48, 0x0F, 0xBF, 0x3E]).unwrap();
+        assert_eq!(cpu.regs.gpr(index::RDI), 0xFFFF_FFFF_FFFF_8001);
+        // A positive index stays small.
+        cpu.memory.write_u64(0x2000, 0x1CB2_0000_0000_0003).unwrap();
+        run(&mut cpu, &[0x48, 0x0F, 0xBF, 0x3E]).unwrap();
+        assert_eq!(cpu.regs.gpr(index::RDI), 3);
+    }
+
+    #[test]
+    fn movsx_from_an_8_bit_memory_operand_reads_one_byte() {
+        let mut cpu = cpu();
+        cpu.memory.write_u64(0x2000, 0x1122_3344_5566_7780).unwrap();
+        cpu.regs.set_gpr(index::RSI, 0x2000);
+        // movsx eax, byte [rsi]
+        run(&mut cpu, &[0x0F, 0xBE, 0x06]).unwrap();
+        assert_eq!(cpu.regs.gpr(index::RAX), 0xFFFF_FF80);
+    }
+
+    #[test]
+    fn movzx_from_a_16_bit_register_ignores_the_upper_bits() {
+        let mut cpu = cpu();
+        cpu.regs.set_gpr(index::RCX, 0xDEAD_BEEF_1234_8001);
+        // movzx rax, cx
+        run(&mut cpu, &[0x48, 0x0F, 0xB7, 0xC1]).unwrap();
+        assert_eq!(cpu.regs.gpr(index::RAX), 0x8001);
+        // movsx rax, cx
+        run(&mut cpu, &[0x48, 0x0F, 0xBF, 0xC1]).unwrap();
+        assert_eq!(cpu.regs.gpr(index::RAX), 0xFFFF_FFFF_FFFF_8001);
     }
 }

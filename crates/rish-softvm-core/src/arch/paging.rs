@@ -31,6 +31,38 @@ pub struct PageFault {
     pub error_code: u16,
 }
 
+/// Error-code bit positions, named so callers do not repeat magic numbers.
+pub const FAULT_PRESENT: u16 = 1 << 0;
+pub const FAULT_WRITE: u16 = 1 << 1;
+pub const FAULT_USER: u16 = 1 << 2;
+pub const FAULT_RESERVED: u16 = 1 << 3;
+pub const FAULT_FETCH: u16 = 1 << 4;
+
+/// One completed page-table walk: the physical frame plus the permissions
+/// accumulated across every level, which is what a TLB entry caches.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Translation {
+    /// Physical base of the mapped frame, with the page offset cleared.
+    pub frame: u64,
+    /// Page size in bytes (4 KiB, 2 MiB, or 1 GiB).
+    pub page_size: u64,
+    /// Writable at every level.
+    pub writable: bool,
+    /// User-accessible at every level.
+    pub user: bool,
+    /// No-execute at any level (only meaningful when EFER.NXE is set).
+    pub no_execute: bool,
+}
+
+impl Translation {
+    /// Physical address of a linear address inside this page.
+    #[inline]
+    #[must_use]
+    pub fn physical(&self, linear: u64) -> u64 {
+        self.frame | (linear & (self.page_size - 1))
+    }
+}
+
 /// Translates one linear address against the active paging mode.
 pub fn translate(
     memory: &Memory,
@@ -44,18 +76,29 @@ pub fn translate(
     if !cr0.contains(Cr0::PG) {
         return Ok(linear);
     }
+    let walked = walk(memory, cr3, cr4, efer, linear)?;
+    check_access(&walked, linear, kind, 0, cr0, cr4, efer, false)?;
+    Ok(walked.physical(linear))
+}
+
+/// Walks the page tables without applying any privilege check. The caller
+/// applies [`check_access`] so a cached walk can be re-checked against the
+/// current privilege level without repeating the walk.
+pub fn walk(
+    memory: &Memory,
+    cr3: u64,
+    cr4: Cr4,
+    efer: Efer,
+    linear: u64,
+) -> Result<Translation, PageFault> {
     let reserved = reserved_mask(efer);
     if efer.contains(Efer::LMA) {
-        return if cr4.contains(Cr4::LA57) {
-            walk_generic(memory, cr3, cr4, efer, reserved, linear, kind, true)
-        } else {
-            walk_generic(memory, cr3, cr4, efer, reserved, linear, kind, false)
-        };
+        return walk_generic(memory, cr3, efer, reserved, linear, cr4.contains(Cr4::LA57));
     }
     if cr4.contains(Cr4::PAE) {
-        return walk_pae32(memory, cr3, cr4, efer, reserved, linear, kind);
+        return walk_pae32(memory, cr3, cr4, efer, reserved, linear);
     }
-    walk_2_level(memory, cr3, cr4, efer, reserved, linear, kind)
+    walk_2_level(memory, cr3, cr4, efer, reserved, linear)
 }
 
 fn reserved_mask(_efer: Efer) -> u64 {
@@ -66,18 +109,35 @@ fn reserved_mask(_efer: Efer) -> u64 {
     0
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Accumulates the permission bits of one level onto a running translation.
+#[inline]
+fn accumulate(state: &mut Translation, entry: u64) {
+    state.writable &= entry & PAGE_WRITABLE != 0;
+    state.user &= entry & PAGE_USER != 0;
+    state.no_execute |= entry & PAGE_NX != 0;
+}
+
+/// A fresh permission accumulator: everything allowed until a level narrows it.
+#[inline]
+fn permissive(page_size: u64) -> Translation {
+    Translation {
+        frame: 0,
+        page_size,
+        writable: true,
+        user: true,
+        no_execute: false,
+    }
+}
+
 fn walk_generic(
     memory: &Memory,
     cr3: u64,
-    cr4: Cr4,
     efer: Efer,
     reserved: u64,
     linear: u64,
-    kind: AccessKind,
     five_level: bool,
-) -> Result<u64, PageFault> {
-    let offset = linear & 0xFFF;
+) -> Result<Translation, PageFault> {
+    let mut state = permissive(0x1000);
     let mut entry = if five_level {
         let index = (linear >> 48) & 0x1FF;
         read_entry(memory, (cr3 & TABLE_MASK) + index * 8, linear, reserved)?
@@ -85,11 +145,9 @@ fn walk_generic(
         let index = (linear >> 39) & 0x1FF;
         read_entry(memory, (cr3 & TABLE_MASK) + index * 8, linear, reserved)?
     };
+    accumulate(&mut state, entry);
     if entry & PAGE_LARGE != 0 {
-        return Err(PageFault {
-            linear,
-            error_code: 0b1000,
-        });
+        return Err(reserved_fault(linear));
     }
     if five_level {
         let pml4_index = (linear >> 39) & 0x1FF;
@@ -99,11 +157,9 @@ fn walk_generic(
             linear,
             reserved,
         )?;
+        accumulate(&mut state, entry);
         if entry & PAGE_LARGE != 0 {
-            return Err(PageFault {
-                linear,
-                error_code: 0b1000,
-            });
+            return Err(reserved_fault(linear));
         }
     }
     let pdpt_index = (linear >> 30) & 0x1FF;
@@ -113,8 +169,9 @@ fn walk_generic(
         linear,
         reserved,
     )?;
+    accumulate(&mut state, entry);
     if entry & PAGE_LARGE != 0 {
-        return large_page(entry, linear, 30, cr4);
+        return large_page(state, entry, linear, 30);
     }
     let pd_index = (linear >> 21) & 0x1FF;
     entry = read_entry(
@@ -123,8 +180,9 @@ fn walk_generic(
         linear,
         reserved,
     )?;
+    accumulate(&mut state, entry);
     if entry & PAGE_LARGE != 0 {
-        return large_page(entry, linear, 21, cr4);
+        return large_page(state, entry, linear, 21);
     }
     let pt_index = (linear >> 12) & 0x1FF;
     entry = read_entry(
@@ -133,17 +191,12 @@ fn walk_generic(
         linear,
         reserved,
     )?;
-    if entry & PAGE_LARGE != 0 {
-        return Err(PageFault {
-            linear,
-            error_code: 0b1000,
-        });
-    }
-    check_access(entry, linear, kind)?;
+    accumulate(&mut state, entry);
     let _ = efer;
-    Ok((entry & TABLE_MASK) + offset)
+    state.frame = entry & TABLE_MASK & !0xFFF;
+    Ok(state)
 }
-#[allow(clippy::too_many_arguments)]
+
 fn walk_pae32(
     memory: &Memory,
     cr3: u64,
@@ -151,21 +204,18 @@ fn walk_pae32(
     efer: Efer,
     reserved: u64,
     linear: u64,
-    kind: AccessKind,
-) -> Result<u64, PageFault> {
-    let offset = linear & 0xFFF;
+) -> Result<Translation, PageFault> {
+    let mut state = permissive(0x1000);
     let pdpt_index = (linear >> 30) & 0b11;
+    // PDPTE entries in PAE mode carry no permission bits.
     let mut entry = read_entry(
         memory,
-        (cr3 & 0xFFFF_FFF0) + pdpt_index * 8,
+        (cr3 & 0xFFFF_FFE0) + pdpt_index * 8,
         linear,
         reserved,
     )?;
     if entry & PAGE_LARGE != 0 {
-        return Err(PageFault {
-            linear,
-            error_code: 0b1000,
-        });
+        return Err(reserved_fault(linear));
     }
     let pd_index = (linear >> 21) & 0x1FF;
     entry = read_entry(
@@ -174,8 +224,9 @@ fn walk_pae32(
         linear,
         reserved,
     )?;
+    accumulate(&mut state, entry);
     if entry & PAGE_LARGE != 0 {
-        return large_page(entry, linear, 21, cr4);
+        return large_page(state, entry, linear, 21);
     }
     let pt_index = (linear >> 12) & 0x1FF;
     entry = read_entry(
@@ -184,18 +235,12 @@ fn walk_pae32(
         linear,
         reserved,
     )?;
-    if entry & PAGE_LARGE != 0 {
-        return Err(PageFault {
-            linear,
-            error_code: 0b1000,
-        });
-    }
-    check_access(entry, linear, kind)?;
-    let _ = efer;
-    Ok((entry & TABLE_MASK) + offset)
+    accumulate(&mut state, entry);
+    let _ = (cr4, efer);
+    state.frame = entry & TABLE_MASK & !0xFFF;
+    Ok(state)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn walk_2_level(
     memory: &Memory,
     cr3: u64,
@@ -203,36 +248,56 @@ fn walk_2_level(
     efer: Efer,
     reserved: u64,
     linear: u64,
-    kind: AccessKind,
-) -> Result<u64, PageFault> {
-    let offset = linear & 0xFFF;
+) -> Result<Translation, PageFault> {
+    let mut state = permissive(0x1000);
     let pd_index = (linear >> 22) & 0x3FF;
-    let entry = read_entry(memory, (cr3 & 0xFFFF_F000) + pd_index * 4, linear, reserved)?;
-    if cr4.contains(Cr4::PSE) && entry & PAGE_LARGE != 0 {
-        return Ok((entry & 0xFFC0_0000) + (linear & 0x003F_FFFF));
-    }
+    let entry = read_entry32(memory, (cr3 & 0xFFFF_F000) + pd_index * 4, linear, reserved)?;
+    accumulate(&mut state, entry);
     if entry & PAGE_LARGE != 0 {
-        return Err(PageFault {
-            linear,
-            error_code: 0b1000,
-        });
+        if !cr4.contains(Cr4::PSE) {
+            return Err(reserved_fault(linear));
+        }
+        state.page_size = 0x40_0000;
+        state.frame = entry & 0xFFC0_0000;
+        return Ok(state);
     }
     let pt_index = (linear >> 12) & 0x3FF;
-    let entry = read_entry(
+    let entry = read_entry32(
         memory,
         (entry & 0xFFFF_F000) + pt_index * 4,
         linear,
         reserved,
     )?;
-    check_access(entry, linear, kind)?;
+    accumulate(&mut state, entry);
     let _ = efer;
-    Ok((entry & 0xFFFF_F000) + offset)
+    state.frame = entry & 0xFFFF_F000;
+    Ok(state)
 }
+
 fn read_entry(memory: &Memory, address: u64, linear: u64, reserved: u64) -> Result<u64, PageFault> {
     let entry = memory.read_u64(address).map_err(|_| PageFault {
         linear,
         error_code: 0,
     })?;
+    validate_entry(entry, linear, reserved)
+}
+
+/// Reads a 32-bit (non-PAE) table entry. Bit 63 does not exist there, so the
+/// NX bit must never be inferred from a sign extension.
+fn read_entry32(
+    memory: &Memory,
+    address: u64,
+    linear: u64,
+    reserved: u64,
+) -> Result<u64, PageFault> {
+    let entry = memory.read_u32(address).map_err(|_| PageFault {
+        linear,
+        error_code: 0,
+    })?;
+    validate_entry(u64::from(entry), linear, reserved)
+}
+
+fn validate_entry(entry: u64, linear: u64, reserved: u64) -> Result<u64, PageFault> {
     if entry & PAGE_PRESENT == 0 {
         return Err(PageFault {
             linear,
@@ -240,41 +305,110 @@ fn read_entry(memory: &Memory, address: u64, linear: u64, reserved: u64) -> Resu
         });
     }
     if entry & reserved != 0 {
-        return Err(PageFault {
-            linear,
-            error_code: 0b1000,
-        });
+        return Err(reserved_fault(linear));
     }
     Ok(entry)
 }
 
-fn check_access(entry: u64, linear: u64, kind: AccessKind) -> Result<(), PageFault> {
-    // Supervisor-only first milestone: the guest boots as ring 0. The U/S
-    // distinction is reserved for the user-mode milestone.
-    if matches!(kind, AccessKind::Write) && entry & PAGE_WRITABLE == 0 {
-        return Err(PageFault {
-            linear,
-            error_code: 0b10,
-        });
+fn reserved_fault(linear: u64) -> PageFault {
+    PageFault {
+        linear,
+        error_code: FAULT_PRESENT | FAULT_RESERVED,
     }
-    if matches!(kind, AccessKind::Execute) && entry & PAGE_NX != 0 {
-        return Err(PageFault {
-            linear,
-            error_code: 0b1_0000,
-        });
+}
+
+/// Adds the access-dependent bits to a fault raised by the walk itself.
+///
+/// A walk failure only knows about presence and reserved bits; the write,
+/// user, and instruction-fetch bits come from the access that triggered it,
+/// and the handler needs them to tell a bad write from a bad read.
+#[must_use]
+pub fn with_access_bits(mut fault: PageFault, kind: AccessKind, cpl: u8) -> PageFault {
+    if matches!(kind, AccessKind::Write) {
+        fault.error_code |= FAULT_WRITE;
+    }
+    if matches!(kind, AccessKind::Execute) {
+        fault.error_code |= FAULT_FETCH;
+    }
+    if cpl == 3 {
+        fault.error_code |= FAULT_USER;
+    }
+    fault
+}
+
+/// Applies the privilege and permission rules to a completed walk.
+///
+/// `cpl` is the current privilege level and `alignment_check` is RFLAGS.AC,
+/// which suppresses the SMAP check for explicit supervisor accesses.
+#[allow(clippy::too_many_arguments)]
+pub fn check_access(
+    walked: &Translation,
+    linear: u64,
+    kind: AccessKind,
+    cpl: u8,
+    cr0: Cr0,
+    cr4: Cr4,
+    efer: Efer,
+    alignment_check: bool,
+) -> Result<(), PageFault> {
+    let user = cpl == 3;
+    let mut error_code = FAULT_PRESENT;
+    if user {
+        error_code |= FAULT_USER;
+    }
+    if matches!(kind, AccessKind::Write) {
+        error_code |= FAULT_WRITE;
+    }
+    if matches!(kind, AccessKind::Execute) {
+        error_code |= FAULT_FETCH;
+    }
+    let deny = |linear: u64| PageFault { linear, error_code };
+    if user && !walked.user {
+        return Err(deny(linear));
+    }
+    match kind {
+        AccessKind::Write => {
+            // Supervisor writes ignore the read-only bit unless CR0.WP is set.
+            let enforced = user || cr0.contains(Cr0::WP);
+            if enforced && !walked.writable {
+                return Err(deny(linear));
+            }
+        }
+        AccessKind::Execute => {
+            if efer.contains(Efer::NXE) && walked.no_execute {
+                return Err(deny(linear));
+            }
+            if !user && cr4.contains(Cr4::SMEP) && walked.user {
+                return Err(deny(linear));
+            }
+        }
+        AccessKind::Read => {}
+    }
+    // SMAP blocks supervisor data access to user pages while AC is clear.
+    if !user
+        && !matches!(kind, AccessKind::Execute)
+        && cr4.contains(Cr4::SMAP)
+        && walked.user
+        && !alignment_check
+    {
+        return Err(deny(linear));
     }
     Ok(())
 }
 
-fn large_page(entry: u64, linear: u64, shift: u32, cr4: Cr4) -> Result<u64, PageFault> {
-    if shift == 30 && !cr4.contains(Cr4::PSE) {
-        return Err(PageFault {
-            linear,
-            error_code: 0b1000,
-        });
-    }
+fn large_page(
+    mut state: Translation,
+    entry: u64,
+    linear: u64,
+    shift: u32,
+) -> Result<Translation, PageFault> {
     let mask = (1_u64 << shift) - 1;
-    Ok((entry & !mask & TABLE_MASK) + (linear & mask))
+    // A 1 GiB page needs CPUID.80000001:EDX[26], which this CPU reports; the
+    // PSE bit only gates 4 MiB pages in the 32-bit non-PAE walk.
+    state.page_size = mask + 1;
+    state.frame = entry & !mask & TABLE_MASK;
+    let _ = linear;
+    Ok(state)
 }
 
 #[cfg(test)]
@@ -348,14 +482,119 @@ mod tests {
         let fault = translate(
             &memory,
             0,
-            Cr0::PG,
+            Cr0::PG | Cr0::WP,
             Cr4::PAE,
             Efer::LMA,
             0x0,
             AccessKind::Write,
         )
         .unwrap_err();
-        assert_eq!(fault.error_code & 0b10, 0b10);
+        assert_eq!(fault.error_code & FAULT_WRITE, FAULT_WRITE);
+        assert_eq!(fault.error_code & FAULT_PRESENT, FAULT_PRESENT);
+    }
+
+    #[test]
+    fn supervisor_write_to_read_only_page_passes_without_wp() {
+        let mut memory = Memory::new(16).unwrap();
+        memory
+            .write_u64(0x0000, 0x1000 | PAGE_PRESENT | PAGE_WRITABLE)
+            .unwrap();
+        memory
+            .write_u64(0x1000, 0x2000 | PAGE_PRESENT | PAGE_WRITABLE)
+            .unwrap();
+        memory
+            .write_u64(0x2000, 0x3000 | PAGE_PRESENT | PAGE_WRITABLE)
+            .unwrap();
+        memory.write_u64(0x3000, 0x5000 | PAGE_PRESENT).unwrap();
+        assert_eq!(
+            translate(
+                &memory,
+                0,
+                Cr0::PG,
+                Cr4::PAE,
+                Efer::LMA,
+                0x0,
+                AccessKind::Write,
+            )
+            .unwrap(),
+            0x5000
+        );
+    }
+
+    #[test]
+    fn user_access_to_supervisor_page_faults() {
+        let mut memory = Memory::new(16).unwrap();
+        for (address, target) in [(0x0000, 0x1000), (0x1000, 0x2000), (0x2000, 0x3000)] {
+            memory
+                .write_u64(address, target | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER)
+                .unwrap();
+        }
+        // The leaf omits PAGE_USER, so ring 3 must fault while ring 0 passes.
+        memory
+            .write_u64(0x3000, 0x5000 | PAGE_PRESENT | PAGE_WRITABLE)
+            .unwrap();
+        let walked = walk(&memory, 0, Cr4::PAE, Efer::LMA, 0).unwrap();
+        assert!(!walked.user);
+        let fault = check_access(
+            &walked,
+            0,
+            AccessKind::Read,
+            3,
+            Cr0::PG | Cr0::WP,
+            Cr4::PAE,
+            Efer::LMA,
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(
+            fault.error_code & (FAULT_PRESENT | FAULT_USER),
+            FAULT_PRESENT | FAULT_USER
+        );
+        assert!(
+            check_access(
+                &walked,
+                0,
+                AccessKind::Read,
+                0,
+                Cr0::PG | Cr0::WP,
+                Cr4::PAE,
+                Efer::LMA,
+                false,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_not_present_fault_keeps_the_access_bits() {
+        let memory = Memory::new(16).unwrap();
+        let fault = walk(&memory, 0, Cr4::PAE, Efer::LMA, 0x1000).unwrap_err();
+        assert_eq!(fault.error_code, 0);
+        let annotated = with_access_bits(fault, AccessKind::Write, 3);
+        assert_eq!(annotated.error_code & FAULT_PRESENT, 0);
+        assert_eq!(annotated.error_code & FAULT_WRITE, FAULT_WRITE);
+        assert_eq!(annotated.error_code & FAULT_USER, FAULT_USER);
+    }
+
+    #[test]
+    fn permissions_narrow_across_levels() {
+        let mut memory = Memory::new(16).unwrap();
+        // The PML4 entry is user-accessible but read-only, so the writable
+        // leaf below it must not grant write access.
+        memory
+            .write_u64(0x0000, 0x1000 | PAGE_PRESENT | PAGE_USER)
+            .unwrap();
+        for (address, target) in [(0x1000, 0x2000), (0x2000, 0x3000)] {
+            memory
+                .write_u64(address, target | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER)
+                .unwrap();
+        }
+        memory
+            .write_u64(0x3000, 0x5000 | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER)
+            .unwrap();
+        let walked = walk(&memory, 0, Cr4::PAE, Efer::LMA, 0).unwrap();
+        assert!(!walked.writable);
+        assert!(walked.user);
     }
 
     #[test]

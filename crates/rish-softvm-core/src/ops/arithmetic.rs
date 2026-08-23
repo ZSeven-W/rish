@@ -105,6 +105,15 @@ pub fn mul_div(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError>
     }
 }
 
+/// All-ones mask for the given width.
+fn mask_for(bits: u32) -> u64 {
+    if bits >= 64 {
+        u64::MAX
+    } else {
+        (1_u64 << bits) - 1
+    }
+}
+
 fn mul(cpu: &mut Cpu, instruction: &Instruction, signed: bool) -> Result<(), CpuError> {
     let size = operand_size(instruction, 0);
     let multiplicand = read_operand0(cpu, instruction)?;
@@ -115,21 +124,34 @@ fn mul(cpu: &mut Cpu, instruction: &Instruction, signed: bool) -> Result<(), Cpu
         _ => read_register(&cpu.regs, Register::RAX, 8),
     };
     let product: u128 = if signed {
-        (sign_extend(accumulator, size) as i128 * sign_extend(multiplicand, size) as i128) as u128
+        (sign_extend(accumulator, size) as i128)
+            .wrapping_mul(sign_extend(multiplicand, size) as i128) as u128
     } else {
-        (accumulator as u128) * (multiplicand as u128)
+        u128::from(accumulator).wrapping_mul(u128::from(multiplicand))
     };
     let bits = u32::from(size) * 8;
-    let full_mask = (1_u128 << (bits * 2)) - 1;
+    // A 64-bit multiply fills the whole 128-bit product, and `1 << 128` is
+    // not representable: build the mask by shifting down instead of up.
+    let full_mask = u128::MAX >> (128 - bits * 2);
     let product = product & full_mask;
     let high = (product >> bits) as u64;
     let low = product as u64;
+    // MUL reports a non-zero upper half. IMUL reports an upper half that is
+    // not the sign extension of the lower half, so a negative result that
+    // fits leaves both flags clear.
+    let overflow = if signed {
+        let low_bits = u32::from(size) * 8;
+        let sign_extension = ((low as i64) >> (low_bits - 1)) as u64 & mask_for(low_bits);
+        (high & mask_for(low_bits)) != sign_extension
+    } else {
+        high != 0
+    };
     cpu.regs
         .rflags
-        .set(crate::arch::registers::RFlags::CF, high != 0);
+        .set(crate::arch::registers::RFlags::CF, overflow);
     cpu.regs
         .rflags
-        .set(crate::arch::registers::RFlags::OF, high != 0);
+        .set(crate::arch::registers::RFlags::OF, overflow);
     match size {
         1 => {
             write_register(&mut cpu.regs, Register::AX, 2, product as u64);
@@ -293,7 +315,7 @@ fn sign_extend128(value: u128, bits: u32) -> i128 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arch::registers::RFlags;
+    use crate::arch::registers::{RFlags, index};
 
     fn cpu() -> Cpu {
         Cpu::new(1, 0).unwrap()
@@ -494,5 +516,65 @@ mod tests {
             cpu.regs.gpr(crate::arch::registers::index::RDX) & 0xFFFF_FFFF,
             0
         );
+    }
+    #[test]
+    fn a_64_bit_multiply_keeps_the_full_product() {
+        // The 128-bit product mask must not be built as `1 << 128`.
+        let mut cpu = cpu();
+        cpu.regs.set_gpr(index::RAX, 1);
+        cpu.regs.set_gpr(index::RSI, 0x20);
+        // mul rsi
+        run(&mut cpu, 64, &[0x48, 0xF7, 0xE6]).unwrap();
+        assert_eq!(cpu.regs.gpr(index::RAX), 0x20);
+        assert_eq!(cpu.regs.gpr(index::RDX), 0);
+        assert!(!cpu.regs.rflags.contains(RFlags::CF));
+    }
+
+    #[test]
+    fn a_64_bit_multiply_reports_the_high_half() {
+        let mut cpu = cpu();
+        cpu.regs.set_gpr(index::RAX, u64::MAX);
+        cpu.regs.set_gpr(index::RSI, 2);
+        run(&mut cpu, 64, &[0x48, 0xF7, 0xE6]).unwrap();
+        assert_eq!(cpu.regs.gpr(index::RAX), 0xFFFF_FFFF_FFFF_FFFE);
+        assert_eq!(cpu.regs.gpr(index::RDX), 1);
+        assert!(cpu.regs.rflags.contains(RFlags::CF));
+        assert!(cpu.regs.rflags.contains(RFlags::OF));
+    }
+
+    #[test]
+    fn a_signed_multiply_that_fits_leaves_carry_clear() {
+        // imul with a negative result sign-extends into RDX, which is not an
+        // overflow even though the upper half is non-zero.
+        let mut cpu = cpu();
+        cpu.regs.set_gpr(index::RAX, (-3_i64) as u64);
+        cpu.regs.set_gpr(index::RSI, 5);
+        // imul rsi
+        run(&mut cpu, 64, &[0x48, 0xF7, 0xEE]).unwrap();
+        assert_eq!(cpu.regs.gpr(index::RAX), (-15_i64) as u64);
+        assert_eq!(cpu.regs.gpr(index::RDX), u64::MAX);
+        assert!(!cpu.regs.rflags.contains(RFlags::CF));
+        assert!(!cpu.regs.rflags.contains(RFlags::OF));
+    }
+
+    #[test]
+    fn a_signed_multiply_that_overflows_sets_carry() {
+        let mut cpu = cpu();
+        cpu.regs.set_gpr(index::RAX, 1 << 62);
+        cpu.regs.set_gpr(index::RSI, 4);
+        run(&mut cpu, 64, &[0x48, 0xF7, 0xEE]).unwrap();
+        assert!(cpu.regs.rflags.contains(RFlags::CF));
+        assert!(cpu.regs.rflags.contains(RFlags::OF));
+    }
+
+    #[test]
+    fn a_32_bit_multiply_still_splits_into_eax_and_edx() {
+        let mut cpu = cpu();
+        cpu.regs.set_gpr(index::RAX, 0x1_0000);
+        cpu.regs.set_gpr(index::RSI, 0x1_0000);
+        // mul esi
+        run(&mut cpu, 64, &[0xF7, 0xE6]).unwrap();
+        assert_eq!(cpu.regs.gpr(index::RAX), 0);
+        assert_eq!(cpu.regs.gpr(index::RDX), 1);
     }
 }

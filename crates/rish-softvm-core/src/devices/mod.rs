@@ -1,12 +1,15 @@
 //! Chipset devices: serial ports, interrupt controllers, timers.
 
+pub mod acpi_pm;
 pub mod cmos;
+pub mod ioapic;
 pub mod lapic;
 pub mod pic8259;
 pub mod pit8254;
 pub mod uart16550;
 
 pub use cmos::Cmos;
+pub use ioapic::IoApic;
 pub use pic8259::Pic8259;
 pub use pit8254::Pit8254;
 pub use uart16550::Uart16550;

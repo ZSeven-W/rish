@@ -476,7 +476,7 @@ pub fn bootstrap_agent() -> GuestAgent<NativeOperationHandler> {
             max_port_forwards: 0,
             max_stream_chunk_size: execution_config.max_stream_chunk_size,
         },
-        format!("bootstrap-{}", std::process::id()),
+        "bootstrap-session".to_owned(),
     )
 }
 

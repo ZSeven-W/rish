@@ -14,7 +14,9 @@ pub const CMDLINE_BASE: u64 = 0x20000;
 pub const STACK_BASE: u64 = 0x90000;
 pub const KERNEL_BASE: u64 = 0x100000;
 pub const KERNEL_ENTRY_OFFSET: u64 = 0x200;
-pub const INITRD_BASE: u64 = 0x1000_0000;
+/// Lowest address the initramfs may be placed at: above the kernel image and
+/// the region it decompresses into.
+pub const INITRD_FLOOR: u64 = 0x1000_0000;
 pub const GDT_BASE: u64 = 0x40000;
 pub const PML4_BASE: u64 = 0x50000;
 
@@ -26,6 +28,19 @@ const LOADFLAG_KEEP_SEGMENTS: u8 = 0x40;
 const LOADFLAG_CAN_USE_HEAP: u8 = 0x80;
 
 const CR0_LONG_MODE: u64 = 0x8000_0033; // PE | MP | ET | NE | WP | PG
+
+/// E820 entry types.
+pub const E820_RAM: u32 = 1;
+pub const E820_RESERVED: u32 = 2;
+pub const E820_ACPI_TABLES: u32 = 3;
+
+/// Zero-page E820 table offset and the number of entries it holds.
+const E820_TABLE_OFFSET: u64 = 0x2D0;
+const E820_MAX_ENTRIES_ZEROPAGE: usize = 128;
+
+/// Bytes reserved at the top of RAM for the firmware tables the machine
+/// publishes (RSDP copy, XSDT, FADT, DSDT, MADT).
+pub const ACPI_RESERVED_BYTES: u64 = 128 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct BootParams {
@@ -74,15 +89,18 @@ pub fn load(
     cmdline.push(0);
     cpu.memory.write(CMDLINE_BASE, &cmdline)?;
 
+    // The initramfs goes as high in RAM as the kernel allows, the way a real
+    // bootloader places it. A large image placed at a fixed low address would
+    // overlap the region the kernel decompresses itself into.
+    let ram_end = (params.memory_mib as u64) * 1024 * 1024;
     let (initrd_image, initrd_size) = match initramfs {
-        Some(bytes) if !bytes.is_empty() => (INITRD_BASE, bytes.len() as u32),
+        Some(bytes) if !bytes.is_empty() => {
+            let base = initrd_placement(&header, kernel_base, ram_end, bytes.len() as u64)?;
+            cpu.memory.write(base, bytes)?;
+            (base, bytes.len() as u32)
+        }
         _ => (0, 0),
     };
-    if let Some(bytes) = initramfs {
-        if !bytes.is_empty() {
-            cpu.memory.write(INITRD_BASE, bytes)?;
-        }
-    }
 
     // Runtime boot_params fields, at their absolute offsets in the zero
     // page (boot.rst offsets are relative to the start of boot_params).
@@ -91,6 +109,10 @@ pub fn load(
     write_u8(cpu, ZERO_PAGE_BASE + 0x211, loadflags)?;
     write_u32(cpu, ZERO_PAGE_BASE + 0x218, initrd_image as u32)?; // ramdisk_image
     write_u32(cpu, ZERO_PAGE_BASE + 0x21C, initrd_size)?; // ramdisk_size
+    // ext_ramdisk_image / ext_ramdisk_size carry bits 63:32 for an initramfs
+    // placed above 4 GiB.
+    write_u32(cpu, ZERO_PAGE_BASE + 0x0C0, (initrd_image >> 32) as u32)?;
+    write_u32(cpu, ZERO_PAGE_BASE + 0x0C4, 0)?;
     write_u16(cpu, ZERO_PAGE_BASE + 0x224, 0xFE00)?; // heap_end_ptr + ext_loader_ver
     write_u32(cpu, ZERO_PAGE_BASE + 0x228, CMDLINE_BASE as u32)?; // cmd_line_ptr
     let alt_mem_k = (params.memory_mib as u64)
@@ -98,24 +120,84 @@ pub fn load(
         .saturating_sub(1024);
     write_u32(cpu, ZERO_PAGE_BASE + 0x1E0, alt_mem_k as u32)?; // alt_mem_k
 
-    // E820 memory map.
-    let ram_end = (params.memory_mib as u64) * 1024 * 1024;
-    let entries: [(u64, u64, u32); 4] = [
-        (0x0000_0000, 0x0009_FC00, 1),
-        (0x0009_FC00, 0x0000_0400, 2),
-        (0x000F_0000, 0x0001_0000, 2),
-        (0x0010_0000, ram_end - 0x0010_0000, 1),
+    write_e820_map(cpu, ram_end)?;
+    install_acpi_tables(cpu, ram_end)?;
+
+    enter_long_mode(cpu, params.memory_mib, kernel_base)?;
+    Ok(())
+}
+
+/// Builds and installs the ACPI tables in the reserved top-of-RAM window and
+/// announces the RSDP through `boot_params.acpi_rsdp_addr` plus a copy in the
+/// legacy BIOS scan area.
+fn install_acpi_tables(cpu: &mut Cpu, ram_end: u64) -> Result<(), CpuError> {
+    let base = ram_end.saturating_sub(ACPI_RESERVED_BYTES);
+    let tables = crate::boot::acpi::build(base);
+    if tables.blob.len() as u64 > ACPI_RESERVED_BYTES {
+        return Err(CpuError::InvalidConfig(
+            "ACPI tables exceed the reserved window".to_owned(),
+        ));
+    }
+    cpu.memory.write(tables.blob_address, &tables.blob)?;
+    cpu.memory
+        .write(crate::boot::acpi::RSDP_BIOS_AREA, &tables.rsdp_copy)?;
+    // boot_params.acpi_rsdp_addr, boot protocol 2.14+.
+    write_u64(cpu, ZERO_PAGE_BASE + 0x070, tables.rsdp_address)?;
+    Ok(())
+}
+
+/// Writes the E820 memory map into the zero page.
+///
+/// The entry count is a single byte at offset 0x1e8 and the table starts at
+/// 0x2d0; writing the count into the table itself makes the kernel fall back
+/// to the much coarser e801 map.
+fn write_e820_map(cpu: &mut Cpu, ram_end: u64) -> Result<(), CpuError> {
+    // Low memory below the EBDA, the EBDA itself, the BIOS area, then all
+    // RAM above 1 MiB with the top 128 KiB reserved for firmware tables.
+    let table_base = ram_end.saturating_sub(ACPI_RESERVED_BYTES);
+    let entries: [(u64, u64, u32); 5] = [
+        (0x0000_0000, 0x0009_FC00, E820_RAM),
+        (0x0009_FC00, 0x0000_0400, E820_RESERVED),
+        (0x000F_0000, 0x0001_0000, E820_RESERVED),
+        (0x0010_0000, table_base - 0x0010_0000, E820_RAM),
+        (table_base, ACPI_RESERVED_BYTES, E820_ACPI_TABLES),
     ];
-    write_u32(cpu, ZERO_PAGE_BASE + 0x2D0, entries.len() as u32)?;
+    if entries.len() > E820_MAX_ENTRIES_ZEROPAGE {
+        return Err(CpuError::InvalidConfig(
+            "E820 map does not fit in the zero page".to_owned(),
+        ));
+    }
+    write_u8(cpu, ZERO_PAGE_BASE + 0x1E8, entries.len() as u8)?;
     for (index, (base, size, kind)) in entries.iter().enumerate() {
-        let address = ZERO_PAGE_BASE + 0x2D4 + (index as u64) * 20;
+        let address = ZERO_PAGE_BASE + E820_TABLE_OFFSET + (index as u64) * 20;
         write_u64(cpu, address, *base)?;
         write_u64(cpu, address + 8, *size)?;
         write_u32(cpu, address + 16, *kind)?;
     }
-
-    enter_long_mode(cpu, params.memory_mib, kernel_base)?;
     Ok(())
+}
+
+/// Chooses where the initramfs lives: as high as the kernel's
+/// `initrd_addr_max` and the installed RAM allow, page aligned, and never
+/// below the region the kernel decompresses itself into.
+fn initrd_placement(
+    header: &Header,
+    kernel_base: u64,
+    ram_end: u64,
+    size: u64,
+) -> Result<u64, CpuError> {
+    // Stay clear of the firmware table window reserved at the top of RAM.
+    let ceiling = ram_end
+        .saturating_sub(ACPI_RESERVED_BYTES)
+        .min(u64::from(header.initrd_addr_max).saturating_add(1));
+    let floor = INITRD_FLOOR.max(kernel_base + u64::from(header.init_size));
+    if ceiling < size || ceiling - size < floor {
+        return Err(CpuError::InvalidConfig(format!(
+            "initramfs of {size} bytes does not fit between {floor:#x} and {ceiling:#x}; \
+give the guest more memory"
+        )));
+    }
+    Ok((ceiling - size) & !0xFFF)
 }
 
 /// Builds the identity map and GDT and enters long mode at kernel_base+0x200.
@@ -275,6 +357,8 @@ pub struct Header {
     pub payload_offset: u32,
     pub payload_length: u32,
     pub pref_address: u64,
+    /// Highest address the initramfs may occupy, from setup header 0x22c.
+    pub initrd_addr_max: u32,
 }
 
 impl Header {
@@ -322,6 +406,12 @@ impl Header {
             init_size: read_u32(0x1F1 + 0x6F),
             payload_offset: read_u32(0x1F1 + 0x57),
             payload_length: read_u32(0x1F1 + 0x5B),
+            // Protocol 2.03 added initrd_addr_max; older kernels cap at 32 MiB.
+            initrd_addr_max: if version >= 0x0203 {
+                read_u32(0x1F1 + 0x3B)
+            } else {
+                0x37FF_FFFF
+            },
             pref_address: u64::from_le_bytes([
                 image[0x1F1 + 0x67],
                 image[0x1F1 + 0x68],
@@ -350,6 +440,8 @@ mod tests {
         image[0x1F1 + 0x43] = 1; // relocatable_kernel
         image[0x1F1 + 0x3F..0x1F1 + 0x43].copy_from_slice(&0x0020_0000_u32.to_le_bytes());
         image[0x1F1 + 0x6F..0x1F1 + 0x73].copy_from_slice(&0x0100_0000_u32.to_le_bytes());
+        // initrd_addr_max
+        image[0x1F1 + 0x3B..0x1F1 + 0x3F].copy_from_slice(&0x7FFF_FFFF_u32.to_le_bytes());
         // payload_offset and payload_length point past the setup section.
         image[0x1F1 + 0x57..0x1F1 + 0x5B].copy_from_slice(&0x600_u32.to_le_bytes());
         image[0x1F1 + 0x5B..0x1F1 + 0x5F].copy_from_slice(&0x300_u32.to_le_bytes());
@@ -410,26 +502,38 @@ mod tests {
             0xE9
         );
         assert_eq!(cpu.memory.read_u8(KERNEL_BASE).unwrap(), image[0x600]);
-        // Initramfs copied to 256 MiB.
-        assert_eq!(cpu.memory.read_u8(INITRD_BASE).unwrap(), 0xAB);
+        // Initramfs placed at the top of RAM, page aligned.
+        let ramdisk = u64::from(cpu.memory.read_u32(ZERO_PAGE_BASE + 0x218).unwrap());
+        assert_eq!(
+            ramdisk,
+            (512 * 1024 * 1024 - ACPI_RESERVED_BYTES - 16) & !0xFFF
+        );
+        assert_eq!(cpu.memory.read_u8(ramdisk).unwrap(), 0xAB);
         // Runtime boot_params fields at their absolute zero-page offsets.
         assert_eq!(cpu.memory.read_u8(ZERO_PAGE_BASE + 0x210).unwrap(), 0xFF);
         assert_eq!(
             cpu.memory.read_u32(ZERO_PAGE_BASE + 0x228).unwrap(),
             CMDLINE_BASE as u32
         );
-        assert_eq!(
-            cpu.memory.read_u32(ZERO_PAGE_BASE + 0x218).unwrap(),
-            INITRD_BASE as u32
-        );
         assert_eq!(cpu.memory.read_u32(ZERO_PAGE_BASE + 0x21C).unwrap(), 16);
-        // E820 count and first entry.
-        assert_eq!(cpu.memory.read_u32(ZERO_PAGE_BASE + 0x2D0).unwrap(), 4);
-        assert_eq!(cpu.memory.read_u64(ZERO_PAGE_BASE + 0x2D4).unwrap(), 0);
+        // E820 count is a byte at 0x1e8; the table itself starts at 0x2d0.
+        assert_eq!(cpu.memory.read_u8(ZERO_PAGE_BASE + 0x1E8).unwrap(), 5);
+        assert_eq!(cpu.memory.read_u64(ZERO_PAGE_BASE + 0x2D0).unwrap(), 0);
         assert_eq!(
-            cpu.memory.read_u64(ZERO_PAGE_BASE + 0x2DC).unwrap(),
+            cpu.memory.read_u64(ZERO_PAGE_BASE + 0x2D8).unwrap(),
             0x9FC00
         );
+        assert_eq!(
+            cpu.memory.read_u32(ZERO_PAGE_BASE + 0x2E0).unwrap(),
+            E820_RAM
+        );
+        // The last entry reserves the firmware table window at the top of RAM.
+        let last = ZERO_PAGE_BASE + 0x2D0 + 4 * 20;
+        assert_eq!(
+            cpu.memory.read_u64(last).unwrap(),
+            512 * 1024 * 1024 - ACPI_RESERVED_BYTES
+        );
+        assert_eq!(cpu.memory.read_u32(last + 16).unwrap(), E820_ACPI_TABLES);
         // CPU state: long mode, paging, boot segments, entry point.
         assert_eq!(cpu.regs.mode(), crate::arch::registers::CpuMode::Long);
         assert!(cpu.regs.cr0.contains(Cr0::PG));
@@ -461,9 +565,9 @@ mod tests {
             KERNEL_BASE
         );
         assert_eq!(
-            cpu.translate(INITRD_BASE, crate::arch::paging::AccessKind::Read)
+            cpu.translate(INITRD_FLOOR, crate::arch::paging::AccessKind::Read)
                 .unwrap(),
-            INITRD_BASE
+            INITRD_FLOOR
         );
     }
 }

@@ -8,6 +8,7 @@ pub mod sse;
 pub mod stack;
 pub mod string;
 pub mod system;
+pub mod x87;
 
 use iced_x86::{Instruction, OpKind, Register};
 
@@ -15,46 +16,14 @@ use crate::arch::registers::{RFlags, Registers};
 use crate::cpu::register_index;
 
 /// Reads a register operand at the natural width as a zero-extended u64.
+#[inline]
 pub fn read_register(regs: &Registers, register: Register, size: u8) -> u64 {
-    let index = register_index(register);
-    let value = regs.gpr(index);
+    let value = regs.gpr(register_index(register));
+    // The only sub-register whose bits are not the low `size` bytes is a legacy
+    // high byte (AH/CH/DH/BH); every other width is the low 1/2/4/8 bytes, and
+    // `size` already carries that width, so a single mask covers them all.
     match register {
-        Register::AH => (value >> 8) & 0xFF,
-        Register::CH => (value >> 8) & 0xFF,
-        Register::DH => (value >> 8) & 0xFF,
-        Register::BH => (value >> 8) & 0xFF,
-        Register::AL
-        | Register::CL
-        | Register::DL
-        | Register::BL
-        | Register::R8L
-        | Register::R9L
-        | Register::R10L
-        | Register::R11L
-        | Register::R12L
-        | Register::R13L
-        | Register::R14L
-        | Register::R15L
-        | Register::SPL
-        | Register::BPL
-        | Register::SIL
-        | Register::DIL => value & 0xFF,
-        Register::AX
-        | Register::CX
-        | Register::DX
-        | Register::BX
-        | Register::SP
-        | Register::BP
-        | Register::SI
-        | Register::DI
-        | Register::R8W
-        | Register::R9W
-        | Register::R10W
-        | Register::R11W
-        | Register::R12W
-        | Register::R13W
-        | Register::R14W
-        | Register::R15W => value & 0xFFFF,
+        Register::AH | Register::CH | Register::DH | Register::BH => (value >> 8) & 0xFF,
         _ => match size {
             1 => value & 0xFF,
             2 => value & 0xFFFF,
@@ -65,61 +34,17 @@ pub fn read_register(regs: &Registers, register: Register, size: u8) -> u64 {
 }
 
 /// Writes a register operand at the natural width, preserving other bits.
+#[inline]
 pub fn write_register(regs: &mut Registers, register: Register, size: u8, value: u64) {
     let index = register_index(register);
     let old = regs.gpr(index);
-    let value = match register {
+    // Mirrors read_register: a legacy high byte patches bits 8..16, and every
+    // other width is governed by `size` — 8/16-bit writes preserve the upper
+    // bits while a 32-bit write zeroes the whole upper half, per x86-64.
+    let new = match register {
         Register::AH | Register::CH | Register::DH | Register::BH => {
             (old & !0xFF00) | ((value & 0xFF) << 8)
         }
-        Register::AL
-        | Register::CL
-        | Register::DL
-        | Register::BL
-        | Register::R8L
-        | Register::R9L
-        | Register::R10L
-        | Register::R11L
-        | Register::R12L
-        | Register::R13L
-        | Register::R14L
-        | Register::R15L
-        | Register::SPL
-        | Register::BPL
-        | Register::SIL
-        | Register::DIL => (old & !0xFF) | (value & 0xFF),
-        Register::AX
-        | Register::CX
-        | Register::DX
-        | Register::BX
-        | Register::SP
-        | Register::BP
-        | Register::SI
-        | Register::DI
-        | Register::R8W
-        | Register::R9W
-        | Register::R10W
-        | Register::R11W
-        | Register::R12W
-        | Register::R13W
-        | Register::R14W
-        | Register::R15W => (old & !0xFFFF) | (value & 0xFFFF),
-        Register::EAX
-        | Register::ECX
-        | Register::EDX
-        | Register::EBX
-        | Register::ESP
-        | Register::EBP
-        | Register::ESI
-        | Register::EDI
-        | Register::R8D
-        | Register::R9D
-        | Register::R10D
-        | Register::R11D
-        | Register::R12D
-        | Register::R13D
-        | Register::R14D
-        | Register::R15D => value & 0xFFFF_FFFF,
         _ => match size {
             1 => (old & !0xFF) | (value & 0xFF),
             2 => (old & !0xFFFF) | (value & 0xFFFF),
@@ -127,7 +52,7 @@ pub fn write_register(regs: &mut Registers, register: Register, size: u8, value:
             _ => value,
         },
     };
-    regs.set_gpr(index, value);
+    regs.set_gpr(index, new);
 }
 
 /// Operand size in bytes for the instruction's natural width.

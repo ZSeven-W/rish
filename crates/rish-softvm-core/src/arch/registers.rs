@@ -226,6 +226,20 @@ impl Registers {
         }
     }
 
+    /// Current privilege level.
+    ///
+    /// Outside protected mode the CPU always runs at ring 0; inside it, CPL is
+    /// the RPL of the code-segment selector, which every control transfer
+    /// keeps up to date.
+    #[inline]
+    #[must_use]
+    pub fn cpl(&self) -> u8 {
+        match self.mode() {
+            CpuMode::Real => 0,
+            _ => self.cs.selector.rpl(),
+        }
+    }
+
     /// Effective code segment base for the current mode.
     #[inline]
     #[must_use]

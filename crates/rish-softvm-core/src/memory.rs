@@ -7,14 +7,26 @@ use std::{
 };
 
 use crate::CpuError;
+use crate::devices::ioapic::{IOAPIC_BASE, IOAPIC_SIZE, IoApic};
 use crate::devices::lapic::{LAPIC_BASE, LAPIC_SIZE, LocalApic};
 
 pub struct Memory {
     ram: Box<[u8]>,
     lapic: Option<RefCell<LocalApic>>,
+    ioapic: RefCell<IoApic>,
     /// Bumped on every write so translation caches can invalidate cheaply.
     generation: u64,
+    /// Per-4KiB-page write counter. A decode-cache entry records the page's
+    /// counter at decode time and re-validates against it on a hit, so a hit
+    /// costs a single load instead of re-reading and comparing the instruction
+    /// bytes. Any write (including code patched through a writable alias, since
+    /// this is keyed on the physical page) bumps the counter and invalidates
+    /// the cached decode without an explicit flush.
+    code_gen: Box<[u32]>,
 }
+
+/// Guest physical page size.
+const PAGE_SIZE: u64 = 4096;
 
 impl Memory {
     pub fn new(megabytes: usize) -> Result<Self, CpuError> {
@@ -26,11 +38,37 @@ impl Memory {
         let bytes = megabytes
             .checked_mul(1024 * 1024)
             .ok_or_else(|| CpuError::InvalidConfig("guest memory size overflow".to_owned()))?;
+        let pages = bytes.div_ceil(PAGE_SIZE as usize);
         Ok(Self {
             ram: vec![0; bytes].into_boxed_slice(),
             lapic: None,
+            ioapic: RefCell::new(IoApic::new()),
             generation: 0,
+            code_gen: vec![0_u32; pages].into_boxed_slice(),
         })
+    }
+
+    /// Write counter for the 4KiB page containing `physical`, used by the
+    /// decode cache to validate a hit without re-reading the bytes. Addresses
+    /// outside RAM (memory-mapped devices) never hold cached code, so they map
+    /// to a stable zero.
+    #[inline]
+    #[must_use]
+    pub fn page_generation(&self, physical: u64) -> u32 {
+        let page = (physical / PAGE_SIZE) as usize;
+        self.code_gen.get(page).copied().unwrap_or(0)
+    }
+
+    /// Bumps the per-page write counters for every page the range touches.
+    #[inline]
+    fn bump_code_gen(&mut self, start: usize, len: usize) {
+        let first = start / PAGE_SIZE as usize;
+        let last = (start + len - 1) / PAGE_SIZE as usize;
+        for page in first..=last {
+            if let Some(counter) = self.code_gen.get_mut(page) {
+                *counter = counter.wrapping_add(1);
+            }
+        }
     }
 
     /// Write generation, for translation-cache invalidation.
@@ -56,9 +94,10 @@ impl Memory {
         self.lapic = Some(RefCell::new(LocalApic::new(queue)));
     }
 
-    pub fn lapic_tick(&self) {
+    /// Advances the local APIC timer by a batch of guest instructions.
+    pub fn lapic_tick(&self, instructions: u32) {
         if let Some(lapic) = &self.lapic {
-            lapic.borrow_mut().tick();
+            lapic.borrow_mut().tick(instructions);
         }
     }
 
@@ -66,8 +105,54 @@ impl Memory {
         (LAPIC_BASE..LAPIC_BASE + LAPIC_SIZE).contains(&address)
     }
 
+    fn in_ioapic(address: u64) -> bool {
+        (IOAPIC_BASE..IOAPIC_BASE + IOAPIC_SIZE).contains(&address)
+    }
+
+    /// Applies interrupt line levels to the I/O APIC and forwards any fired
+    /// vectors to the local APIC.
+    pub fn ioapic_set_lines(&self, lines: u32) {
+        let fired = self.ioapic.borrow_mut().set_lines(lines);
+        self.forward_to_lapic(&fired);
+    }
+
+    /// Delivers a one-shot edge on an I/O APIC pin (rising then falling).
+    pub fn ioapic_pulse(&self, pin: u8, levels: u32) {
+        let bit = 1_u32 << pin;
+        let fired = {
+            let mut ioapic = self.ioapic.borrow_mut();
+            let fired = ioapic.set_lines(levels | bit);
+            ioapic.set_lines(levels & !bit);
+            fired
+        };
+        self.forward_to_lapic(&fired);
+    }
+
+    fn forward_to_lapic(&self, vectors: &[u8]) {
+        if vectors.is_empty() {
+            return;
+        }
+        if let Some(lapic) = &self.lapic {
+            let mut lapic = lapic.borrow_mut();
+            for vector in vectors {
+                lapic.request(*vector);
+            }
+        }
+    }
+
     #[inline]
     pub fn read(&self, address: u64, output: &mut [u8]) -> Result<(), CpuError> {
+        if Self::in_ioapic(address) {
+            let offset = address - IOAPIC_BASE;
+            let value = self.ioapic.borrow_mut().read(offset, output.len() as u8);
+            let bytes = value.to_le_bytes();
+            let count = output.len().min(4);
+            output[..count].copy_from_slice(&bytes[..count]);
+            for slot in output.iter_mut().skip(4) {
+                *slot = 0;
+            }
+            return Ok(());
+        }
         if Self::in_lapic(address) {
             if let Some(lapic) = &self.lapic {
                 let offset = address - LAPIC_BASE;
@@ -86,11 +171,9 @@ impl Memory {
                 return Ok(());
             }
         }
-        let end = address
-            .checked_add(output.len() as u64)
-            .ok_or(CpuError::GuestFault(format!(
-                "memory read address overflow at {address:#x}"
-            )))?;
+        let end = address.checked_add(output.len() as u64).ok_or_else(|| {
+            CpuError::GuestFault(format!("memory read address overflow at {address:#x}"))
+        })?;
         if end > self.ram.len() as u64 {
             return Err(CpuError::GuestFault(format!(
                 "memory read {address:#x}..{end:#x} exceeds {} bytes",
@@ -104,26 +187,36 @@ impl Memory {
 
     #[inline]
     pub fn write(&mut self, address: u64, input: &[u8]) -> Result<(), CpuError> {
+        if Self::in_ioapic(address) {
+            let offset = address - IOAPIC_BASE;
+            let mut buffer = [0_u8; 4];
+            let count = input.len().min(4);
+            buffer[..count].copy_from_slice(&input[..count]);
+            self.ioapic
+                .borrow_mut()
+                .write(offset, input.len() as u8, u32::from_le_bytes(buffer));
+            return Ok(());
+        }
         if Self::in_lapic(address) {
             if let Some(lapic) = &self.lapic {
                 let offset = address - LAPIC_BASE;
-                if input.len() == 4 {
-                    let value = u32::from_le_bytes([input[0], input[1], input[2], input[3]]);
-                    lapic.borrow_mut().write(offset, 4, value);
-                } else {
-                    let mut buffer = [0_u8; 4];
-                    buffer[..input.len().min(4)].copy_from_slice(&input[..input.len().min(4)]);
-                    let value = u32::from_le_bytes(buffer);
-                    lapic.borrow_mut().write(offset, input.len() as u8, value);
+                let mut buffer = [0_u8; 4];
+                let count = input.len().min(4);
+                buffer[..count].copy_from_slice(&input[..count]);
+                let value = u32::from_le_bytes(buffer);
+                let retired = lapic.borrow_mut().write(offset, input.len() as u8, value);
+                // A retiring level-triggered vector may refire immediately if
+                // its line is still asserted at the I/O APIC.
+                if let Some(vector) = retired {
+                    let refired = self.ioapic.borrow_mut().end_of_interrupt(vector);
+                    self.forward_to_lapic(&refired);
                 }
                 return Ok(());
             }
         }
-        let end = address
-            .checked_add(input.len() as u64)
-            .ok_or(CpuError::GuestFault(format!(
-                "memory write address overflow at {address:#x}"
-            )))?;
+        let end = address.checked_add(input.len() as u64).ok_or_else(|| {
+            CpuError::GuestFault(format!("memory write address overflow at {address:#x}"))
+        })?;
         if end > self.ram.len() as u64 {
             return Err(CpuError::GuestFault(format!(
                 "memory write {address:#x}..{end:#x} exceeds {} bytes",
@@ -133,6 +226,7 @@ impl Memory {
         let start = address as usize;
         self.ram[start..start + input.len()].copy_from_slice(input);
         self.generation = self.generation.wrapping_add(1);
+        self.bump_code_gen(start, input.len());
         Ok(())
     }
 

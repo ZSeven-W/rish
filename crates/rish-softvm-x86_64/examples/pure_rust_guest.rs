@@ -177,7 +177,9 @@ fn run() -> Result<(), String> {
         root_disk_path: options.root_disk.to_string_lossy().into_owned(),
         acceleration: VmAcceleration::Interpreter,
         devices: vec![VmDevice::Console],
-        command_line: String::new(), // engine default: pinned docker guest cmdline
+        // Diagnostic override: keep the pinned guest cmdline but let the LAPIC
+        // timer run so the multi-threaded guest agent gets scheduler ticks.
+        command_line: std::env::var("RISH_GUEST_CMDLINE").unwrap_or_default(),
     };
 
     // Stage 1: boot until the init script reports on the console.
@@ -185,13 +187,16 @@ fn run() -> Result<(), String> {
     let started = Instant::now();
     let mut executed = 0_u64;
     let mut console = Vec::new();
+    let mut printed = 0_usize;
     loop {
         let report = machine
             .run_units(500_000)
             .map_err(|error| error.to_string())?;
         executed += report.executed_units;
         console.extend_from_slice(&report.console);
-        print_console(&mut console);
+        // Print only the newly arrived bytes; keep the full buffer so the boot
+        // marker is still detectable even when it spans two run chunks.
+        print_console(&console, &mut printed);
         if contains(&console, BOOT_FAILED_MARKER) {
             return Err("guest init reported RISH_X86_64_BOOT_FAILED".to_owned());
         }
@@ -222,6 +227,52 @@ fn run() -> Result<(), String> {
     // the already-booted machine (no second boot).
     let channel =
         SerialGuestTransport::new(machine, limits.clone()).map_err(|error| error.to_string())?;
+
+    // Diagnostic short path: bootstrap the control session and run the command
+    // directly, skipping the /proc/config.gz kernel-evidence gathering. Used to
+    // demonstrate the control channel end to end on a guest whose ikconfig data
+    // is not mounted. This is not the verified Full-VM profile.
+    if std::env::var_os("RISH_SKIP_EVIDENCE").is_some() {
+        use rish_guest_protocol::{
+            DEFAULT_MAX_FRAME_SIZE, Envelope, Hello, Message, PeerInfo, RequestId,
+        };
+        use rish_vm::GuestChannel;
+        let hello = Envelope::new(Message::Hello(Hello::host(
+            RequestId::new("vm-bootstrap-1").map_err(|error| error.to_string())?,
+            PeerInfo {
+                name: "rish-host".to_owned(),
+                version: env!("CARGO_PKG_VERSION").to_owned(),
+                platform: "linux".to_owned(),
+                architecture: "x86_64".to_owned(),
+            },
+            Vec::new(),
+            DEFAULT_MAX_FRAME_SIZE as u32,
+        )));
+        channel
+            .bootstrap(&hello)
+            .map_err(|error| error.to_string())?;
+        println!("[pure-rust-guest] control session bootstrapped (evidence skipped)");
+        if options.command.is_empty() {
+            return Ok(());
+        }
+        let command = rish_core::GuestCommand {
+            program: options.command[0].clone(),
+            args: options.command[1..].to_vec(),
+            env: Default::default(),
+            cwd: "/".to_owned(),
+            stdin: Vec::new(),
+        };
+        let reply = channel
+            .execute(&command)
+            .map_err(|error| error.to_string())?;
+        print!("{}", String::from_utf8_lossy(&reply.stdout));
+        eprint!("{}", String::from_utf8_lossy(&reply.stderr));
+        if reply.exit_code != 0 {
+            return Err(format!("guest command exited with {}", reply.exit_code));
+        }
+        return Ok(());
+    }
+
     let prebooted = PrebootedEngine {
         real: X86_64SoftwareEngine::new(Arc::new(PureRustProvider::new()), limits)
             .map_err(|error| error.to_string())?,
@@ -264,13 +315,13 @@ fn contains(buffer: &[u8], marker: &[u8]) -> bool {
     buffer.windows(marker.len()).any(|window| window == marker)
 }
 
-fn print_console(buffer: &mut Vec<u8>) {
-    if buffer.is_empty() {
+fn print_console(buffer: &[u8], printed: &mut usize) {
+    if *printed >= buffer.len() {
         return;
     }
-    let text = String::from_utf8_lossy(buffer);
+    let text = String::from_utf8_lossy(&buffer[*printed..]);
     print!("{text}");
     use std::io::Write as _;
     let _ = std::io::stdout().flush();
-    buffer.clear();
+    *printed = buffer.len();
 }
