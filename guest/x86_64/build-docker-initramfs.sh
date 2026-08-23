@@ -125,6 +125,9 @@ install -m 0755 "$agent" "$rootfs/usr/bin/rish-guest-agent"
 
 # 5. Docker guest overlay and supplementary group.
 cp -a "$script_dir/docker-overlay/." "$rootfs/"
+# PID 1 must be executable regardless of the checked-out mode of the overlay
+# source (git does not reliably preserve the executable bit on all hosts).
+chmod 0755 "$rootfs/init"
 echo "docker:x:100:" >> "$rootfs/etc/group"
 
 # 6. Deterministic newc pack.
