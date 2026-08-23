@@ -12,6 +12,7 @@ failures=0
 passes=0
 
 java_image=${RISH_JAVA_IMAGE:-eclipse-temurin:21-jdk-alpine}
+python_image=${RISH_PYTHON_IMAGE:-python:3.13-alpine}
 go_image=${RISH_GO_IMAGE:-golang:1.25-alpine}
 rust_image=${RISH_RUST_IMAGE:-rust:1-alpine}
 node_image=${RISH_NODE_IMAGE:-node:22-alpine}
@@ -64,6 +65,12 @@ java -version
 printf "%s\n" "public class Hello { public static void main(String[] args) { System.out.println(\"RISH_JAVA_OK \" + System.getProperty(\"os.arch\")); } }" > /tmp/Hello.java
 javac /tmp/Hello.java
 java -cp /tmp Hello
+'
+
+test_image python "$python_image" '
+python --version
+python -m pip --version
+python -c "import hashlib, json, platform, sqlite3, sys, zlib; values = json.loads(json.dumps([6, 7])); db = sqlite3.connect(\":memory:\"); db.execute(\"create table values_table (value integer)\"); db.executemany(\"insert into values_table values (?)\", [(value,) for value in values]); rows = db.execute(\"select value from values_table order by value\").fetchall(); answer = rows[0][0] * rows[1][0]; assert answer == 42; digest = hashlib.sha256(zlib.compress(b\"rish-python\")).hexdigest()[:12]; print(\"RISH_PYTHON_OK\", platform.machine(), sys.platform, answer, digest)"
 '
 
 test_image go "$go_image" '

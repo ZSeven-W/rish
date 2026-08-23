@@ -1,4 +1,4 @@
 # rish-x86-derived-v1
 # id	filename	size	sha256
 rish-alpine-diagnostic-initramfs	rish-alpine-3.24.1-x86_64-initramfs.cpio	8484864	a92bf96c76dee0850db6662843d39bc52fe97762b6074f28b05ed6e01bf8b488
-rish-alpine-docker-initramfs	rish-alpine-3.24.1-x86_64-docker-initramfs.cpio	285680128	023593f5af064054998e14d290eaea0072efcbc9d6fc68e58fab55876d4047e1
+rish-alpine-docker-initramfs	rish-alpine-3.24.1-x86_64-docker-initramfs.cpio	285680128	0b762ca4d0837b609d4a3f98c820a8a96bf37f210b55895718e7ed347a1c995b

@@ -116,6 +116,107 @@ bytes are re-read for tracing or fatal diagnostics instead of crossing every
 hot return path. LAPIC-to-CPU delivery stays in the owning interpreter thread,
 avoiding cross-thread synchronization at every interrupt-recognition boundary.
 
+## Container compatibility and startup benchmark
+
+The pinned Docker diagnostic guest passed real compile/execute checks for Java,
+Python, Go, Rust, Node.js, and Bun. The table records the exact cached
+`linux/amd64` image resolved on 2026-08-23, so the result can be reproduced
+without relying on a floating tag:
+
+| Runtime | Resolved image digest | Executed compatibility check |
+|---|---|---|
+| Java 21.0.12 | `eclipse-temurin@sha256:6ea5548706b60ac0a602eaf48af74792cbab012d90e811ca8db6184b16b5c3d6` | `javac` + `java` passed on `amd64` |
+| Python 3.13.15 | `python@sha256:540c7d91f98ff6880174c40e99067bf5941eb54d818a7a5e094d188b196a934d` | CPython + pip + JSON/hashlib/zlib/SQLite passed on `x86_64 linux` |
+| Go 1.25.14 | `golang@sha256:1ae0735f00daffa3aaf1363a5184c0d2dc55c78e3db4ec70241cdac97bf84b59` | `go run` passed on `linux/amd64` |
+| Rust 1.98.0 | `rust@sha256:a10e64dd139b7387337c7fbe8aca31b959b57b2fd4c8ae20a02cf1d6ea424dce` | `rustc` output executed successfully |
+| Node.js 22.23.2 | `node@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32` | Node + npm passed on `x64 linux` |
+| Bun 1.4.0 | `oven/bun@sha256:07235578f79ef8c6f97d94aee7938e76f5cdba5f21ae5dbfdd3d3d38058437eb` | `bun --version` + JavaScript passed with the QEMU Nehalem oracle |
+
+The official Bun 1.4.0 x64 Alpine baseline executable was also tested directly
+on the pure-software rish CPU. The 74,507,808-byte executable has SHA-256
+`805ecd8b91244de1c14d8d7e24841add8cb15c4eefffd17ce3d93cb87b3162ed`;
+`bun --version` returned `1.4.0`, and `bun -e` returned
+`RISH_BUN_OK x64 linux 42`. This is evidence for that tested Bun binary and
+execution path, not a claim that rish implements or advertises every SSE4.2
+instruction.
+
+### Cached-image timing
+
+The startup benchmark was host-timed on QEMU 11.1.0 TCG using a Nehalem CPU
+profile with `thread=single`, one vCPU, 4 GiB RAM, Linux 6.18.35, Docker 29.7.2,
+overlay2, and cgroup v2 with the `cgroupfs` driver. All six exact image digests
+were cached and no containers existed before the run. Each result below is
+P50 / P95 in milliseconds from ten measured samples after two warmups, with an
+unmeasured 100 ms settle interval between samples:
+
+| Runtime | Container lifecycle | Fresh minimal command | Same-container warm exec | P50 reduction |
+|---|---:|---:|---:|---:|
+| Java | 1006.5 / 1082.2 ms | 1360.2 / 1493.9 ms | 735.8 / 783.3 ms | 45.9% |
+| Python | 990.8 / 1053.0 ms | 1312.1 / 1361.8 ms | 553.8 / 606.1 ms | 57.8% |
+| Go | 987.5 / 1040.9 ms | 1013.4 / 1059.1 ms | 396.4 / 406.7 ms | 60.9% |
+| Rust | 981.9 / 1064.1 ms | 1269.1 / 1338.3 ms | 640.6 / 672.7 ms | 49.5% |
+| Node.js | 978.3 / 1017.8 ms | 1279.8 / 1332.0 ms | 685.1 / 736.9 ms | 46.5% |
+| Bun | 977.0 / 1032.3 ms | 995.3 / 1057.2 ms | 379.7 / 472.7 ms | 61.9% |
+
+“Container lifecycle” overrides the image entrypoint with `/bin/true` and
+includes create, start, exit, and removal. “Fresh minimal command” runs one
+minimal runtime command in a new container. “Warm exec” runs the same command
+in one already-running container. Warm reuse is therefore valid only for the
+same verified image, tenant, policy, and security context; mutable state must be
+reset or retained by an explicit contract.
+
+Two guest changes made the matrix stable and removed avoidable startup pressure:
+
+- The pinned `docker-init`/tini process now remains PID 1, reaps descendants,
+  and forwards signals to `rish-guest-agent`. A stress run that had accumulated
+  568 orphaned `containerd-shim` zombies ended with zero zombies after this
+  change, with the guest task count near 59.
+- `/var/lib/docker` uses a `noatime` tmpfs capped at 75% of guest RAM. With the
+  six-image matrix, this changed the tested 4 GiB guest from an approximately
+  1.9 GiB filesystem at 94% use (about 122 MiB free) to approximately 2.9 GiB
+  at 63% use (about 1.1 GiB free). In an exploratory live Bun A/B, lifecycle
+  P50 fell from 1809.5 ms to 1355.0 ms (25.1%) and warm-exec P50 from 540.7 ms
+  to 458.3 ms (15.2%); the clean-run table above is the authoritative matrix.
+
+A five-sample Python `/bin/true` boundary experiment found no worthwhile safe
+container-flag shortcut:
+
+| Configuration | P50 / P95 | Result |
+|---|---:|---|
+| Baseline before controls | 980.2 / 1166.7 ms | Reference |
+| `--log-driver none` | 975.6 / 1007.2 ms | No material P50 gain; persistent logs are lost |
+| `--cgroupns host` | 978.7 / 1022.9 ms | No material P50 gain; namespace isolation is weaker |
+| `--security-opt seccomp=unconfined` | 891.8 / 905.5 ms | About 8.7% faster, rejected because isolation is weaker |
+| `--privileged` | 1048.8 / 1105.2 ms | Slower and substantially weaker isolation |
+| Baseline after controls | 972.7 / 990.4 ms | Control for run-to-run drift |
+
+Reproduce the compatibility checks and benchmark through the diagnostic
+loopback-only Docker API with:
+
+```bash
+DOCKER_HOST=tcp://127.0.0.1:12375 \
+RISH_REMOVE_TEST_IMAGES=1 \
+sh guest/x86_64/test-language-images.sh
+
+DOCKER_HOST=tcp://127.0.0.1:12375 \
+python3 guest/x86_64/benchmark-language-images.py \
+  --warm-exec --runs 10 --warmups 2 --settle-ms 100 \
+  --output guest/x86_64/out/language-startup-benchmark.json
+```
+
+The reproducible Docker initramfs produced for this run is
+`guest/x86_64/out/rish-alpine-3.24.1-x86_64-docker-initramfs.cpio`:
+285,680,128 bytes, SHA-256
+`0b762ca4d0837b609d4a3f98c820a8a96bf37f210b55895718e7ed347a1c995b`.
+The unauthenticated diagnostic Docker API is disabled by default; the guest
+documentation explains how to opt into a loopback-forwarded test setup.
+
+These timing numbers characterize the QEMU development oracle used to exercise
+Docker deterministically. QEMU is not a production runtime dependency, and the
+numbers are neither pure-rish interpreter throughput nor native-kernel support.
+See the [x86-64 guest documentation](guest/x86_64/README.md) for the complete
+artifact, network, proxy, and Bun CPU-contract details.
+
 ## Repository layout
 
 ```text
@@ -123,7 +224,7 @@ crates/
   rish-softvm-core/     no-JIT x86-64 full-system interpreter (CPU / paging / devices)
   rish-softvm-x86_64/   interpreter control plane, engine gate, bounded quanta
   rish-vm/              evidence-gated VM boot, device config, guest kernel contract
-  rish-guest-agent/     fail-closed bootstrap agent (PID 1 inside the guest)
+  rish-guest-agent/     fail-closed bootstrap agent behind the guest PID 1 reaper
   rish-guest-protocol/  host↔guest handshake, exec, OCI, port and checkpoint RPC
   rish-ffi/             stable JSON C ABI callable from Swift / JNI / N-API
   rish-oci · rish-pull · rish-registry · rish-layer · rish-snapshot · rish-content

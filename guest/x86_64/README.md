@@ -41,7 +41,7 @@ Generated files live under ignored `out/`; no third-party binaries are committed
 |---|---:|---|
 | `out/downloads/vmlinuz-virt-6.18.35` | 12,575,744 | `1e6bf9027720c75c3ed0d79171f21b5791ee40ca9795d07c7c6e04dc5ea2ae90` |
 | `out/rish-alpine-3.24.1-x86_64-initramfs.cpio` | 8,484,864 | `a92bf96c76dee0850db6662843d39bc52fe97762b6074f28b05ed6e01bf8b488` |
-| `out/rish-alpine-3.24.1-x86_64-docker-initramfs.cpio` | 285,680,128 | `023593f5af064054998e14d290eaea0072efcbc9d6fc68e58fab55876d4047e1` |
+| `out/rish-alpine-3.24.1-x86_64-docker-initramfs.cpio` | 285,680,128 | `0b762ca4d0837b609d4a3f98c820a8a96bf37f210b55895718e7ed347a1c995b` |
 
 Use `./fetch-assets.sh --all` only when the optional Alpine virt ISO is also
 needed for provenance or later disk-image work.
@@ -106,8 +106,9 @@ carries a real container stack:
   squashfs);
 - the static Docker 29.7.2 toolchain (dockerd, containerd, runc, ctr, docker
   CLI, docker-init, docker-proxy);
-- the statically linked rish-guest-agent, started as PID 1 with its framed
-  protocol polling the second 16550A UART directly at COM2 (`0x2f8`).
+- docker-init/tini as the PID 1 signal forwarder and orphan reaper, with the
+  statically linked rish-guest-agent polling its framed protocol directly from
+  the second 16550A UART at COM2 (`0x2f8`).
 
 Build it from this directory:
 
@@ -141,7 +142,9 @@ VM capability profile still requires the TCTI provider gate.
 The Docker guest sets `DOCKER_RAMDISK=1`, which makes Moby request runc's
 `NoPivotRoot` mode; Linux cannot pivot away from its special initramfs rootfs.
 It also loads `virtio-rng` so Go-based Docker tooling cannot block waiting for
-early-boot entropy.
+early-boot entropy. The ephemeral Docker data tmpfs is capped at 75% of guest
+RAM and mounted `noatime`; this is a limit rather than a reservation, and keeps
+the full six-image test set away from the default tmpfs 50% near-full boundary.
 
 ### Language image compatibility oracle
 
@@ -168,6 +171,7 @@ v2:
 | Runtime | Resolved image digest | Executed result |
 |---|---|---|
 | Java 21.0.12 | `eclipse-temurin@sha256:6ea5548706b60ac0a602eaf48af74792cbab012d90e811ca8db6184b16b5c3d6` | `javac` + `java` passed on `amd64` |
+| Python 3.13.15 | `python@sha256:540c7d91f98ff6880174c40e99067bf5941eb54d818a7a5e094d188b196a934d` | CPython + pip + JSON/hashlib/zlib/SQLite passed on `x86_64 linux` |
 | Go 1.25.14 | `golang@sha256:1ae0735f00daffa3aaf1363a5184c0d2dc55c78e3db4ec70241cdac97bf84b59` | `go run` passed on `linux/amd64` |
 | Rust 1.98.0 | `rust@sha256:a10e64dd139b7387337c7fbe8aca31b959b57b2fd4c8ae20a02cf1d6ea424dce` | `rustc` output executed successfully |
 | Node.js 22.23.2 | `node@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32` | Node + npm passed on `x64 linux` |
@@ -189,6 +193,52 @@ SSE4.2 feature bits. The language-image oracle now judges Bun by the real
 process result instead of treating a `/proc/cpuinfo` flag as proof; QEMU
 `qemu64` still faults, while its Nehalem profile supplies the complete hardware
 contract.
+
+### Cached startup benchmark
+
+`benchmark-language-images.py` measures cached images through the same
+loopback-only diagnostic Docker API. The core benchmark overrides each image's
+entrypoint with `/bin/true` to measure create/start/exit/remove, then runs one
+minimal language command. `--warm-exec` additionally measures that command in
+one already-running container:
+
+```sh
+DOCKER_HOST=tcp://127.0.0.1:12375 \
+python3 guest/x86_64/benchmark-language-images.py \
+  --warm-exec --runs 10 --warmups 2 --settle-ms 100 \
+  --output guest/x86_64/out/language-startup-benchmark.json
+```
+
+The unmeasured settle interval prevents asynchronous cleanup from turning a
+single-start benchmark into a one-vCPU saturation test. Results below are the
+median/P95 of ten samples after two warmups on QEMU 11.1 TCG with a Nehalem CPU
+profile, one vCPU, 4 GiB RAM, Docker 29.7.2, Linux 6.18.35, overlay2, cgroup v2,
+and all six image digests above already cached:
+
+| Runtime | Container lifecycle | Minimal runtime command | Same-container warm exec | Median reduction |
+|---|---:|---:|---:|---:|
+| Java | 1006.5 / 1082.2 ms | 1360.2 / 1493.9 ms | 735.8 / 783.3 ms | 45.9% |
+| Python | 990.8 / 1053.0 ms | 1312.1 / 1361.8 ms | 553.8 / 606.1 ms | 57.8% |
+| Go | 987.5 / 1040.9 ms | 1013.4 / 1059.1 ms | 396.4 / 406.7 ms | 60.9% |
+| Rust | 981.9 / 1064.1 ms | 1269.1 / 1338.3 ms | 640.6 / 672.7 ms | 49.5% |
+| Node.js | 978.3 / 1017.8 ms | 1279.8 / 1332.0 ms | 685.1 / 736.9 ms | 46.5% |
+| Bun | 977.0 / 1032.3 ms | 995.3 / 1057.2 ms | 379.7 / 472.7 ms | 61.9% |
+
+The first long-run benchmark exposed 568 orphaned `containerd-shim` zombies:
+the guest agent had been PID 1 without an init reaper. Keeping the pinned
+docker-init/tini binary as PID 1 reduced the zombie count to zero after the
+final benchmark and kept the task count near 59. Expanding the Docker tmpfs
+from its approximately 1.9 GiB default (94% used by this matrix) to its 75%
+cap produced approximately 2.9 GiB (63% used) at the tested memory size.
+
+Reusing one running container for the same verified image and security context
+is the largest remaining measured optimization. It must not cross tenant or
+policy boundaries, and mutable state must be reset or explicitly retained by
+contract. Disabling the log driver or sharing the host cgroup namespace did not
+materially improve a five-sample `/bin/true` control. Disabling seccomp saved
+only about 8.7% and was rejected because it weakens isolation; privileged mode
+was slower. These timings characterize the QEMU development oracle, not the
+pure-software rish CPU or native kernel support.
 
 ## What is not claimed yet
 

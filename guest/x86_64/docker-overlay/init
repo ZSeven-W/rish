@@ -31,7 +31,7 @@ ln -snf pts/ptmx /dev/ptmx || fail "cannot link /dev/ptmx"
 mount -t tmpfs tmpfs /run -o mode=0755,nosuid,nodev ||
     fail "cannot mount /run"
 mount -t tmpfs tmpfs /tmp -o mode=1777 || fail "cannot mount /tmp"
-mount -t tmpfs tmpfs /var/lib/docker -o mode=0711 ||
+mount -t tmpfs tmpfs /var/lib/docker -o mode=0711,noatime,size=75% ||
     fail "cannot mount docker data"
 
 mkdir -p /sys/fs/cgroup || fail "cannot create cgroup mount point"
@@ -123,7 +123,11 @@ case "$command_line" in
         ;;
 esac
 
+# docker-init remains PID 1 so orphaned containerd shims are reaped instead of
+# accumulating as zombies during repeated container starts. It forwards
+# termination signals to the agent without racing the agent's own child waits.
 # Do not open ttyS1 through the kernel serial driver: its receive interrupt
 # would race the agent's direct UART polling for control bytes. Console
 # diagnostics stay on ttyS0.
-exec /usr/bin/rish-guest-agent </dev/null >/dev/null 2>/dev/ttyS0
+exec /usr/bin/docker-init -- /usr/bin/rish-guest-agent \
+    </dev/null >/dev/null 2>/dev/ttyS0

@@ -81,7 +81,7 @@
       "id": "rish-alpine-docker-initramfs",
       "kind": "derived_initramfs_newc",
       "size": 285680128,
-      "sha256": "023593f5af064054998e14d290eaea0072efcbc9d6fc68e58fab55876d4047e1"
+      "sha256": "0b762ca4d0837b609d4a3f98c820a8a96bf37f210b55895718e7ed347a1c995b"
     }
   ],
   "engine_requirements": [
