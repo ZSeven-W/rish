@@ -240,6 +240,20 @@ only about 8.7% and was rejected because it weakens isolation; privileged mode
 was slower. These timings characterize the QEMU development oracle, not the
 pure-software rish CPU or native kernel support.
 
+## Root-disk overlay image
+
+`build-root-disk.sh` turns a runtime overlay directory (the app's
+`Application Support/rish-guest-overlay/`, e.g. `etc/apk/repositories`)
+into a deterministic 4 MiB FAT16 image that the boot request consumes as
+`root_disk_path`. See `docs/guest-root-disk.md` for the format contract,
+the root_disk_path support matrix, and the honest list of unmet
+prerequisites.
+
+```sh
+./build-root-disk.sh overlay-dir out/root-disk.img
+./test-root-disk.sh
+```
+
 ## What is not claimed yet
 
 The minimal shell artifact still carries no full module payload; the Docker

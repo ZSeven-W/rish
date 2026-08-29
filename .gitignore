@@ -1,6 +1,7 @@
 target/
 /.idea/
 /.vscode/
+/.toolchain/
 *.xcframework
 *.so
 *.a
