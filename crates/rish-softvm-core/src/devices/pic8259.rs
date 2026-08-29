@@ -26,7 +26,6 @@ pub struct Pic8259 {
     /// cleared when the interrupt is acknowledged, which is how the 8259
     /// edge-triggered mode actually behaves.
     latched: u16,
-    initialized: bool,
 }
 
 #[derive(Default)]
@@ -36,6 +35,11 @@ struct Pic {
     init_state: u8,
     expect_icw4: bool,
     in_service: u8,
+    /// Set once the chip's ICW1..ICW4 sequence completed. A chip the guest
+    /// never programmed delivers nothing: its vector base is unknowable and
+    /// the model must not guess one (an uninitialized slave with base 0
+    /// would otherwise deliver vector 2, which the guest takes as an NMI).
+    initialized: bool,
 }
 
 impl Pic8259 {
@@ -46,18 +50,21 @@ impl Pic8259 {
             slave: Pic::default(),
             inputs: 0,
             latched: 0,
-            initialized: false,
         }
     }
 
     /// Returns the highest-priority unmasked pending interrupt, if any.
     #[must_use]
     pub fn pending_irq(&self) -> Option<u8> {
-        if !self.initialized {
+        if !self.master.initialized {
             return None;
         }
         let requests = self.inputs | self.latched;
-        let slave_bits = (requests >> 8) as u8 & !self.slave.mask & !self.slave.in_service;
+        let slave_bits = if self.slave.initialized {
+            (requests >> 8) as u8 & !self.slave.mask & !self.slave.in_service
+        } else {
+            0
+        };
         let direct = (requests as u8) & !self.master.mask & !self.master.in_service & !(1 << 2);
         let cascade = if slave_bits != 0 { 1 << 2 } else { 0 };
         let master_pending = direct | cascade;
@@ -73,10 +80,11 @@ impl Pic8259 {
     }
 
     /// Acknowledges an interrupt: the INTA cycle marks it in service and the
-    /// CPU receives the vector.
+    /// CPU receives the vector. Callers only acknowledge interrupts that
+    /// pending_irq reported, so both chips are initialized by construction.
     #[must_use]
     pub fn acknowledge(&mut self, irq: u8) -> u8 {
-        if !self.initialized {
+        if !self.master.initialized || (irq >= 8 && !self.slave.initialized) {
             return 0;
         }
         self.latched &= !(1 << irq);
@@ -115,7 +123,7 @@ impl Pic8259 {
 
     #[must_use]
     pub fn initialized(&self) -> bool {
-        self.initialized
+        self.master.initialized
     }
 
     pub fn master_mask(&self) -> u8 {
@@ -168,7 +176,7 @@ impl Pic8259 {
             }
             3 => {
                 if self.master.expect_icw4 && value & ICW4_8086 != 0 {
-                    self.initialized = true;
+                    self.master.initialized = true;
                 }
                 self.master.init_state = 0;
             }
@@ -188,6 +196,9 @@ impl Pic8259 {
                 self.slave.init_state = 3;
             }
             3 => {
+                if self.slave.expect_icw4 && value & ICW4_8086 != 0 {
+                    self.slave.initialized = true;
+                }
                 self.slave.init_state = 0;
             }
             _ => {
@@ -268,6 +279,28 @@ mod tests {
         pic.set_input(InterruptLines { asserted: 1 << 10 });
         assert_eq!(pic.pending_irq(), Some(10));
         assert_eq!(pic.acknowledge(10), 0x28 + 2);
+    }
+
+    #[test]
+    fn an_uninitialized_slave_delivers_nothing() {
+        // The pinned guest kernel initializes only the master 8259 (its
+        // interrupt routing goes through the I/O APIC). A pulse on a slave
+        // line must fail closed: with no ICW2 the slave's vector base is
+        // unknowable, and defaulting it to zero would deliver vector 2,
+        // which the guest takes as an NMI.
+        let mut pic = Pic8259::new();
+        pic.write(0x20, 1, u32::from(ICW1_INIT | ICW1_ICW4))
+            .unwrap();
+        pic.write(0x21, 1, 0x30).unwrap();
+        pic.write(0x21, 1, 0x04).unwrap();
+        pic.write(0x21, 1, 1).unwrap();
+        assert!(pic.initialized());
+        pic.pulse(10);
+        assert_eq!(pic.pending_irq(), None);
+        // The master keeps working for its own lines.
+        pic.pulse(0);
+        assert_eq!(pic.pending_irq(), Some(0));
+        assert_eq!(pic.acknowledge(0), 0x30);
     }
 
     #[test]
