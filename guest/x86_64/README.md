@@ -279,6 +279,20 @@ configuration (no virtio-blk), or persistence (initramfs rootfs is RAM and
 every boot starts fresh). See `docs/guest-apk-offline.md` for the dynamic
 verification record, verbatim guest output, and the app-side prerequisites.
 
+## Root-disk overlay image
+
+`build-root-disk.sh` turns a runtime overlay directory (the app's
+`Application Support/rish-guest-overlay/`, e.g. `etc/apk/repositories`)
+into a deterministic 4 MiB FAT16 image that the boot request consumes as
+`root_disk_path`. See `docs/guest-root-disk.md` for the format contract,
+the root_disk_path support matrix, and the honest list of unmet
+prerequisites.
+
+```sh
+./build-root-disk.sh overlay-dir out/root-disk.img
+./test-root-disk.sh
+```
+
 ## What is not claimed yet
 
 The minimal shell artifact still carries no full module payload; the Docker
