@@ -133,6 +133,20 @@ protocol on a control socket), negotiates the session, collects live kernel
 evidence, and streams the requested command. It is a diagnostic tool: the
 verified Full VM capability profile still requires the TCTI provider gate.
 
+## Root-disk overlay image
+
+`build-root-disk.sh` turns a runtime overlay directory (the app's
+`Application Support/rish-guest-overlay/`, e.g. `etc/apk/repositories`)
+into a deterministic 4 MiB FAT16 image that the boot request consumes as
+`root_disk_path`. See `docs/guest-root-disk.md` for the format contract,
+the root_disk_path support matrix, and the honest list of unmet
+prerequisites.
+
+```sh
+./build-root-disk.sh overlay-dir out/root-disk.img
+./test-root-disk.sh
+```
+
 ## What is not claimed yet
 
 The Alpine `virt` kernel config builds several container/storage/network
