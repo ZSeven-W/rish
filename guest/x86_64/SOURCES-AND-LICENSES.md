@@ -67,6 +67,31 @@ primarily GPL-2.0 and includes components under other licenses. Any eventual
 distribution must audit the exact configured source set, retain notices, and
 meet the corresponding source obligations.
 
+## Offline apk repository additions
+
+`build-container-initramfs.sh` stages an offline Alpine v3.24 `main/x86_64`
+repository from three more pinned inputs in `assets.lock.tsv`:
+
+| Asset | Package | License |
+|---|---|---|
+| `APKINDEX.tar.gz` | repository index snapshot, signed with key `alpine-devel@lists.alpinelinux.org-6165ee59` (the `.SIGN.RSA` travels inside the archive) | index metadata; individual entries carry their own `L:` fields |
+| `musl-1.2.6-r2.apk` | musl libc | MIT |
+| `tree-2.3.2-r0.apk` | tree | GPL-2.0-or-later |
+
+Source directory (a moving snapshot; the exact bytes are hash-pinned in the
+lock file):
+
+<https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/>
+
+The apk runtime itself is **not** re-downloaded: the `sbin/apk` binary,
+`libapk.so.3.0.0`, `libssl.so.3`, `libcrypto.so.3`, `libz.so.1`, and the
+signing keys are extracted from the pinned minirootfs and remain covered by its
+`/lib/apk/db/installed` records (apk-tools GPL-2.0-only, openssl Apache-2.0,
+zlib Zlib). Distributing the generated initramfs requires the license notices
+of these packages; tree is GPL-2.0-or-later, so corresponding source must be
+offered. The packages stay inside the emulated guest and grant no mobile-host
+privilege.
+
 ## Docker diagnostic guest additions
 
 `build-docker-initramfs.sh` adds two more pinned inputs to the same

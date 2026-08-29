@@ -254,6 +254,31 @@ prerequisites.
 ./test-root-disk.sh
 ```
 
+## Offline apk repository in the container initramfs
+
+`build-container-initramfs.sh` now also carries the real Alpine `apk` (its
+binary and full runtime closure, extracted from the same pinned minirootfs)
+plus a small **offline** repository so the guest can install packages with no
+network:
+
+- `assets.lock.tsv` pins the v3.24 `main/x86_64` `APKINDEX.tar.gz` (with
+  its embedded `.SIGN.RSA` index signature) and two packages:
+  `musl-1.2.6-r2.apk`, `tree-2.3.2-r0.apk`;
+- the repo is staged at `/opt/rish-apk-repo/main` and
+  `container-overlay/etc/apk/repositories` points apk at
+  `file:///opt/rish-apk-repo/main`;
+- signature verification uses the minirootfs's own `/etc/apk/keys`, so no
+  `--allow-untrusted` is needed;
+- the apk database ships empty on purpose: the initramfs payload sits outside
+  apk's bookkeeping, and `apk add` resolves dependencies from the local
+  repository (installing musl as a dependency of tree in the recorded proof).
+
+This proves configuration-to-`apk` consumption inside the guest. It does
+**not** prove remote mirrors (no guest network emulation), disk-injected
+configuration (no virtio-blk), or persistence (initramfs rootfs is RAM and
+every boot starts fresh). See `docs/guest-apk-offline.md` for the dynamic
+verification record, verbatim guest output, and the app-side prerequisites.
+
 ## What is not claimed yet
 
 The minimal shell artifact still carries no full module payload; the Docker
