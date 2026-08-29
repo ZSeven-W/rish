@@ -9,11 +9,17 @@ use std::{
 use crate::CpuError;
 use crate::devices::ioapic::{IOAPIC_BASE, IOAPIC_SIZE, IoApic};
 use crate::devices::lapic::{LAPIC_BASE, LAPIC_SIZE, LocalApic};
+use crate::virtio::{
+    GuestMemory, VIRTIO_MMIO_BASE, VIRTIO_MMIO_REGISTER_BYTES, VIRTIO_MMIO_WINDOW_BYTES,
+    VirtioError, VirtioMmioBlk,
+};
 
 pub struct Memory {
     ram: Box<[u8]>,
     lapic: Option<RefCell<LocalApic>>,
     ioapic: RefCell<IoApic>,
+    /// The virtio-mmio block device, when a backend is attached.
+    virtio_blk: Option<RefCell<VirtioMmioBlk>>,
     /// Bumped on every write so translation caches can invalidate cheaply.
     generation: u64,
     /// Per-4KiB-page write counter. A decode-cache entry records the page's
@@ -43,6 +49,7 @@ impl Memory {
             ram: vec![0; bytes].into_boxed_slice(),
             lapic: None,
             ioapic: RefCell::new(IoApic::new()),
+            virtio_blk: None,
             generation: 0,
             code_gen: vec![0_u32; pages].into_boxed_slice(),
         })
@@ -62,13 +69,7 @@ impl Memory {
     /// Bumps the per-page write counters for every page the range touches.
     #[inline]
     fn bump_code_gen(&mut self, start: usize, len: usize) {
-        let first = start / PAGE_SIZE as usize;
-        let last = (start + len - 1) / PAGE_SIZE as usize;
-        for page in first..=last {
-            if let Some(counter) = self.code_gen.get_mut(page) {
-                *counter = counter.wrapping_add(1);
-            }
-        }
+        bump_page_counters(&mut self.code_gen, start, len);
     }
 
     /// Write generation, for translation-cache invalidation.
@@ -109,6 +110,59 @@ impl Memory {
         (IOAPIC_BASE..IOAPIC_BASE + IOAPIC_SIZE).contains(&address)
     }
 
+    fn in_virtio(address: u64) -> bool {
+        (VIRTIO_MMIO_BASE..VIRTIO_MMIO_BASE + VIRTIO_MMIO_WINDOW_BYTES).contains(&address)
+    }
+
+    /// Attaches the virtio-mmio block device. A second device is refused so
+    /// a caller can never silently replace a running backend.
+    pub fn attach_virtio_blk(&mut self, device: VirtioMmioBlk) -> Result<(), CpuError> {
+        if self.virtio_blk.is_some() {
+            return Err(CpuError::InvalidConfig(
+                "a virtio block device is already attached".to_owned(),
+            ));
+        }
+        self.virtio_blk = Some(RefCell::new(device));
+        Ok(())
+    }
+
+    /// The sticky fail-closed fault the block device latched, if any. The
+    /// provider surfaces it for diagnostics; the device itself stops
+    /// servicing after it latches.
+    #[must_use]
+    pub fn virtio_blk_fault(&self) -> Option<String> {
+        self.virtio_blk
+            .as_ref()
+            .and_then(|device| device.borrow().fault().map(str::to_owned))
+    }
+
+    /// Drains block requests the guest kicked since the last device tick.
+    /// Returns true when at least one request completed, so the CPU can
+    /// raise the used-ring interrupt edge on the device's IRQ line.
+    pub fn poll_virtio_irq(&mut self) -> bool {
+        let Some(device) = &self.virtio_blk else {
+            return false;
+        };
+        let mut device = device.borrow_mut();
+        let mut guest = DeviceMemory {
+            ram: &mut self.ram,
+            code_gen: &mut self.code_gen,
+            wrote: false,
+        };
+        match device.poll_kick(&mut guest) {
+            Ok(completed) => {
+                if guest.wrote {
+                    // Device writes into guest RAM can reach page-table or
+                    // code pages; invalidate both caches like any RAM write.
+                    self.generation = self.generation.wrapping_add(1);
+                }
+                completed
+            }
+            // poll_kick latches the fault itself; no edge is raised.
+            Err(_) => false,
+        }
+    }
+
     /// Applies interrupt line levels to the I/O APIC and forwards any fired
     /// vectors to the local APIC.
     pub fn ioapic_set_lines(&self, lines: u32) {
@@ -142,6 +196,34 @@ impl Memory {
 
     #[inline]
     pub fn read(&self, address: u64, output: &mut [u8]) -> Result<(), CpuError> {
+        if Self::in_virtio(address) {
+            let offset = address - VIRTIO_MMIO_BASE;
+            if offset >= VIRTIO_MMIO_REGISTER_BYTES {
+                // Inside the advertised 1 KiB window but past the register
+                // file: reads as zero.
+                for slot in output.iter_mut() {
+                    *slot = 0;
+                }
+                return Ok(());
+            }
+            if let Some(device) = &self.virtio_blk {
+                let value = device.borrow_mut().mmio_read(offset);
+                let bytes = value.to_le_bytes();
+                let count = output.len().min(4);
+                output[..count].copy_from_slice(&bytes[..count]);
+                if output.len() > 4 {
+                    let value2 = device.borrow_mut().mmio_read(offset + 4);
+                    let bytes2 = value2.to_le_bytes();
+                    let rest = output.len() - 4;
+                    output[4..].copy_from_slice(&bytes2[..rest]);
+                }
+            } else {
+                for slot in output.iter_mut() {
+                    *slot = 0;
+                }
+            }
+            return Ok(());
+        }
         if Self::in_ioapic(address) {
             let offset = address - IOAPIC_BASE;
             let value = self.ioapic.borrow_mut().read(offset, output.len() as u8);
@@ -187,6 +269,20 @@ impl Memory {
 
     #[inline]
     pub fn write(&mut self, address: u64, input: &[u8]) -> Result<(), CpuError> {
+        if Self::in_virtio(address) {
+            let offset = address - VIRTIO_MMIO_BASE;
+            if offset < VIRTIO_MMIO_REGISTER_BYTES {
+                if let Some(device) = &self.virtio_blk {
+                    let mut buffer = [0_u8; 4];
+                    let count = input.len().min(4);
+                    buffer[..count].copy_from_slice(&input[..count]);
+                    device
+                        .borrow_mut()
+                        .mmio_write(offset, u32::from_le_bytes(buffer));
+                }
+            }
+            return Ok(());
+        }
         if Self::in_ioapic(address) {
             let offset = address - IOAPIC_BASE;
             let mut buffer = [0_u8; 4];
@@ -278,6 +374,70 @@ impl Memory {
     }
 }
 
+/// Guest-memory adapter handed to the virtio block device while it drains
+/// its queue: direct, bounds-checked access to the RAM slice plus the
+/// decode-cache write counters, so device writes invalidate cached decodes
+/// exactly like any other RAM write.
+struct DeviceMemory<'a> {
+    ram: &'a mut [u8],
+    code_gen: &'a mut [u32],
+    wrote: bool,
+}
+
+impl GuestMemory for DeviceMemory<'_> {
+    fn ram_bytes(&self) -> u64 {
+        self.ram.len() as u64
+    }
+
+    fn read(&self, address: u64, output: &mut [u8]) -> Result<(), VirtioError> {
+        let end = address
+            .checked_add(output.len() as u64)
+            .ok_or(VirtioError::OutOfBounds {
+                address,
+                bytes: output.len() as u64,
+            })?;
+        if end > self.ram.len() as u64 {
+            return Err(VirtioError::OutOfBounds {
+                address,
+                bytes: output.len() as u64,
+            });
+        }
+        output.copy_from_slice(&self.ram[address as usize..end as usize]);
+        Ok(())
+    }
+
+    fn write(&mut self, address: u64, input: &[u8]) -> Result<(), VirtioError> {
+        let end = address
+            .checked_add(input.len() as u64)
+            .ok_or(VirtioError::OutOfBounds {
+                address,
+                bytes: input.len() as u64,
+            })?;
+        if end > self.ram.len() as u64 {
+            return Err(VirtioError::OutOfBounds {
+                address,
+                bytes: input.len() as u64,
+            });
+        }
+        let start = address as usize;
+        self.ram[start..end as usize].copy_from_slice(input);
+        bump_page_counters(self.code_gen, start, input.len());
+        self.wrote = true;
+        Ok(())
+    }
+}
+
+/// Bumps the per-page write counters for every page the range touches.
+fn bump_page_counters(code_gen: &mut [u32], start: usize, len: usize) {
+    let first = start / PAGE_SIZE as usize;
+    let last = (start + len - 1) / PAGE_SIZE as usize;
+    for page in first..=last {
+        if let Some(counter) = code_gen.get_mut(page) {
+            *counter = counter.wrapping_add(1);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,5 +465,47 @@ mod tests {
     #[test]
     fn zero_memory_is_rejected() {
         assert!(Memory::new(0).is_err());
+    }
+
+    #[test]
+    fn virtio_mmio_window_dispatches_reads_and_writes() {
+        use crate::virtio::backend::VecBlockBackend;
+        use crate::virtio::{VIRTIO_MMIO_BASE, VIRTIO_MMIO_REGISTER_BYTES, VirtioMmioBlk};
+
+        let mut memory = Memory::new(1).unwrap();
+        // Without a device the window reads as zero and writes are dropped.
+        let mut bytes = [0xFF_u8; 4];
+        memory.read(VIRTIO_MMIO_BASE, &mut bytes).unwrap();
+        assert_eq!(bytes, [0; 4]);
+        memory.write(VIRTIO_MMIO_BASE, &[0x12, 0, 0, 0]).unwrap();
+
+        let device = VirtioMmioBlk::new(Box::new(VecBlockBackend {
+            bytes: vec![0_u8; 4096],
+        }))
+        .unwrap();
+        memory.attach_virtio_blk(device).unwrap();
+        // A second device is refused, never silently replaced.
+        let second = VirtioMmioBlk::new(Box::new(VecBlockBackend {
+            bytes: vec![0_u8; 512],
+        }))
+        .unwrap();
+        assert!(memory.attach_virtio_blk(second).is_err());
+
+        // The magic value reads back through the MMIO dispatch.
+        let mut magic = [0_u8; 4];
+        memory.read(VIRTIO_MMIO_BASE, &mut magic).unwrap();
+        assert_eq!(magic, [0x76, 0x69, 0x72, 0x74]); // "virt"
+        // Reads past the register file (inside the 1 KiB window) are zero.
+        let mut past = [0xAB_u8; 4];
+        memory
+            .read(VIRTIO_MMIO_BASE + VIRTIO_MMIO_REGISTER_BYTES, &mut past)
+            .unwrap();
+        assert_eq!(past, [0; 4]);
+        // An 8-byte config read composes the two capacity words.
+        let mut capacity = [0_u8; 8];
+        memory
+            .read(VIRTIO_MMIO_BASE + 0x100, &mut capacity)
+            .unwrap();
+        assert_eq!(capacity, 8_u64.to_le_bytes());
     }
 }

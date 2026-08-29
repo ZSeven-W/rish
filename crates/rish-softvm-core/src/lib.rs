@@ -13,6 +13,7 @@ pub mod devices;
 mod error;
 pub mod memory;
 mod ops;
+pub mod virtio;
 
 pub use boot::bzimage;
 pub use cpu::{Cpu, register_index};

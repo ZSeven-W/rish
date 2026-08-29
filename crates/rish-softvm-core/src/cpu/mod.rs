@@ -9,6 +9,7 @@ use crate::arch::paging::{self, AccessKind, Translation};
 use crate::arch::registers::{CpuMode, Registers, index};
 use crate::arch::segments::{Descriptor, SegmentRegister, SegmentSelector};
 use crate::devices::{Cmos, InterruptLines, Pic8259, Pit8254, PortBus, Uart16550};
+use crate::virtio::{self, BlockBackend, VirtioMmioBlk};
 use crate::{CpuError, Memory};
 
 mod decode;
@@ -220,6 +221,16 @@ impl Cpu {
         }
     }
 
+    /// Attaches the virtio-mmio block device backed by the given backend.
+    /// The guest discovers it through the virtio_mmio kernel command line
+    /// (appended by the provider) and raises used-ring interrupts on
+    /// VIRTIO_IRQ.
+    pub fn attach_virtio_blk(&mut self, backend: Box<dyn BlockBackend>) -> Result<(), CpuError> {
+        let device = VirtioMmioBlk::new(backend)
+            .map_err(|error| CpuError::InvalidConfig(format!("virtio block backend: {error}")))?;
+        self.memory.attach_virtio_blk(device)
+    }
+
     fn record_io(&mut self, write: bool, port: u16, size: u8, value: u32) {
         if self.io_log_capacity == 0 {
             return;
@@ -298,6 +309,13 @@ impl Cpu {
             let line = self.uart_control.irq_line();
             self.pic.pulse(line);
             self.memory.ioapic_pulse(line, levels);
+        }
+        // The virtio block device is edge driven like the serials: one
+        // fresh edge per used-ring update. The queue itself is drained
+        // inside the poll.
+        if self.memory.poll_virtio_irq() {
+            self.pic.pulse(virtio::VIRTIO_IRQ);
+            self.memory.ioapic_pulse(virtio::VIRTIO_IRQ, levels);
         }
         self.pic.set_input(self.lines);
         self.memory.ioapic_set_lines(levels);
