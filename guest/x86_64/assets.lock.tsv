@@ -7,4 +7,7 @@ alpine-virt-iso	optional	alpine-virt-3.24.1-x86_64.iso	69206016	e73a6241bd5f3c5c
 alpine-modloop-virt	required	modloop-virt	22867968	78907e7cc812d555f08d4e1133d090cf11fa197370882adfe67b0a5986ccb3f9	https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/netboot-3.24.1/modloop-virt
 alpine-netboot-initramfs	required	initramfs-virt	9637032	6d80a739fedeeb6cd63e24dd208845e22199c41a5fb2054941ef61ec30264fa9	https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/netboot-3.24.1/initramfs-virt
 docker-moby-static	required	docker-29.7.2.tgz	85700518	803d433f226db4776e1768fd319fc6c6e4935a456acf84fcc0080818b854bc8f	https://download.docker.com/linux/static/stable/x86_64/docker-29.7.2.tgz
+alpine-apkindex-main	required	APKINDEX.tar.gz	528320	24281c730dfa9c721f2f21fc30ead29f99f557ff2d6736663617aaa5cd5d2102	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/APKINDEX.tar.gz
+alpine-musl-apk	required	musl-1.2.6-r2.apk	415475	573712e2f49c15bfc20a2699f204acdfc74c772722b15e7353d768057fae0e71	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/musl-1.2.6-r2.apk
+alpine-tree-apk	required	tree-2.3.2-r0.apk	32419	e5cdd8bd2d761c2a6a33a95955f85584fb2ca1228598b592e665df0b1801ad0c	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/tree-2.3.2-r0.apk
 
