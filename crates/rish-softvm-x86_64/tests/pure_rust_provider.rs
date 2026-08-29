@@ -172,6 +172,41 @@ fn engine_rejects_a_non_bzimage_kernel() {
 }
 
 #[test]
+fn engine_rejects_a_root_disk_whose_size_is_not_sector_aligned() {
+    let directory = tempdir().unwrap();
+    let kernel = directory.path().join("bzImage");
+    let root = directory.path().join("root.img");
+    fs::write(&kernel, synthetic_bzimage()).unwrap();
+    // 1000 bytes is a valid regular file but not a multiple of 512: the
+    // virtio-blk backend must refuse it instead of reporting a wrong
+    // capacity to the guest.
+    fs::write(&root, vec![0x5a; 1000]).unwrap();
+    let (engine, _) = pure_rust_engine(EngineLimits::default());
+    assert!(matches!(
+        engine.launch(&config(&kernel, &root, 128)),
+        Err(SoftVmError::Worker(message)) if message.contains("multiple of 512")
+    ));
+}
+
+#[test]
+fn engine_rejects_a_command_line_that_declares_virtio_mmio_devices() {
+    let directory = tempdir().unwrap();
+    let kernel = directory.path().join("bzImage");
+    let root = directory.path().join("root.img");
+    fs::write(&kernel, synthetic_bzimage()).unwrap();
+    fs::write(&root, vec![0x5a; 4096]).unwrap();
+    let mut config = config(&kernel, &root, 128);
+    // The provider attaches its own device; a second virtio_mmio declaration
+    // would make the guest probe the same window twice, so it fails closed.
+    config.command_line = "console=ttyS0 virtio_mmio.device=1K@0xfebf0000:10".to_owned();
+    let (engine, _) = pure_rust_engine(EngineLimits::default());
+    assert!(matches!(
+        engine.launch(&config),
+        Err(SoftVmError::Worker(message)) if message.contains("virtio_mmio")
+    ));
+}
+
+#[test]
 fn default_engine_remains_unavailable_without_a_provider() {
     assert!(matches!(
         X86_64SoftwareEngine::default().probe(),
