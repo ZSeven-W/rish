@@ -8,12 +8,28 @@ export HOME=/root
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 mkdir -p /proc /sys /dev /tmp /root
-mount -t proc proc /proc 2>/dev/null
-mount -t sysfs sysfs /sys 2>/dev/null
-mount -t devtmpfs devtmpfs /dev 2>/dev/null
 
-# The rootfs ships only the busybox binary; materialise the applet links.
+# The rootfs ships only the busybox binary; materialise the applet links
+# FIRST: the mounts below (and the insmods after them) need the applets.
 /bin/busybox --install -s /bin 2>/dev/null
+
+mount -t proc proc /proc 2>/dev/null || true
+mount -t sysfs sysfs /sys 2>/dev/null || true
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+
+# Load the root-disk drivers the pinned virt kernel ships as modules: the
+# emulated machine exposes root_disk_path as a virtio-mmio block device
+# (transport built in), so virtio_blk registers /dev/vda via devtmpfs as
+# soon as it loads. The vfat stack follows so a plain mount -t vfat works.
+# insmod failures are tolerated: the agent must still boot without a disk,
+# and the host sees the missing block node in the command output.
+MODULES=/lib/modules/6.18.35-0-virt
+insmod "$MODULES/kernel/drivers/block/virtio_blk.ko" 2>/dev/null || true
+insmod "$MODULES/kernel/fs/fat/fat.ko" 2>/dev/null || true
+insmod "$MODULES/kernel/fs/nls/nls_cp437.ko" 2>/dev/null || true
+insmod "$MODULES/kernel/fs/nls/nls_ascii.ko" 2>/dev/null || true
+insmod "$MODULES/kernel/fs/nls/nls_utf8.ko" 2>/dev/null || true
+insmod "$MODULES/kernel/fs/fat/vfat.ko" 2>/dev/null || true
 
 hostname -F /etc/hostname 2>/dev/null || true
 

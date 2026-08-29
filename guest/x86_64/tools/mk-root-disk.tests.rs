@@ -67,13 +67,38 @@
             let utf16: Vec<u16> = name.encode_utf16().collect();
             let mut joined: Vec<u16> = Vec::new();
             for chunk in &chunks {
-                joined.extend(chunk.iter().take_while(|ch| **ch != 0xFFFF));
+                joined.extend(chunk.iter().take_while(|ch| **ch != 0x0000));
             }
             assert_eq!(joined, utf16, "chunks of {name:?} join back");
         }
         let checksum = |short: [u8; 11]| lfn_checksum(&short);
         let one = checksum(*b"ETC        ");
         assert_eq!(checksum(*b"ETC        "), one, "checksum is deterministic");
+    }
+
+    #[test]
+    fn lfn_chunks_pad_with_a_nul_terminator_then_ffff_filler() {
+        // The convention the Linux fat driver itself writes for its own
+        // entries: name, one 0x0000 terminator, then 0xFFFF filler. Plain
+        // 0xFFFF padding would render as '?' in every long name on Linux.
+        let chunks = lfn_chunks("xt");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0][0], u16::from(b'x'));
+        assert_eq!(chunks[0][1], u16::from(b't'));
+        assert_eq!(chunks[0][2], 0x0000);
+        assert!(chunks[0][3..].iter().all(|ch| *ch == 0xFFFF));
+    }
+
+    #[test]
+    fn lfn_checksum_matches_the_on_disk_format_definition() {
+        // Reference values computed with the canonical algorithm from the
+        // VFAT LFN definition (also used by Linux fs/fat/dir.c fat_checksum):
+        // sum = ((sum & 1) << 7) | (sum >> 1), then add the next name byte.
+        // The previous left-rotating variant produced 0xa1/0xa9 here, which
+        // macOS tolerates but Linux rejects (long names were dropped).
+        assert_eq!(lfn_checksum(b"RISH0000   "), 0x90);
+        assert_eq!(lfn_checksum(b"RISH0001   "), 0x70);
+        assert_eq!(lfn_checksum(b"ETC        "), 0xAD);
     }
 
     #[test]

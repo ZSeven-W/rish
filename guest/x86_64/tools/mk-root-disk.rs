@@ -224,22 +224,40 @@ fn lfn_chunks(name: &str) -> Vec<[u16; 13]> {
     let chunks: Vec<[u16; 13]> = utf16
         .chunks(13)
         .map(|chunk| {
+            // Padding follows the convention the Linux fat driver itself
+            // writes (observed in guest-created entries): the name, then one
+            // 0x0000 terminator, then 0xFFFF filler. The reader converts code
+            // units up to the first NUL, so plain 0xFFFF padding would
+            // surface as literal '?' characters in every long name. Chunks
+            // are built from the start of the name, so only the final
+            // (flagged) slot can ever carry padding.
             let mut fixed = [0xFFFF_u16; 13];
             fixed[..chunk.len()].copy_from_slice(chunk);
+            if chunk.len() < fixed.len() {
+                fixed[chunk.len()] = 0x0000;
+            }
             fixed
         })
         .collect();
     if chunks.is_empty() {
-        vec![[0xFFFF; 13]]
+        let mut empty = [0xFFFF_u16; 13];
+        empty[0] = 0x0000;
+        vec![empty]
     } else {
         chunks
     }
 }
 
+/// The VFAT long-name checksum over the 8.3 short entry, per the on-disk
+/// format: rotate the accumulator right (bit 0 into bit 7), then add the next
+/// name byte, mod 256. This is the algorithm Linux (fs/fat/dir.c) and Windows
+/// validate strictly; macOS does not validate it, which is why the previous
+/// left-rotating variant passed the hdiutil read-back while every Linux vfat
+/// mount silently dropped the long names.
 fn lfn_checksum(short: &[u8; 11]) -> u8 {
     short
         .iter()
-        .fold(0_u8, |sum, byte| sum.rotate_left(1).wrapping_add(*byte))
+        .fold(0_u8, |sum, byte| sum.rotate_right(1).wrapping_add(*byte))
 }
 
 // ---------------------------------------------------------------------------
@@ -691,7 +709,7 @@ fn extract_directory(image: &[u8], fat: &[u16], entries: &[u8], dest: &Path) -> 
             }
             let mut utf16 = Vec::new();
             for (_, chunk) in &sorted {
-                utf16.extend(chunk.iter().take_while(|ch| **ch != 0xFFFF));
+                utf16.extend(chunk.iter().take_while(|ch| **ch != 0x0000));
             }
             String::from_utf16(&utf16)
                 .map_err(|_| invalid_data("LFN is not valid UTF-16"))?
@@ -731,13 +749,12 @@ fn extract_directory(image: &[u8], fat: &[u16], entries: &[u8], dest: &Path) -> 
 }
 
 fn lfn_unicode(entry: &[u8]) -> Result<[u16; 13]> {
-    let mut chars = [0xFFFF_u16; 13];
+    // The name ends at the first 0x0000 code unit; anything after it is
+    // filler (see lfn_chunks). Extraction truncates at that NUL.
+    let mut chars = [0x0000_u16; 13];
     read_utf16(entry, 1, &mut chars[..5]);
     read_utf16(entry, 14, &mut chars[5..11]);
     read_utf16(entry, 28, &mut chars[11..13]);
-    if chars.iter().any(|ch| *ch == 0) {
-        return Err(invalid_data("LFN contains an invalid NUL code unit"));
-    }
     Ok(chars)
 }
 
