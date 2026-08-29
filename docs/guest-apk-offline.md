@@ -72,6 +72,19 @@ Build #1 and build #2 both produced:
 - 9,835,008 bytes
 - `152905238ade87b7e1cd495508ff1bb92807b4440cc0ed056030e4dfd72caea0`
 
+Since the virtio-blk milestone (`docs/guest-virtio-blk.md`) the same build
+additionally bakes six kernel modules (virtio_blk, fat, vfat, nls_cp437,
+nls_ascii, nls_utf8) out of the pinned netboot initramfs, and the overlay
+init installs the busybox applets before mounting proc/sys/devtmpfs (the
+mounts previously ran before the applet links existed and silently failed).
+The deterministic rebuild now produces:
+
+- 10,252,288 bytes
+- `df72a43ba0308b396e729d2daec758f04f8d5ad38792ef2ec1d232d21f6b85ad`
+
+The offline-apk regression below was re-run against this exact image and
+passes unchanged.
+
 Boot and command (the `vm_smoke` example of `rish_vm_run_docker_json`):
 
 ```sh

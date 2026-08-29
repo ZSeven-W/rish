@@ -20,7 +20,13 @@ sectors) FAT16 image:
   `RISHOVERLAY`, constant volume serial;
 - Names: UTF-8 names are stored as VFAT LFNs (UTF-16); names that do not fit
   8.3 (long, lowercase, dotfiles, multiple extensions, ...) deterministically
-  get a generated `RISH0001...` short name plus an LFN;
+  get a generated `RISH0001...` short name plus an LFN. Each LFN carries the
+  spec-defined short-name checksum (rotate-right accumulator over the 8.3
+  bytes) and NUL-pads the unused characters of its final slot, both of which
+  Linux and Windows validate strictly; an earlier build used a left-rotating
+  checksum and 0xFFFF filler, which macOS (lenient on both) read fine while
+  Linux vfat either dropped the long names or rendered the filler as `?` —
+  fixed in `tools/mk-root-disk.rs` with reference-value unit tests;
 - Every directory-entry timestamp is pinned to **2020-01-01 00:00:00**; FAT
   stores no file uid (the uid is a mount-time option), so timestamps and uids
   are reproducible by construction;
