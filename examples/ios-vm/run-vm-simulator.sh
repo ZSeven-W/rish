@@ -20,10 +20,18 @@ VM_KERNEL=${RISH_KERNEL:-"${VM_REPOSITORY_ROOT}/guest/x86_64/out/downloads/vmlin
 # different guest (e.g. the full docker-in-guest image).
 VM_INITRD=${RISH_INITRD:-"${VM_REPOSITORY_ROOT}/guest/x86_64/out/rish-container.cpio"}
 VM_INITRD_NAME=${RISH_INITRD_NAME:-rish-container.cpio}
+# Optional root-disk image (guest/x86_64/build-root-disk.sh); staged when
+# RISH_ROOT_DISK names an existing file or the default path exists.
+VM_ROOT_DISK=${RISH_ROOT_DISK:-"${VM_REPOSITORY_ROOT}/guest/x86_64/out/root-disk.img"}
+VM_ROOT_DISK_NAME=${RISH_ROOT_DISK_NAME:-rish-root-disk.img}
 
 if ! rustup target list --installed | grep -qx "${VM_TARGET}"; then
-    print -u2 "missing Rust target: ${VM_TARGET} (rustup target add ${VM_TARGET})"
-    exit 2
+    # A workspace-local sysroot (per-target RUSTFLAGS with --sysroot) can also
+    # supply the target std without a rustup install.
+    if [[ "${CARGO_TARGET_AARCH64_APPLE_IOS_SIM_RUSTFLAGS:-}" != *"--sysroot"* ]]; then
+        print -u2 "missing Rust target: ${VM_TARGET} (rustup target add ${VM_TARGET})"
+        exit 2
+    fi
 fi
 for image in "${VM_KERNEL}" "${VM_INITRD}"; do
     if [[ ! -f "${image}" ]]; then
@@ -55,11 +63,18 @@ cp "${VM_SCRIPT_DIR}/Info.plist" "${VM_APP}/Info.plist"
 # resolves them with Bundle.main.path and passes the paths across the ABI.
 cp "${VM_KERNEL}" "${VM_APP}/vmlinuz-virt-6.18.35"
 cp "${VM_INITRD}" "${VM_APP}/${VM_INITRD_NAME}"
+if [[ -n "${VM_ROOT_DISK}" && -f "${VM_ROOT_DISK}" ]]; then
+    cp "${VM_ROOT_DISK}" "${VM_APP}/${VM_ROOT_DISK_NAME}"
+fi
 
+# Keep clang's module cache inside the build root so the compile also
+# works in sandboxes that deny writes to the shared per-user cache.
+mkdir -p "${VM_BUILD_ROOT}/ModuleCache"
 xcrun --sdk iphonesimulator swiftc \
     -target arm64-apple-ios18.0-simulator \
     -O \
     -parse-as-library \
+    -Xcc -fmodules-cache-path="${VM_BUILD_ROOT}/ModuleCache" \
     -import-objc-header "${VM_REPOSITORY_ROOT}/platform/rish.h" \
     "${VM_REPOSITORY_ROOT}/platform/ios/RishBridge.swift" \
     "${VM_SCRIPT_DIR}/RishVMDemo.swift" \

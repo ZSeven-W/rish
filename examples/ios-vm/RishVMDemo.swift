@@ -6,6 +6,12 @@ import UIKit
 /// the same open control channel.
 enum RishVMConfig {
     static let initrdResource = "rish-container"
+    /// Optional root-disk image (built by guest/x86_64/build-root-disk.sh).
+    /// When the bundle carries it, the path is passed as root_disk_path in the
+    /// boot request so the demo exercises the full FFI plumbing. The pure-Rust
+    /// interpreter does not emulate a block device yet, so the guest /dev does
+    /// not show the disk — the probe output below records that honestly.
+    static let rootDiskResource = "rish-root-disk.img"
     static let commandLine =
         "console=ttyS0,115200n8 rdinit=/init panic=-1 oops=panic nokaslr cgroup_no_v1=all 8250.nr_uarts=1"
 
@@ -18,6 +24,7 @@ enum RishVMConfig {
             kernelPath: kernel,
             initrdPath: initrd,
             command: ["true"],
+            rootDiskPath: Bundle.main.path(forResource: rootDiskResource, ofType: nil),
             memoryMib: 1024,
             commandLine: commandLine,
             bootBudgetUnits: 60_000_000_000,
@@ -292,7 +299,9 @@ final class RishTerminalViewController: UIViewController, UITextFieldDelegate {
                         line: "try:  cat /proc/cpuinfo  ·  ls /  ·  ps  ·  echo hi\n\n",
                         color: Theme.secondary)
                     self.statusReady(true)
-                    self.execute("uname -a")
+                    self.execute(
+                        "uname -a; echo ---; ls /dev; echo ---;"
+                            + "cat /etc/apk/repositories 2>&1 || true")
                 } else {
                     self.append(line: "the guest failed to boot\n", color: Theme.failure)
                     self.statusReady(false)
