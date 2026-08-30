@@ -90,6 +90,14 @@ impl VmConfig {
                 "kernel and root disk paths are required".to_owned(),
             ));
         }
+        if self.command_line.contains('\0') {
+            // The kernel stops reading the command line at the first NUL,
+            // so an embedded NUL could hide appended device declarations
+            // from the guest while host-side checks see the whole string.
+            return Err(VmError::InvalidConfig(
+                "the kernel command line must not contain NUL bytes".to_owned(),
+            ));
+        }
         if !self
             .devices
             .iter()
@@ -142,6 +150,17 @@ mod tests {
         let error = config("x86_64", VmAcceleration::Kvm, 256)
             .validate()
             .unwrap_err();
+        assert!(matches!(error, VmError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn rejects_an_embedded_nul_in_the_command_line() {
+        // Linux stops reading the command line at the first NUL, so a NUL
+        // could hide whatever a provider appends after it (device
+        // declarations) while config checks still see the whole string.
+        let mut config = config("x86_64", VmAcceleration::Interpreter, 128);
+        config.command_line = "console=ttyS0\0virtio_mmio.device=1K@0xfebf0000:10".to_owned();
+        let error = config.validate().unwrap_err();
         assert!(matches!(error, VmError::InvalidConfig(_)));
     }
 }
