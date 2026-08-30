@@ -206,17 +206,17 @@ impl Memory {
         // once every two seconds of host time. The device itself stops
         // servicing after it latches a fault, so this is the only place the
         // host can see why.
-        if std::env::var_os("RISH_DBG_NET").is_some() {
-            if self.net_dbg_last.map_or(true, |last| {
-                last.elapsed() >= std::time::Duration::from_secs(2)
-            }) {
-                self.net_dbg_last = Some(std::time::Instant::now());
-                eprintln!(
-                    "[rish-softvm net] fault={:?} {}",
-                    device.fault(),
-                    device.debug_state(),
-                );
-            }
+        if std::env::var_os("RISH_DBG_NET").is_some()
+            && self
+                .net_dbg_last
+                .is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(2))
+        {
+            self.net_dbg_last = Some(std::time::Instant::now());
+            eprintln!(
+                "[rish-softvm net] fault={:?} {}",
+                device.fault(),
+                device.debug_state(),
+            );
         }
         let mut guest = DeviceMemory {
             ram: &mut self.ram,
