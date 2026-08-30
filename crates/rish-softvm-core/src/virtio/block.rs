@@ -290,30 +290,17 @@ impl VirtioMmioBlk {
             return Ok(false);
         }
         let drained = (|| {
-            // Fail closed before touching anything: all three rings must
-            // fit inside guest RAM.
-            self.queue.validate(memory.ram_bytes())?;
-            let avail = queue::avail_index(memory, &self.queue)?;
-            // The ring holds at most queue.size entries, so the driver can
-            // never publish more than that between two drains. A larger
-            // delta means the guest is replaying the same heads or the ring
-            // contents are garbage: fail closed instead of servicing the
-            // same request thousands of times inside one device tick.
-            let pending = avail.wrapping_sub(self.last_seen_avail);
-            if u32::from(pending) > u32::from(self.queue.size) {
-                return Err(VirtioError::BadQueue(
-                    "available ring grew by more than the queue size",
-                ));
-            }
-            let mut completed = 0_u32;
-            while self.last_seen_avail != avail {
-                let head = queue::avail_head(memory, &self.queue, self.last_seen_avail)?;
-                let length = self.process_request(memory, head)?;
-                let used_index = queue::used_index(memory, &self.queue)?;
-                queue::write_used(memory, &self.queue, used_index, u32::from(head), length)?;
-                self.last_seen_avail = self.last_seen_avail.wrapping_add(1);
-                completed += 1;
-            }
+            // The shared drain skeleton: validate the rings, bound the
+            // avail delta by the queue size, walk every head through the
+            // request processor (which validates each whole chain before
+            // moving data), and publish one used entry per completion.
+            let queue_layout = self.queue;
+            let mut last_seen = self.last_seen_avail;
+            let completed =
+                queue::drain_available(memory, &queue_layout, &mut last_seen, |memory, head| {
+                    self.process_request(memory, head)
+                })?;
+            self.last_seen_avail = last_seen;
             Ok::<u32, VirtioError>(completed)
         })();
         match drained {
@@ -382,14 +369,17 @@ impl VirtioMmioBlk {
         head: u16,
     ) -> Result<u32, VirtioError> {
         let mut chain = [Descriptor::default(); MAX_CHAIN_DESCRIPTORS];
-        let count = queue::read_chain(memory, &self.queue, head, &mut chain)?;
-        if count < 3 {
+        // Phase 1: the whole chain is walked and proven inside guest RAM
+        // before anything else (the shared two-phase gate).
+        let validated = queue::validated_chain(memory, &self.queue, head, &mut chain)?;
+        if validated.count() < 3 {
             return Err(VirtioError::BadQueue(
                 "request chain has fewer than three descriptors",
             ));
         }
-        let header = chain[0];
-        let status = chain[count - 1];
+        let descriptors = validated.descriptors();
+        let header = descriptors[0];
+        let status = descriptors[validated.count() - 1];
         if header.length < HEADER_BYTES as u32 || header.device_writable() {
             return Err(VirtioError::BadQueue(
                 "request header is missing or device-writable",
@@ -406,13 +396,7 @@ impl VirtioMmioBlk {
         memory.read(header.address, &mut header_bytes)?;
         let request_type = u32::from_le_bytes(header_bytes[0..4].try_into().unwrap());
         let sector = u64::from_le_bytes(header_bytes[8..16].try_into().unwrap());
-        let data = &chain[1..count - 1];
-        // Fail closed before any data movement: the entire chain — header,
-        // data segments, and status — must lie inside guest RAM, even for
-        // buffers the request type ends up discarding.
-        for descriptor in &chain[..count] {
-            memory.check_range(descriptor.address, u64::from(descriptor.length))?;
-        }
+        let data = &descriptors[1..validated.count() - 1];
         // Data descriptors must carry the direction each request type
         // demands. Violations are structurally malformed chains, not
         // request-level errors.

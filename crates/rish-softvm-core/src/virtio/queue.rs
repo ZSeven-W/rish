@@ -160,6 +160,139 @@ pub fn read_chain<M: GuestMemory>(
     ))
 }
 
+/// Fails closed when the driver published more available entries than the
+/// ring can hold since the last drain (`avail - last_seen` > size). A
+/// conforming driver can never do that; a larger delta means the guest is
+/// replaying the same heads or the ring contents are garbage. Both devices
+/// gate every drain on this bound instead of servicing one request per
+/// phantom slot until the 16-bit counter wraps.
+pub fn avail_delta(last_seen: u16, avail: u16, size: u16) -> Result<(), VirtioError> {
+    let pending = avail.wrapping_sub(last_seen);
+    if u32::from(pending) > u32::from(size) {
+        return Err(VirtioError::BadQueue(
+            "available ring grew by more than the queue size",
+        ));
+    }
+    Ok(())
+}
+
+/// Drains every buffer the driver published since `last_seen`: validates
+/// the three rings against guest RAM, bounds the avail-ring delta, walks
+/// each head through `process` (which must itself validate the whole
+/// chain before moving data -- the two-phase contract), and publishes one
+/// used entry per completion. Returns the number of completions. Any error
+/// fails the whole drain closed; the owning device latches its fault.
+pub fn drain_available<M: GuestMemory, F>(
+    memory: &mut M,
+    queue: &QueueLayout,
+    last_seen: &mut u16,
+    mut process: F,
+) -> Result<u32, VirtioError>
+where
+    F: FnMut(&mut M, u16) -> Result<u32, VirtioError>,
+{
+    queue.validate(memory.ram_bytes())?;
+    let avail = avail_index(memory, queue)?;
+    avail_delta(*last_seen, avail, queue.size)?;
+    let mut completed = 0_u32;
+    while *last_seen != avail {
+        let head = avail_head(memory, queue, *last_seen)?;
+        let length = process(memory, head)?;
+        let used_index = used_index(memory, queue)?;
+        write_used(memory, queue, used_index, u32::from(head), length)?;
+        *last_seen = last_seen.wrapping_add(1);
+        completed += 1;
+    }
+    Ok(completed)
+}
+
+/// Fails closed unless every descriptor buffer lies entirely inside guest
+/// RAM. Phase 1 of the two-phase contract every device follows: the whole
+/// chain proves in-bounds before a single byte moves, so a later
+/// out-of-RAM descriptor can never leave earlier descriptors half-written.
+pub fn check_chain_ranges<M: GuestMemory>(
+    memory: &M,
+    descriptors: &[Descriptor],
+) -> Result<(), VirtioError> {
+    for descriptor in descriptors {
+        memory.check_range(descriptor.address, u64::from(descriptor.length))?;
+    }
+    Ok(())
+}
+
+/// A descriptor chain that passed phase-1 validation: walked inside the
+/// ring (length and cycle bounds) and proven entirely inside guest RAM.
+/// Devices obtain one through [validated_chain] and only then move bytes;
+/// a chain that fails phase 1 failed closed with zero bytes moved.
+#[derive(Clone, Copy)]
+pub struct ValidatedChain<'a> {
+    descriptors: &'a [Descriptor],
+}
+
+impl<'a> ValidatedChain<'a> {
+    #[must_use]
+    pub fn descriptors(&self) -> &[Descriptor] {
+        self.descriptors
+    }
+
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.descriptors.len()
+    }
+
+    /// Sum of every descriptor length, in u128 so a hostile chain of
+    /// near-u32::MAX segments cannot overflow the total.
+    #[must_use]
+    pub fn total_bytes(&self) -> u128 {
+        self.descriptors
+            .iter()
+            .map(|descriptor| u128::from(descriptor.length))
+            .sum()
+    }
+
+    /// Fails closed unless every descriptor is device-readable.
+    pub fn require_all_device_readable(&self) -> Result<(), VirtioError> {
+        for descriptor in self.descriptors {
+            if descriptor.device_writable() {
+                return Err(VirtioError::BadQueue(
+                    "descriptor is device-writable where the device reads",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Fails closed unless every descriptor is device-writable.
+    pub fn require_all_device_writable(&self) -> Result<(), VirtioError> {
+        for descriptor in self.descriptors {
+            if !descriptor.device_writable() {
+                return Err(VirtioError::BadQueue(
+                    "descriptor is not device-writable where the device writes",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Phase 1 of the two-phase chain contract: walk the chain (ring, length,
+/// and cycle bounds) and prove every descriptor buffer inside guest RAM.
+/// Only a chain that passed this gate may be touched; the device then moves
+/// bytes knowing a malformed chain already failed closed with zero side
+/// effects.
+pub fn validated_chain<'a, M: GuestMemory>(
+    memory: &M,
+    queue: &QueueLayout,
+    head: u16,
+    chain: &'a mut [Descriptor],
+) -> Result<ValidatedChain<'a>, VirtioError> {
+    let count = read_chain(memory, queue, head, chain)?;
+    check_chain_ranges(memory, &chain[..count])?;
+    Ok(ValidatedChain {
+        descriptors: &chain[..count],
+    })
+}
+
 /// The driver's position in the used ring.
 pub fn used_index<M: GuestMemory>(memory: &M, queue: &QueueLayout) -> Result<u16, VirtioError> {
     read_u16(memory, queue.used + 2)
@@ -386,6 +519,108 @@ mod tests {
         assert_eq!(avail_head(&memory, &queue, 0).unwrap(), 104);
         assert_eq!(avail_head(&memory, &queue, 4).unwrap(), 104);
         assert_eq!(avail_head(&memory, &queue, 7).unwrap(), 107);
+    }
+
+    #[test]
+    fn avail_delta_fails_closed_when_the_ring_could_not_hold_it() {
+        // A 4-entry ring can never grow by 5 between two drains.
+        assert!(avail_delta(0, 4, 4).is_ok());
+        assert!(matches!(
+            avail_delta(0, 5, 4),
+            Err(VirtioError::BadQueue(_))
+        ));
+        // Wrapping deltas within the ring are legitimate.
+        assert!(avail_delta(0xFFFE, 2, 4).is_ok());
+    }
+
+    #[test]
+    fn validated_chain_fails_before_any_data_when_a_later_buffer_is_outside_ram() {
+        // Phase 1 must prove the WHOLE chain in-bounds: descriptor 0 is
+        // fine, descriptor 1 points outside RAM, and the gate must fail
+        // before the device could have written anything into descriptor 0.
+        let mut bytes = vec![0_u8; 0x1000];
+        let queue = layout(4, 0x100);
+        write_desc(&mut bytes, &queue, 0, 0x800, 8, DESC_FLAG_NEXT, 1);
+        write_desc(&mut bytes, &queue, 1, 0xFFFF_0000, 8, 0, 0);
+        let memory = SliceMemory { bytes: &mut bytes };
+        let mut chain = [Descriptor::default(); MAX_CHAIN_DESCRIPTORS];
+        assert!(matches!(
+            validated_chain(&memory, &queue, 0, &mut chain),
+            Err(VirtioError::OutOfBounds { .. })
+        ));
+    }
+
+    #[test]
+    fn validated_chain_reports_totals_and_direction_violations() {
+        let mut bytes = vec![0_u8; 0x1000];
+        let queue = layout(4, 0x100);
+        write_desc(&mut bytes, &queue, 0, 0x800, 8, DESC_FLAG_NEXT, 1);
+        write_desc(&mut bytes, &queue, 1, 0x900, 0x100, DESC_FLAG_WRITE, 0);
+        let memory = SliceMemory { bytes: &mut bytes };
+        let mut chain = [Descriptor::default(); MAX_CHAIN_DESCRIPTORS];
+        let validated = validated_chain(&memory, &queue, 0, &mut chain).unwrap();
+        assert_eq!(validated.count(), 2);
+        assert_eq!(validated.total_bytes(), 8 + 0x100);
+        assert!(validated.require_all_device_readable().is_err());
+        assert!(validated.require_all_device_writable().is_err());
+    }
+
+    #[test]
+    fn drain_available_bounds_the_delta_and_completes_every_head() {
+        let mut bytes = vec![0_u8; 0x1000];
+        let queue = layout(4, 0x100);
+        for slot in 0..3 {
+            write_desc(
+                &mut bytes,
+                &queue,
+                slot,
+                0x800 + u64::from(slot) * 16,
+                8,
+                0,
+                0,
+            );
+        }
+        bytes[queue.avail as usize + 2..queue.avail as usize + 4]
+            .copy_from_slice(&3_u16.to_le_bytes());
+        bytes[queue.avail as usize + 4..queue.avail as usize + 10].copy_from_slice(&{
+            let mut entries = [0_u8; 6];
+            for (slot, head) in [0_u16, 1, 2].iter().enumerate() {
+                entries[slot * 2..slot * 2 + 2].copy_from_slice(&head.to_le_bytes());
+            }
+            entries
+        });
+        let mut memory = SliceMemory { bytes: &mut bytes };
+        let mut last_seen = 0_u16;
+        let mut seen = Vec::new();
+        let completed = drain_available(&mut memory, &queue, &mut last_seen, |_memory, head| {
+            seen.push(head);
+            Ok(8)
+        })
+        .unwrap();
+        assert_eq!(completed, 3);
+        assert_eq!(last_seen, 3);
+        assert_eq!(seen, vec![0, 1, 2]);
+        assert_eq!(used_index(&memory, &queue).unwrap(), 3);
+        // The used ring carries one entry per head, each 8 bytes long.
+        for slot in 0..3 {
+            let offset = queue.used as usize + 4 + slot * 8;
+            assert_eq!(
+                u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()),
+                slot as u32,
+            );
+            assert_eq!(
+                u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()),
+                8,
+            );
+        }
+        // A phantom delta past the ring size fails the whole drain closed.
+        bytes[queue.avail as usize + 2..queue.avail as usize + 4]
+            .copy_from_slice(&0xFFFF_u16.to_le_bytes());
+        let mut memory = SliceMemory { bytes: &mut bytes };
+        assert!(matches!(
+            drain_available(&mut memory, &queue, &mut last_seen, |_memory, _head| Ok(0)),
+            Err(VirtioError::BadQueue(_))
+        ));
     }
 
     fn write_desc(

@@ -53,6 +53,11 @@ pub trait NetBackend: Send {
     fn poll(&mut self, output: &mut Vec<Vec<u8>>);
     /// Protocol counters, for tests and diagnostics.
     fn counters(&self) -> NetCounters;
+    /// Tears down every connection, pending DNS query, and queued frame.
+    /// Called when the device resets (status 0): stale host-side state must
+    /// not survive into the next driver session. The default no-op keeps
+    /// minimal backends simple.
+    fn reset(&mut self) {}
 }
 
 /// Fixed addressing for the emulated network.

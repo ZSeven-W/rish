@@ -411,6 +411,10 @@ impl VirtioMmioNet {
         self.last_seen_avail = [0; QUEUE_COUNT];
         self.irq_status = 0;
         self.rx_backlog.clear();
+        // A device reset tears the backend down with it: open connections,
+        // DNS state, and queued frames must not survive into the next
+        // driver session.
+        self.backend.reset();
         // The fault latch deliberately survives a device reset: it marks a
         // machine-level integrity violation, not driver state.
     }
@@ -442,28 +446,17 @@ impl VirtioMmioNet {
     /// exceeds the device MTU is dropped and counted, and the buffer is
     /// still completed so the ring cannot wedge.
     fn drain_tx<M: GuestMemory>(&mut self, memory: &mut M) -> Result<bool, VirtioError> {
+        // The shared drain skeleton: ring validation, the avail-delta bound,
+        // one chain through the transmit processor per head (which validates
+        // the whole chain before consuming a byte), and used-ring
+        // publication.
         let queue = self.queues[QUEUE_TX];
-        queue.validate(memory.ram_bytes())?;
-        let avail = queue::avail_index(memory, &queue)?;
-        // The ring holds at most queue.size entries; a larger delta means
-        // the guest is replaying the same heads. Fail closed instead of
-        // servicing one frame thousands of times in a single poll.
-        let pending = avail.wrapping_sub(self.last_seen_avail[QUEUE_TX]);
-        if u32::from(pending) > u32::from(queue.size) {
-            return Err(VirtioError::BadQueue(
-                "transmit available ring grew by more than the queue size",
-            ));
-        }
-        let mut completed = 0_u32;
-        while self.last_seen_avail[QUEUE_TX] != avail {
-            let head = queue::avail_head(memory, &queue, self.last_seen_avail[QUEUE_TX])?;
-            let length = self.process_tx(memory, head)?;
-            let used_index = queue::used_index(memory, &queue)?;
-            queue::write_used(memory, &queue, used_index, u32::from(head), length)?;
-            self.last_seen_avail[QUEUE_TX] = self.last_seen_avail[QUEUE_TX].wrapping_add(1);
-            self.tx_drained = self.tx_drained.saturating_add(1);
-            completed += 1;
-        }
+        let mut last_seen = self.last_seen_avail[QUEUE_TX];
+        let completed = queue::drain_available(memory, &queue, &mut last_seen, |memory, head| {
+            self.process_tx(memory, head)
+        })?;
+        self.last_seen_avail[QUEUE_TX] = last_seen;
+        self.tx_drained = self.tx_drained.saturating_add(u64::from(completed));
         Ok(completed > 0)
     }
 
@@ -480,30 +473,21 @@ impl VirtioMmioNet {
     ) -> Result<u32, VirtioError> {
         let queue = self.queues[QUEUE_TX];
         let mut chain = [Descriptor::default(); MAX_CHAIN_DESCRIPTORS];
-        let count = queue::read_chain(memory, &queue, head, &mut chain)?;
-        if count == 0 {
+        // Phase 1: the whole chain is walked and proven inside guest RAM
+        // before any byte is read or forwarded (the shared two-phase gate).
+        let validated = queue::validated_chain(memory, &queue, head, &mut chain)?;
+        if validated.count() == 0 {
             return Err(VirtioError::BadQueue("transmit chain is empty"));
         }
-        // Every descriptor must be device-readable.
-        let mut total: u128 = 0;
-        for descriptor in &chain[..count] {
-            if descriptor.device_writable() {
-                return Err(VirtioError::BadQueue(
-                    "transmit descriptor is device-writable",
-                ));
-            }
-            total += u128::from(descriptor.length);
-        }
-        // Validate the whole chain even when the frame will be dropped:
-        // the device never touches memory it has not proven to be RAM.
-        for descriptor in &chain[..count] {
-            memory.check_range(descriptor.address, u64::from(descriptor.length))?;
-        }
+        validated.require_all_device_readable()?;
+        let total = validated.total_bytes();
+        let descriptors = validated.descriptors();
         // The header occupies the first 12 bytes of the chain. The split
         // shape (header in its own descriptor) is recognized by a first
         // descriptor of exactly the header size followed by payload.
-        let split_header = count >= 2 && chain[0].length == VIRTIO_NET_HDR_BYTES as u32;
-        let frame_bytes = if split_header || chain[0].length > VIRTIO_NET_HDR_BYTES as u32 {
+        let split_header =
+            validated.count() >= 2 && descriptors[0].length == VIRTIO_NET_HDR_BYTES as u32;
+        let frame_bytes = if split_header || descriptors[0].length > VIRTIO_NET_HDR_BYTES as u32 {
             total - VIRTIO_NET_HDR_BYTES as u128
         } else {
             return Err(VirtioError::BadQueue(
@@ -512,17 +496,20 @@ impl VirtioMmioNet {
         };
         if frame_bytes > MAX_FRAME_BYTES as u128 {
             self.tx_dropped = self.tx_dropped.saturating_add(1);
-            return Ok(total as u32);
+            // The chain may legally exceed u32 bytes (64 x near-u32::MAX
+            // segments); the published length saturates instead of
+            // truncating.
+            return Ok(u32::try_from(total).unwrap_or(u32::MAX));
         }
         let frame_len = frame_bytes as usize;
         // Drain the header (no offload features are offered, so its
         // contents carry no meaning) and gather the frame across the
         // descriptors, skipping the header bytes at the chain start.
         let mut header_bytes = [0_u8; VIRTIO_NET_HDR_BYTES];
-        memory.read(chain[0].address, &mut header_bytes)?;
+        memory.read(descriptors[0].address, &mut header_bytes)?;
         let mut frame = vec![0_u8; frame_len];
         let mut written = 0_usize;
-        for (index, descriptor) in chain[..count].iter().enumerate() {
+        for (index, descriptor) in descriptors.iter().enumerate() {
             let start = if index == 0 {
                 VIRTIO_NET_HDR_BYTES.min(descriptor.length as usize)
             } else {
@@ -552,8 +539,8 @@ impl VirtioMmioNet {
         Ok(total as u32)
     }
 
-    /// Fills posted receive buffers from the backlog: a 10-byte header and
-    /// the frame, or a zero-length completion when the frame cannot fit.
+    /// Fills posted receive buffers from the backlog: the 12-byte header
+    /// and the frame, or a zero-length completion when the frame cannot fit.
     fn drain_rx<M: GuestMemory>(&mut self, memory: &mut M) -> Result<bool, VirtioError> {
         let queue = self.queues[QUEUE_RX];
         queue.validate(memory.ram_bytes())?;
@@ -566,14 +553,10 @@ impl VirtioMmioNet {
             if self.last_seen_avail[QUEUE_RX] == avail {
                 break;
             }
-            // Same fail-closed bound as the transmit drain: the driver can
-            // never publish more than the ring holds between two polls.
-            let pending = avail.wrapping_sub(self.last_seen_avail[QUEUE_RX]);
-            if u32::from(pending) > u32::from(queue.size) {
-                return Err(VirtioError::BadQueue(
-                    "receive available ring grew by more than the queue size",
-                ));
-            }
+            // Same fail-closed bound as the transmit drain (shared with the
+            // block device): the driver can never publish more than the
+            // ring holds between two polls.
+            queue::avail_delta(self.last_seen_avail[QUEUE_RX], avail, queue.size)?;
             let head = queue::avail_head(memory, &queue, self.last_seen_avail[QUEUE_RX])?;
             let frame = self.rx_backlog.pop_front().unwrap_or_default();
             let length = self.process_rx(memory, head, &frame)?;
@@ -587,9 +570,11 @@ impl VirtioMmioNet {
     }
 
     /// Writes one frame into a posted receive buffer: the 12-byte header
-    /// followed by the frame, matching the pinned kernel's virtio_net (a
-    /// single descriptor per buffer in the non-mergeable path, with the
-    /// header at the buffer start). A buffer too small for the frame
+    /// followed by the frame, laid out contiguously from chain offset 0 --
+    /// the header may span descriptors, and the frame starts at chain
+    /// offset 12, never at descriptor 1 offset 0. Phase 1 proves the whole
+    /// chain in-bounds and device-writable before a single byte is written.
+    /// A buffer too small for the frame, or a frame past the device MTU,
     /// completes with length zero: the frame is dropped, never truncated.
     fn process_rx<M: GuestMemory>(
         &mut self,
@@ -599,65 +584,43 @@ impl VirtioMmioNet {
     ) -> Result<u32, VirtioError> {
         let queue = self.queues[QUEUE_RX];
         let mut chain = [Descriptor::default(); MAX_CHAIN_DESCRIPTORS];
-        let count = queue::read_chain(memory, &queue, head, &mut chain)?;
-        if count == 0 {
+        // Phase 1: the whole chain is walked and proven inside guest RAM
+        // before any byte is written, so a later out-of-RAM descriptor
+        // fails the chain with zero bytes committed (the same two-phase
+        // contract as the block device and the transmit path).
+        let validated = queue::validated_chain(memory, &queue, head, &mut chain)?;
+        if validated.count() == 0 {
             return Err(VirtioError::BadQueue("receive chain is empty"));
         }
-        let mut capacity: u128 = 0;
-        for descriptor in &chain[..count] {
-            if !descriptor.device_writable() {
-                return Err(VirtioError::BadQueue(
-                    "receive descriptor is not device-writable",
-                ));
-            }
-            capacity += u128::from(descriptor.length);
-        }
+        validated.require_all_device_writable()?;
+        let capacity = validated.total_bytes();
         if capacity < VIRTIO_NET_HDR_BYTES as u128 {
             return Err(VirtioError::BadQueue(
                 "receive buffer is smaller than the virtio_net_hdr",
             ));
         }
         let payload_capacity = capacity - VIRTIO_NET_HDR_BYTES as u128;
-        if frame.len() as u128 > payload_capacity {
+        if frame.len() as u128 > payload_capacity || frame.len() > MAX_FRAME_BYTES {
             self.rx_dropped = self.rx_dropped.saturating_add(1);
             return Ok(0);
         }
-        // Zero header: no offloads, no GSO, no csum, no mergeable buffers.
-        let header_bytes = [0_u8; VIRTIO_NET_HDR_BYTES];
-        if chain[0].length >= VIRTIO_NET_HDR_BYTES as u32 {
-            memory.write(chain[0].address, &header_bytes)?;
-        } else {
-            memory.write(chain[0].address, &header_bytes[..chain[0].length as usize])?;
-            let mut rest = chain[0].length as usize;
-            for descriptor in &chain[1..count] {
-                let step = (VIRTIO_NET_HDR_BYTES - rest).min(descriptor.length as usize);
-                memory.write(descriptor.address, &header_bytes[rest..rest + step])?;
-                rest += step;
-                if rest == VIRTIO_NET_HDR_BYTES {
-                    break;
-                }
+        // Phase 2: the zero header and the frame as one contiguous stream
+        // from chain offset 0. Zero-length descriptors contribute nothing
+        // and are simply skipped.
+        let mut bytes = Vec::with_capacity(VIRTIO_NET_HDR_BYTES + frame.len());
+        bytes.extend_from_slice(&[0_u8; VIRTIO_NET_HDR_BYTES]);
+        bytes.extend_from_slice(frame);
+        let mut offset = 0_usize;
+        for descriptor in validated.descriptors() {
+            let remaining = bytes.len() - offset;
+            if remaining == 0 {
+                break;
             }
+            let step = remaining.min(descriptor.length as usize);
+            memory.write(descriptor.address, &bytes[offset..offset + step])?;
+            offset += step;
         }
-        // Spread the frame across the descriptors after the 12 header
-        // bytes at the chain start.
-        let mut written = 0_usize;
-        for (index, descriptor) in chain[..count].iter().enumerate() {
-            let start = if index == 0 {
-                VIRTIO_NET_HDR_BYTES.min(descriptor.length as usize)
-            } else {
-                0
-            };
-            let step = (descriptor.length as usize)
-                .saturating_sub(start)
-                .min(frame.len() - written);
-            if step > 0 {
-                memory.write(
-                    descriptor.address + start as u64,
-                    &frame[written..written + step],
-                )?;
-                written += step;
-            }
-        }
+        debug_assert_eq!(offset, bytes.len());
         Ok((VIRTIO_NET_HDR_BYTES + frame.len()) as u32)
     }
 }
