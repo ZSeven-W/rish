@@ -33,6 +33,25 @@ insmod "$MODULES/kernel/fs/nls/nls_ascii.ko" 2>/dev/null || true
 insmod "$MODULES/kernel/fs/nls/nls_utf8.ko" 2>/dev/null || true
 insmod "$MODULES/kernel/fs/fat/vfat.ko" 2>/dev/null || true
 
+# Network drivers. The emulated machine exposes a second virtio-mmio device;
+# virtio_net depends on net_failover, which depends on failover (all modules
+# in the pinned virt kernel). Load order matters: busybox insmod does not
+# resolve dependencies. insmod failures are tolerated: the agent must still
+# boot without a NIC, and the host sees the missing interface in the output.
+insmod "$MODULES/kernel/net/core/failover.ko" 2>/dev/null || true
+insmod "$MODULES/kernel/drivers/net/net_failover.ko" 2>/dev/null || true
+insmod "$MODULES/kernel/drivers/net/virtio_net.ko" 2>/dev/null || true
+
+# Static addressing on the emulated network: 10.0.2.0/24 with gateway and
+# DNS at 10.0.2.2, the addresses the interpreter's slirp-style backend
+# terminates. dhcpcd is not shipped, and static configuration needs no DHCP
+# state machine on the host side; the guest just needs a route and a
+# resolver, both deterministic.
+ip link set eth0 up 2>/dev/null || true
+ip addr add 10.0.2.15/24 dev eth0 2>/dev/null || true
+ip route add default via 10.0.2.2 2>/dev/null || true
+echo "nameserver 10.0.2.2" > /etc/resolv.conf 2>/dev/null || true
+
 hostname -F /etc/hostname 2>/dev/null || true
 
 echo RISH_X86_64_BOOT_OK
