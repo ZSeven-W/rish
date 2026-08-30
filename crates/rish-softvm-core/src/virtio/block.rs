@@ -55,6 +55,10 @@ const VENDOR_ID_RISH: u32 = 0x5249_5348;
 /// Device status bit the device watches: the driver finished feature
 /// negotiation (virtio spec section 2.1).
 const STATUS_FEATURES_OK: u32 = 8;
+/// Device status bit gating queue use: the driver is ready to drive the
+/// device (virtio spec section 2.1). Kicks before this bit is set are
+/// dropped instead of serviced.
+const STATUS_DRIVER_OK: u32 = 4;
 
 /// Feature bits the device offers.
 const VIRTIO_F_VERSION_1: u64 = 1 << 32;
@@ -69,9 +73,17 @@ pub const OFFERED_FEATURES: u64 = VIRTIO_F_VERSION_1 | VIRTIO_BLK_F_SEG_MAX | VI
 /// Largest queue the device accepts.
 pub const QUEUE_NUM_MAX_VALUE: u16 = 128;
 
+/// Smallest queue the device lets the driver mark ready: a request chain
+/// needs a header, at least one data descriptor, and a status descriptor,
+/// so anything smaller can only ever fault on the first kick.
+const MIN_SERVICEABLE_QUEUE_SIZE: u16 = 3;
+
 /// Max segments per request, reported when VIRTIO_BLK_F_SEG_MAX is
-/// negotiated.
-pub const SEG_MAX: u32 = 126;
+/// negotiated. A chain is header + data segments + status, and the device
+/// walks at most MAX_CHAIN_DESCRIPTORS entries, so the advertised value
+/// must never let a conforming driver submit a chain the device would have
+/// to fault on: SEG_MAX + 2 == MAX_CHAIN_DESCRIPTORS.
+pub const SEG_MAX: u32 = 62;
 
 /// Reported block size (bytes).
 pub const BLK_SIZE: u32 = 512;
@@ -197,7 +209,9 @@ impl VirtioMmioBlk {
             },
             QUEUE_SEL => self.queue_sel = value,
             QUEUE_NUM => {
-                if !self.queue_ready {
+                // The device has exactly one queue; configuration written
+                // through any other selection must not reach it.
+                if self.queue_sel == 0 && !self.queue_ready {
                     self.queue.size = if value > 0 && value <= u32::from(QUEUE_NUM_MAX_VALUE) {
                         value as u16
                     } else {
@@ -206,10 +220,12 @@ impl VirtioMmioBlk {
                 }
             }
             QUEUE_READY => {
-                if value == 0 {
+                if self.queue_sel != 0 {
+                    // No such queue: reject instead of programming queue 0.
+                } else if value == 0 {
                     self.queue_ready = false;
                     self.last_seen_avail = 0;
-                } else if value == 1 && self.queue_sel == 0 && self.queue.size > 0 {
+                } else if value == 1 && self.queue.size >= MIN_SERVICEABLE_QUEUE_SIZE {
                     self.queue_ready = true;
                 }
             }
@@ -231,12 +247,24 @@ impl VirtioMmioBlk {
                     }
                 }
             }
-            QUEUE_DESC_LOW => self.queue.desc = merge_low(self.queue.desc, value),
-            QUEUE_DESC_HIGH => self.queue.desc = merge_high(self.queue.desc, value),
-            QUEUE_AVAIL_LOW => self.queue.avail = merge_low(self.queue.avail, value),
-            QUEUE_AVAIL_HIGH => self.queue.avail = merge_high(self.queue.avail, value),
-            QUEUE_USED_LOW => self.queue.used = merge_low(self.queue.used, value),
-            QUEUE_USED_HIGH => self.queue.used = merge_high(self.queue.used, value),
+            QUEUE_DESC_LOW if self.queue_sel == 0 => {
+                self.queue.desc = merge_low(self.queue.desc, value)
+            }
+            QUEUE_DESC_HIGH if self.queue_sel == 0 => {
+                self.queue.desc = merge_high(self.queue.desc, value)
+            }
+            QUEUE_AVAIL_LOW if self.queue_sel == 0 => {
+                self.queue.avail = merge_low(self.queue.avail, value)
+            }
+            QUEUE_AVAIL_HIGH if self.queue_sel == 0 => {
+                self.queue.avail = merge_high(self.queue.avail, value)
+            }
+            QUEUE_USED_LOW if self.queue_sel == 0 => {
+                self.queue.used = merge_low(self.queue.used, value)
+            }
+            QUEUE_USED_HIGH if self.queue_sel == 0 => {
+                self.queue.used = merge_high(self.queue.used, value)
+            }
             // Read-only, unimplemented (shared-memory), and reserved
             // registers: discarded.
             _ => {}
@@ -252,7 +280,13 @@ impl VirtioMmioBlk {
             return Ok(false);
         }
         self.kick_pending = false;
-        if self.fault.is_some() || !self.queue_ready || self.queue.size == 0 {
+        // The virtio lifecycle gates queue use on DRIVER_OK: a kick before
+        // the driver finished negotiation is dropped, never serviced.
+        if self.fault.is_some()
+            || !self.queue_ready
+            || self.queue.size == 0
+            || self.status & STATUS_DRIVER_OK == 0
+        {
             return Ok(false);
         }
         let drained = (|| {
@@ -260,6 +294,17 @@ impl VirtioMmioBlk {
             // fit inside guest RAM.
             self.queue.validate(memory.ram_bytes())?;
             let avail = queue::avail_index(memory, &self.queue)?;
+            // The ring holds at most queue.size entries, so the driver can
+            // never publish more than that between two drains. A larger
+            // delta means the guest is replaying the same heads or the ring
+            // contents are garbage: fail closed instead of servicing the
+            // same request thousands of times inside one device tick.
+            let pending = avail.wrapping_sub(self.last_seen_avail);
+            if u32::from(pending) > u32::from(self.queue.size) {
+                return Err(VirtioError::BadQueue(
+                    "available ring grew by more than the queue size",
+                ));
+            }
             let mut completed = 0_u32;
             while self.last_seen_avail != avail {
                 let head = queue::avail_head(memory, &self.queue, self.last_seen_avail)?;
@@ -321,9 +366,16 @@ impl VirtioMmioBlk {
         }
     }
 
-    /// Services one request: walks the chain, moves data between the guest
-    /// and the backend with sector-range validation, and writes the status
-    /// byte. Returns the byte length published in the used ring.
+    /// Services one request: validates the whole chain first — every
+    /// descriptor inside guest RAM, the permission bits each request type
+    /// demands, and the sector-aligned length semantics — and only then
+    /// moves a single byte between the guest and the backend. A malformed
+    /// chain fails closed before any data movement or disk write, so a
+    /// hostile request can never leave a partial copy in guest RAM or a
+    /// partial write on the host disk. Returns the byte length published in
+    /// the used ring: the bytes written into device-writable descriptors
+    /// (data plus the status byte for IN/GET_ID, the status byte alone for
+    /// OUT and error completions).
     fn process_request<M: GuestMemory>(
         &mut self,
         memory: &mut M,
@@ -348,52 +400,103 @@ impl VirtioMmioBlk {
                 "request status descriptor is missing or not device-writable",
             ));
         }
+        // Reading the header is a pure guest read and part of validation:
+        // it moves nothing and touches no host state.
         let mut header_bytes = [0_u8; HEADER_BYTES];
         memory.read(header.address, &mut header_bytes)?;
         let request_type = u32::from_le_bytes(header_bytes[0..4].try_into().unwrap());
         let sector = u64::from_le_bytes(header_bytes[8..16].try_into().unwrap());
         let data = &chain[1..count - 1];
+        // Fail closed before any data movement: the entire chain — header,
+        // data segments, and status — must lie inside guest RAM, even for
+        // buffers the request type ends up discarding.
+        for descriptor in &chain[..count] {
+            memory.check_range(descriptor.address, u64::from(descriptor.length))?;
+        }
+        // Data descriptors must carry the direction each request type
+        // demands. Violations are structurally malformed chains, not
+        // request-level errors.
+        match request_type {
+            REQ_IN | REQ_GET_ID => {
+                for descriptor in data {
+                    if !descriptor.device_writable() {
+                        return Err(VirtioError::BadQueue(
+                            "read request data descriptor is not device-writable",
+                        ));
+                    }
+                }
+            }
+            REQ_OUT => {
+                for descriptor in data {
+                    if descriptor.device_writable() {
+                        return Err(VirtioError::BadQueue(
+                            "write request data descriptor is device-writable",
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
         let mut total: u128 = 0;
         for descriptor in data {
             total += u128::from(descriptor.length);
         }
-        let transferred: Result<(), VirtioError> = match request_type {
+        // IN/OUT payloads are whole sectors; anything else is a driver
+        // contract violation and fails closed.
+        if matches!(request_type, REQ_IN | REQ_OUT) && total % VIRTIO_BLK_SECTOR_SIZE as u128 != 0 {
+            return Err(VirtioError::BadQueue(
+                "request length is not a multiple of the block size",
+            ));
+        }
+        match request_type {
             REQ_IN => match self.checked_range(sector, total)? {
                 None => {
                     self.write_status(memory, &status, STATUS_BYTE_IOERR)?;
-                    return Ok(0);
+                    return Ok(1);
                 }
-                Some(end) => self.copy_from_backend(memory, data, sector * 512, end),
+                Some(end) => self.copy_from_backend(memory, data, sector * 512, end)?,
             },
             REQ_OUT => match self.checked_range(sector, total)? {
                 None => {
                     self.write_status(memory, &status, STATUS_BYTE_IOERR)?;
-                    return Ok(0);
+                    return Ok(1);
                 }
-                Some(end) => self.copy_to_backend(memory, data, sector * 512, end),
+                Some(end) => match self.copy_to_backend(memory, data, sector * 512, end) {
+                    Ok(()) => {}
+                    // Host backend failures complete the request with IOERR.
+                    // The device cannot roll back chunks already committed
+                    // without staging the whole request (which would break
+                    // the bounded-allocation rule); the guest must treat
+                    // IOERR as "request failed, data state undefined", the
+                    // same contract real disks offer on host I/O errors.
+                    Err(VirtioError::Backend(_)) => {
+                        self.write_status(memory, &status, STATUS_BYTE_IOERR)?;
+                        return Ok(1);
+                    }
+                    Err(fatal) => return Err(fatal),
+                },
             },
-            REQ_GET_ID => self.write_serial(memory, data, total),
+            REQ_GET_ID => self.write_serial(memory, data)?,
             REQ_FLUSH | REQ_DISCARD | REQ_WRITE_ZEROES => {
                 // Not offered in the feature set; a non-conforming driver
                 // gets an explicit unsupported status, never data movement.
                 self.write_status(memory, &status, STATUS_BYTE_UNSUPP)?;
-                return Ok(0);
+                return Ok(1);
             }
             _ => {
                 self.write_status(memory, &status, STATUS_BYTE_UNSUPP)?;
-                return Ok(0);
+                return Ok(1);
             }
         };
-        match transferred {
-            Ok(()) => self.write_status(memory, &status, STATUS_BYTE_OK)?,
-            // Host backend failures complete the request with IOERR; guest
-            // memory faults (OutOfBounds) propagate and latch the device.
-            Err(VirtioError::Backend(_)) => {
-                self.write_status(memory, &status, STATUS_BYTE_IOERR)?
-            }
-            Err(fatal) => return Err(fatal),
-        }
-        Ok(u32::try_from(total).unwrap_or(u32::MAX))
+        self.write_status(memory, &status, STATUS_BYTE_OK)?;
+        // IN and GET_ID wrote the data plus the status byte; OUT wrote only
+        // the status byte.
+        let device_written = if request_type == REQ_OUT {
+            1
+        } else {
+            total.saturating_add(1)
+        };
+        Ok(u32::try_from(device_written).unwrap_or(u32::MAX))
     }
 
     /// Validates the sector range against the backend capacity. Ok(None)
@@ -471,18 +574,22 @@ impl VirtioMmioBlk {
 
     /// Writes the fixed device serial across the data segments, padding the
     /// remainder of the buffer with spaces (the virtio-blk GET_ID
-    /// convention).
+    /// convention). Like the data paths it moves bytes in bounded chunks, so
+    /// a hostile segment length (up to u32::MAX) can never force a
+    /// multi-gigabyte host allocation.
     fn write_serial<M: GuestMemory>(
         &self,
         memory: &mut M,
         data: &[Descriptor],
-        total: u128,
     ) -> Result<(), VirtioError> {
         let mut written: u128 = 0;
         for descriptor in data {
             let mut done = 0_u32;
             while done < descriptor.length {
-                let step = descriptor.length.saturating_sub(done) as usize;
+                let step = descriptor
+                    .length
+                    .saturating_sub(done)
+                    .min(TRANSFER_CHUNK_BYTES as u32) as usize;
                 let mut buffer = vec![0x20_u8; step]; // space padding
                 let position = written + u128::from(done);
                 if position < u128::from(SERIAL.len() as u32) {
@@ -496,7 +603,6 @@ impl VirtioMmioBlk {
                 done += step as u32;
             }
         }
-        let _ = total;
         Ok(())
     }
 
