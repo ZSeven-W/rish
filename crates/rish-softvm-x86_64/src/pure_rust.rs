@@ -7,18 +7,22 @@
 //! there is no JIT, no executable-memory translation, and no hypervisor
 //! involved.
 //!
-//! Device surface: both 16550 serials plus one virtio-mmio block device.
-//! The validated root disk image becomes the block backend and the provider
-//! appends the virtio-mmio command-line fragment so the pinned kernel
-//! (CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y) discovers it. User networking is
-//! still not emulated, so network device requests are rejected. See the
-//! rish-softvm-core virtio module for the implemented and explicitly
-//! unimplemented virtio features.
+//! Device surface: both 16550 serials, one virtio-mmio block device, and
+//! one virtio-mmio network device. The validated root disk image becomes the
+//! block backend; user-mode networking (network_mode = user-nat) attaches the
+//! slirp-style backend from rish-softvm-core. The provider appends both
+//! virtio-mmio command-line fragments so the pinned kernel
+//! (CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y) discovers them. See the
+//! rish-softvm-core virtio and net modules for the implemented and explicitly
+//! unimplemented features.
 
 use std::fs;
 
 use rish_softvm_core::bzimage::{self, BootParams};
-use rish_softvm_core::virtio::{FileBlockBackend, VIRTIO_CMDLINE_FRAGMENT};
+use rish_softvm_core::net::{NetConfig, SlirpNetBackend};
+use rish_softvm_core::virtio::{
+    FileBlockBackend, VIRTIO_CMDLINE_FRAGMENT, VIRTIO_NET_CMDLINE_FRAGMENT,
+};
 use rish_softvm_core::{Cpu, CpuError};
 
 use crate::{
@@ -32,13 +36,14 @@ pub const PURE_RUST_TARGET: &str = "x86_64-softvm-pure-rust";
 
 /// Feature bits the interpreter must declare: full-system x86_64 execution,
 /// bounded runs, cancellation polling, both 16550 channels, the virtio-mmio
-/// block device, and initramfs.
+/// block device, the user-mode network device, and initramfs.
 pub(crate) const PURE_RUST_REQUIRED_FEATURES: u64 = abi::FEATURE_FULL_SYSTEM
     | abi::FEATURE_X86_64
     | abi::FEATURE_BOUNDED_RUN
     | abi::FEATURE_CANCEL_POLL
     | abi::FEATURE_SERIAL_16550
     | abi::FEATURE_VIRTIO_BLOCK
+    | abi::FEATURE_USER_NETWORK
     | abi::FEATURE_INITRD
     | abi::FEATURE_CONTROL_SERIAL;
 
@@ -170,9 +175,28 @@ impl MachineProvider for PureRustProvider {
             })?;
         cpu.attach_virtio_blk(Box::new(backend))
             .map_err(|error| SoftVmError::InvalidConfig(error.to_string()))?;
+        // User-mode networking attaches the slirp-style backend from
+        // rish-softvm-core: ARP/ICMP/DNS forwarding plus outbound TCP proxy
+        // over host sockets. Anything else fails closed.
+        let user_net = match request.network_mode {
+            abi::NETWORK_DISABLED => false,
+            abi::NETWORK_USER_NAT => true,
+            other => {
+                return Err(SoftVmError::InvalidConfig(format!(
+                    "unsupported network mode {other}"
+                )));
+            }
+        };
+        if user_net {
+            let backend = SlirpNetBackend::new(NetConfig::slirp_defaults()).map_err(|error| {
+                SoftVmError::InvalidConfig(format!("user-mode network backend: {error}"))
+            })?;
+            cpu.attach_virtio_net(Box::new(backend))
+                .map_err(|error| SoftVmError::InvalidConfig(error.to_string()))?;
+        }
         if request.command_line.contains("virtio_mmio.device") {
             return Err(SoftVmError::InvalidConfig(
-                "command line already declares virtio_mmio devices; the pure-Rust provider                  attaches its own virtio-mmio block device"
+                "command line already declares virtio_mmio devices; the pure-Rust provider attaches its own virtio-mmio block and network devices"
                     .to_owned(),
             ));
         }
@@ -181,6 +205,10 @@ impl MachineProvider for PureRustProvider {
             command_line.push(' ');
         }
         command_line.push_str(VIRTIO_CMDLINE_FRAGMENT);
+        if user_net {
+            command_line.push(' ');
+            command_line.push_str(VIRTIO_NET_CMDLINE_FRAGMENT);
+        }
         bzimage::load(
             &mut cpu,
             &kernel,

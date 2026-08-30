@@ -132,7 +132,7 @@ fn engine_rejects_multiple_vcpus_for_the_interpreter() {
 }
 
 #[test]
-fn engine_rejects_user_networking_the_interpreter_does_not_implement() {
+fn engine_accepts_user_nat_networking_from_the_interpreter() {
     let directory = tempdir().unwrap();
     let kernel = directory.path().join("bzImage");
     let root = directory.path().join("root.img");
@@ -142,11 +142,10 @@ fn engine_rejects_user_networking_the_interpreter_does_not_implement() {
     config.devices.push(VmDevice::Network {
         mode: VmNetworkMode::UserNat,
     });
-    let (engine, _) = pure_rust_engine(EngineLimits::default());
-    assert!(matches!(
-        engine.launch(&config),
-        Err(SoftVmError::InvalidConfig(_))
-    ));
+    let (engine, build_info) = pure_rust_engine(EngineLimits::default());
+    assert!(build_info.supports(abi::FEATURE_USER_NETWORK));
+    let machine = engine.launch(&config).unwrap();
+    assert_eq!(machine.initial_snapshot().state, MachineState::Running);
 }
 
 #[test]
