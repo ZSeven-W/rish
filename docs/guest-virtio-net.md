@@ -191,13 +191,17 @@ example.com index page over the backend's TCP proxy. (e) fetched, verified
   attempts across four boots, 16 successes and 2 failures (one mid-transfer
   `I/O error`, one handshake `TLS: unspecified error` from the guest's TLS
   stack, each on a different boot). An immediate retry succeeded in every
-  observed case (3/3). The failures are intermittent and tied to real
-  network conditions: under burst loss the backend's single retransmission
-  timer stalls the connection until the loss is resent, and a TCP bridge
-  without fast retransmit or SACK is exactly that slow (see the inventory
-  below). The retransmit now resends every unacknowledged segment per
-  timeout (bounded, idempotent), which cut the recovery time; the residual
-  flakiness is reported here as-is, not papered over.
+  observed case (3/3). The attribution above ("real packet loss plus a
+  single retransmission timer") was an unverified inference; the
+  independent review found a concrete alternative explanation and it is
+  fixed in the hardening round below: a legitimate host-side burst could
+  push the per-connection pending buffer past its cap within one poll, and
+  the backend then reset the connection mid-transfer. The cap is now a
+  backpressure point, never a kill switch, so that failure mode is gone.
+  Four post-fix attempts (one plus three more on a second boot) all
+  succeeded; that is consistent with the fix but too small a sample to
+  claim the 2/18 are fully explained -- the handshake failure in particular
+  has no matching defect here and may be real network noise.
 
 ### Offline regression (unchanged capability)
 
@@ -253,6 +257,132 @@ fixed with a regression test:
    SYN-ACK permanently unacknowledged (`our_una` started one sequence
    number too high), retransmitting the handshake until the connection
    reset; fixed with a regression assertion in the loopback test.
+
+## Hardening round (independent review, virtio-net)
+
+The block-device hardening round ended with an independent review of the
+network device, which confirmed four P1 defects and a P2 cluster across two
+untrusted input surfaces: the guest drives the descriptor rings from its
+own memory, and the backend parses bytes that arrived from the real
+network. Everything below is fixed with regression tests written red first
+(panic/hang/assert evidence against the pre-fix code), and the workspace
+suite went from 589 to 615 passing tests.
+
+### Shared virtqueue validation skeleton
+
+"Unbounded avail-ring delta" and "data movement before the whole chain
+validated" had each been patched once per device. `virtio/queue.rs` now
+owns the shared code both devices use:
+
+- `avail_delta`: the driver can never publish more entries than the ring
+  holds between two drains; a larger delta fails the device closed instead
+  of replaying one head per phantom slot.
+- `drain_available`: validates the three rings, bounds the delta, walks
+  each head through the device's processor, and publishes one used entry
+  per completion. The block drain and the net transmit drain both ride it.
+- `validated_chain`: the phase-1 gate. A chain is walked (ring, length,
+  and cycle bounds) and every descriptor buffer is proven inside guest RAM
+  before the device moves a single byte; `require_all_device_readable` /
+  `require_all_device_writable` and `total_bytes` cover the direction and
+  length checks. Only chains that passed phase 1 are ever touched.
+
+Not shared (deliberately): the receive drain keeps its own per-frame loop
+because each head consumes one backlogged frame and the ring must never be
+completed without data; the request-type semantics (blk header/sector
+layout, net 12-byte virtio_net_hdr/frame layout) stay in each device.
+
+### P1 fixes
+
+- **P1-A short DNS answers (panic).** The transaction id was read from the
+  4096-byte receive buffer without checking the datagram length, and the
+  guest-id rewrite indexed `answer[0..2]` on an empty vec: a zero- or
+  1-byte datagram from the configured resolver panicked the host. Answers
+  shorter than the 12-byte DNS header are now dropped and counted, and the
+  id is read from the bytes that actually arrived. Test:
+  `a_short_resolver_datagram_is_dropped_instead_of_panicking` (red: exact
+  panic at the old indexing site).
+- **P1-B DNS id exhaustion (permanent hang).** With all 65536 ids held,
+  `allocate_id` spun forever -- and the expiry sweep runs on the same
+  interpreter thread. Expired queries are now swept before allocation, the
+  pending table is capped at 1024, and the allocator returns None (query
+  dropped and counted) instead of spinning. Tests:
+  `id_exhaustion_fails_closed_instead_of_hanging`,
+  `a_query_beyond_the_pending_cap_is_dropped_not_forwarded`,
+  `expired_queries_are_swept_before_allocating_an_id` (red: the first two
+  hang on the pre-fix code; the cap test fails fast).
+- **P1-C RX zero-length descriptor (underflow) and write-before-validation.**
+  A zero-length writable descriptor at guest address 0 made the device write
+  an empty slice whose page-counter bump computed `start + len - 1` with
+  len == 0: debug panic, release ~4.5e15-page hang. `bump_page_counters`
+  now returns early on len == 0, the receive path validates the whole chain
+  (in-bounds, device-writable) before writing, and the header+frame are
+  laid out contiguously from chain offset 0, which also fixes the split
+  shape (the frame used to start at descriptor 1 offset 0, on top of the
+  header tail). Tests: `zero_length_device_writes_do_not_underflow_the_page_counters`
+  (red: overflow panic), `a_zero_length_receive_descriptor_keeps_header_and_frame_layout`,
+  `a_split_receive_chain_places_header_and_frame_contiguously`,
+  `a_receive_chain_fails_before_writing_when_a_later_descriptor_is_out_of_ram`.
+- **P1-D unbounded, uncancellable host threads.** Every SYN spawned a
+  blocking `TcpStream::connect` with no cap; a guest RST or device reset
+  could not interrupt a blocked connect or write, and reset left the
+  backend running. Concurrent connections are now capped at 64 (excess
+  SYNs get a RST), connects carry a 10 s timeout and socket writes a 5 s
+  timeout, and device reset tears the backend down (all connections, DNS
+  state, queued frames), so every teardown path -- RST, connect failure,
+  retransmit exhaustion, reset -- reclaims its thread and socket. Tests:
+  `connection_creation_is_capped_and_excess_syns_get_a_reset`,
+  `a_connect_to_a_black_hole_fails_within_the_timeout`,
+  `a_reset_drops_every_connection_and_reclaims_the_host_socket`,
+  `a_device_reset_discards_stale_backend_frames`.
+
+### P2 fixes
+
+- **Host burst over the pending cap reset the connection** (the review's
+  alternative explanation for the intermittent `apk update` failures):
+  the cap is now a backpressure point -- draining stops, the bounded
+  channel stalls the host thread, and the host TCP stack shrinks its
+  window -- never a mid-transfer reset. Test:
+  `a_host_burst_over_the_pending_cap_applies_backpressure_not_a_reset`.
+- **ACKs outside the receive window** `[our_una, our_next]` are ignored
+  (an ACK past `our_next` used to be clamped and confirm data the guest
+  never received). Test: `an_ack_outside_the_receive_window_is_ignored`.
+- **Sequence wrap turning retransmitted data into SYN-ACK**: the SYN flag
+  comes from the segment record, not sequence equality with `our_isn`.
+  Test: `retransmitted_data_never_reuses_the_syn_flag`.
+- **Retransmit exhaustion now sends the RST it counts**, instead of closing
+  silently and leaving the guest to time out (~6.75 s of silence under
+  loss). Test: `retransmit_exhaustion_sends_the_rst_it_counts`.
+- **payload+FIN sequence accounting**: the FIN lands at `seq + payload_len`,
+  so a segment carrying both completes the close instead of being read as a
+  duplicate FIN. Test:
+  `a_payload_and_fin_in_one_segment_advances_the_fin_sequence`.
+- **UDP length and ICMP checksum**: a UDP datagram whose length field lies
+  is dropped; ICMP echo requests must carry a valid ICMP checksum. Tests:
+  `a_udp_datagram_with_a_lying_length_field_is_dropped`,
+  `echo_replies_refuse_a_request_with_a_bad_checksum`.
+- **Backend frames past the 1514-byte MTU** are dropped and counted on the
+  receive path too (the cap was transmit-only). Test:
+  `an_oversized_backend_frame_is_dropped_at_the_device`.
+- **Oversized transmit completion lengths** saturate at u32::MAX instead of
+  truncating a u128 total. Test:
+  `an_oversized_transmit_chain_reports_a_saturated_length`.
+- **Host clock before 1970** no longer collapses every ISN seed to a
+  constant: seeds fold the wall clock and a per-process salt through an
+  OS-entropy-keyed hasher. Test:
+  `isn_seeds_stay_distinct_when_the_clock_reads_before_1970`.
+
+### Regression record (this round, real runs)
+
+`cargo test --workspace`: 615 passed / 0 failed / 3 ignored (baseline 589).
+
+`RISH_NETWORK` unset, root disk built by `build-root-disk.sh`: `apk add
+tree` from the baked file repo, `/dev/vda` mounted, and the marker read
+back byte for byte.
+
+`RISH_NETWORK=user-nat`, `/etc/apk/repositories` pointing at the https
+mirror (main + community) from the root disk: gateway ping, then `apk
+update` fetching both indexes over the backend (DNS + TLS + TCP), exit 0,
+28,641 packages. Three more updates on a second boot: 3/3, exit 0.
 
 ## Explicitly not implemented / not verified (fail-closed inventory)
 
