@@ -7,7 +7,7 @@ use crate::devices::ioapic::{IOAPIC_BASE, IOAPIC_SIZE, IoApic};
 use crate::devices::lapic::{LAPIC_BASE, LAPIC_SIZE, LocalApic};
 use crate::virtio::{
     GuestMemory, VIRTIO_MMIO_BASE, VIRTIO_MMIO_REGISTER_BYTES, VIRTIO_MMIO_WINDOW_BYTES,
-    VirtioError, VirtioMmioBlk,
+    VIRTIO_NET_MMIO_BASE, VirtioError, VirtioMmioBlk, VirtioMmioNet,
 };
 
 pub struct Memory {
@@ -16,6 +16,10 @@ pub struct Memory {
     ioapic: RefCell<IoApic>,
     /// The virtio-mmio block device, when a backend is attached.
     virtio_blk: Option<RefCell<VirtioMmioBlk>>,
+    /// The virtio-mmio network device, when a backend is attached.
+    virtio_net: Option<RefCell<VirtioMmioNet>>,
+    /// Host timestamp of the last RISH_DBG_NET diagnostics line.
+    net_dbg_last: Option<std::time::Instant>,
     /// Bumped on every write so translation caches can invalidate cheaply.
     generation: u64,
     /// Per-4KiB-page write counter. A decode-cache entry records the page's
@@ -46,6 +50,8 @@ impl Memory {
             lapic: None,
             ioapic: RefCell::new(IoApic::new()),
             virtio_blk: None,
+            virtio_net: None,
+            net_dbg_last: None,
             generation: 0,
             code_gen: vec![0_u32; pages].into_boxed_slice(),
         })
@@ -124,6 +130,10 @@ impl Memory {
         (VIRTIO_MMIO_BASE..VIRTIO_MMIO_BASE + VIRTIO_MMIO_WINDOW_BYTES).contains(&address)
     }
 
+    fn in_virtio_net(address: u64) -> bool {
+        (VIRTIO_NET_MMIO_BASE..VIRTIO_NET_MMIO_BASE + VIRTIO_MMIO_WINDOW_BYTES).contains(&address)
+    }
+
     /// Attaches the virtio-mmio block device. A second device is refused so
     /// a caller can never silently replace a running backend.
     pub fn attach_virtio_blk(&mut self, device: VirtioMmioBlk) -> Result<(), CpuError> {
@@ -136,12 +146,32 @@ impl Memory {
         Ok(())
     }
 
+    /// Attaches the virtio-mmio network device. A second device is refused
+    /// so a caller can never silently replace a running backend.
+    pub fn attach_virtio_net(&mut self, device: VirtioMmioNet) -> Result<(), CpuError> {
+        if self.virtio_net.is_some() {
+            return Err(CpuError::InvalidConfig(
+                "a virtio network device is already attached".to_owned(),
+            ));
+        }
+        self.virtio_net = Some(RefCell::new(device));
+        Ok(())
+    }
+
     /// The sticky fail-closed fault the block device latched, if any. The
     /// provider surfaces it for diagnostics; the device itself stops
     /// servicing after it latches.
     #[must_use]
     pub fn virtio_blk_fault(&self) -> Option<String> {
         self.virtio_blk
+            .as_ref()
+            .and_then(|device| device.borrow().fault().map(str::to_owned))
+    }
+
+    /// The sticky fail-closed fault the network device latched, if any.
+    #[must_use]
+    pub fn virtio_net_fault(&self) -> Option<String> {
+        self.virtio_net
             .as_ref()
             .and_then(|device| device.borrow().fault().map(str::to_owned))
     }
@@ -169,6 +199,49 @@ impl Memory {
                 completed
             }
             // poll_kick latches the fault itself; no edge is raised.
+            Err(_) => false,
+        }
+    }
+
+    /// Services the network device: transmit kicks, the host backend poll
+    /// (wall-clock throttled inside the device), and receive-buffer fills.
+    /// Returns true when at least one buffer completed, so the CPU can raise
+    /// the used-ring interrupt edge on the device's IRQ line.
+    pub fn poll_virtio_net(&mut self) -> bool {
+        let Some(device) = &self.virtio_net else {
+            return false;
+        };
+        let mut device = device.borrow_mut();
+        // Env-gated diagnostics: fault, counters, and drop tallies, at most
+        // once every two seconds of host time. The device itself stops
+        // servicing after it latches a fault, so this is the only place the
+        // host can see why.
+        if std::env::var_os("RISH_DBG_NET").is_some() {
+            if self
+                .net_dbg_last
+                .map_or(true, |last| last.elapsed() >= std::time::Duration::from_secs(2))
+            {
+                self.net_dbg_last = Some(std::time::Instant::now());
+                eprintln!(
+                    "[rish-softvm net] fault={:?} {}",
+                    device.fault(),
+                    device.debug_state(),
+                );
+            }
+        }
+        let mut guest = DeviceMemory {
+            ram: &mut self.ram,
+            code_gen: &mut self.code_gen,
+            wrote: false,
+        };
+        match device.poll(&mut guest) {
+            Ok(completed) => {
+                if guest.wrote {
+                    self.generation = self.generation.wrapping_add(1);
+                }
+                completed
+            }
+            // poll latches the fault itself; no edge is raised.
             Err(_) => false,
         }
     }
@@ -206,6 +279,32 @@ impl Memory {
 
     #[inline]
     pub fn read(&self, address: u64, output: &mut [u8]) -> Result<(), CpuError> {
+        if Self::in_virtio_net(address) {
+            let offset = address - VIRTIO_NET_MMIO_BASE;
+            if offset >= VIRTIO_MMIO_REGISTER_BYTES {
+                for slot in output.iter_mut() {
+                    *slot = 0;
+                }
+                return Ok(());
+            }
+            if let Some(device) = &self.virtio_net {
+                let value = device.borrow_mut().mmio_read(offset);
+                let bytes = value.to_le_bytes();
+                let count = output.len().min(4);
+                output[..count].copy_from_slice(&bytes[..count]);
+                if output.len() > 4 {
+                    let value2 = device.borrow_mut().mmio_read(offset + 4);
+                    let bytes2 = value2.to_le_bytes();
+                    let rest = output.len() - 4;
+                    output[4..].copy_from_slice(&bytes2[..rest]);
+                }
+            } else {
+                for slot in output.iter_mut() {
+                    *slot = 0;
+                }
+            }
+            return Ok(());
+        }
         if Self::in_virtio(address) {
             let offset = address - VIRTIO_MMIO_BASE;
             if offset >= VIRTIO_MMIO_REGISTER_BYTES {
@@ -279,6 +378,29 @@ impl Memory {
 
     #[inline]
     pub fn write(&mut self, address: u64, input: &[u8]) -> Result<(), CpuError> {
+        if Self::in_virtio_net(address) {
+            let offset = address - VIRTIO_NET_MMIO_BASE;
+            if offset < VIRTIO_MMIO_REGISTER_BYTES {
+                if std::env::var_os("RISH_DBG_NET").is_some() {
+                    let mut buffer = [0_u8; 4];
+                    let count = input.len().min(4);
+                    buffer[..count].copy_from_slice(&input[..count]);
+                    eprintln!(
+                        "[rish-softvm net wr] offset={offset:#x} value={:#010x}",
+                        u32::from_le_bytes(buffer),
+                    );
+                }
+                if let Some(device) = &self.virtio_net {
+                    let mut buffer = [0_u8; 4];
+                    let count = input.len().min(4);
+                    buffer[..count].copy_from_slice(&input[..count]);
+                    device
+                        .borrow_mut()
+                        .mmio_write(offset, u32::from_le_bytes(buffer));
+                }
+            }
+            return Ok(());
+        }
         if Self::in_virtio(address) {
             let offset = address - VIRTIO_MMIO_BASE;
             if offset < VIRTIO_MMIO_REGISTER_BYTES {

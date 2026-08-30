@@ -8,7 +8,8 @@ use crate::arch::paging::{self, AccessKind, Translation};
 use crate::arch::registers::{CpuMode, Registers, index};
 use crate::arch::segments::{Descriptor, SegmentRegister, SegmentSelector};
 use crate::devices::{Cmos, InterruptLines, Pic8259, Pit8254, PortBus, Uart16550};
-use crate::virtio::{self, BlockBackend, VirtioMmioBlk};
+use crate::net::NetBackend;
+use crate::virtio::{self, BlockBackend, VirtioMmioBlk, VirtioMmioNet};
 use crate::{CpuError, Memory};
 
 mod decode;
@@ -227,6 +228,14 @@ impl Cpu {
         self.memory.attach_virtio_blk(device)
     }
 
+    /// Attaches the virtio-mmio network device backed by the given host-side
+    /// user-mode backend. The guest discovers it through the virtio_mmio
+    /// kernel command line (appended by the provider) and raises used-ring
+    /// interrupts on VIRTIO_NET_IRQ.
+    pub fn attach_virtio_net(&mut self, backend: Box<dyn NetBackend>) -> Result<(), CpuError> {
+        self.memory.attach_virtio_net(VirtioMmioNet::new(backend))
+    }
+
     fn record_io(&mut self, write: bool, port: u16, size: u8, value: u32) {
         if self.io_log_capacity == 0 {
             return;
@@ -312,6 +321,11 @@ impl Cpu {
         if self.memory.poll_virtio_irq() {
             self.pic.pulse(virtio::VIRTIO_IRQ);
             self.memory.ioapic_pulse(virtio::VIRTIO_IRQ, levels);
+        }
+        // Same edge discipline for the network device on its own IRQ line.
+        if self.memory.poll_virtio_net() {
+            self.pic.pulse(virtio::VIRTIO_NET_IRQ);
+            self.memory.ioapic_pulse(virtio::VIRTIO_NET_IRQ, levels);
         }
         self.pic.set_input(self.lines);
         self.memory.ioapic_set_lines(levels);
