@@ -160,7 +160,15 @@ impl MachineProvider for PureRustProvider {
             Some(file) => Some(read_artifact("initrd", file.path())?),
             None => None,
         };
-        let mut cpu = Cpu::new(memory_mib, 0)
+        // Boot the guest with the host's wall clock: the guest's TLS stack
+        // verifies certificate validity against its own RTC, and a guest
+        // stuck at the kernel's RTC-invalid fallback date (1999-11-30) can
+        // never pass that check.
+        let boot_epoch_seconds = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        let mut cpu = Cpu::new(memory_mib, boot_epoch_seconds)
             .map_err(|error| SoftVmError::InvalidConfig(error.to_string()))?;
         // The validated root disk image becomes the virtio-blk backend. The
         // backend rejects non-512-byte-multiple sizes; everything else about
