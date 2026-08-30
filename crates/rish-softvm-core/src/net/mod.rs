@@ -293,6 +293,16 @@ impl NetBackend for SlirpNetBackend {
     fn counters(&self) -> NetCounters {
         self.counters
     }
+
+    fn reset(&mut self) {
+        // A device reset (status 0) tears the backend down with it: open
+        // connections, pending DNS queries, and queued frames must not
+        // outlive the reset into the next driver session.
+        self.tcp.reset();
+        self.udp.reset();
+        self.output.clear();
+        self.ip_id = 0;
+    }
 }
 
 /// Host resolver address for the DNS forwarder, read once at construction.
