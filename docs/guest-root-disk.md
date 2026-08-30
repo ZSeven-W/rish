@@ -63,17 +63,18 @@ trip, determinism, symlink rejection, name validation), two builds of a
 realistic overlay compared byte-for-byte, extraction compared file-by-file,
 macOS `hdiutil` mount + kernel vfat read-back, and symlink rejection.
 
-## How far root_disk_path actually works (fail-closed findings)
+## How far root_disk_path actually works (status)
 
 ### The parameter plumbing is complete (verified line by line)
 
 | Layer | Location | Behavior |
 |---|---|---|
 | FFI JSON | `crates/rish-ffi/src/vm_ffi.rs` (`VmRunRequest.root_disk_path`, `boot_channel`) | Both `rish_vm_boot_session` and `rish_vm_run_docker_json` accept an optional `root_disk_path`; when omitted a 64 MiB scratch file is materialized (because `VmConfig` requires a non-empty value) |
-| Config | `crates/rish-vm/src/config.rs:88` | `root_disk_path` must be non-empty |
-| Artifact check | `crates/rish-softvm-x86_64/src/artifacts.rs:62-65` | Must be a regular, non-empty file of at most 16 GiB (`max_root_disk_bytes`) |
-| Provider | `crates/rish-softvm-x86_64/src/provider.rs:268-276` | The TCTI (QEMU) provider forwards the path into `RishTctiConfigV1.root_disk_path` across the C ABI; `PureRustProvider` reads only kernel + initrd and emulates no block device (`pure_rust.rs`: "It does not declare virtio-block") |
-| Device gate | `crates/rish-softvm-x86_64/src/engine.rs` (`validate_engine_config`) | Only Console/Network devices are admitted today |
+| Config | `crates/rish-vm/src/config.rs` | `root_disk_path` must be non-empty; the command line must not contain NUL bytes (which would hide appended device declarations from the kernel) |
+| Artifact check | `crates/rish-softvm-x86_64/src/artifacts.rs` | Must be a regular, non-empty file of at most 16 GiB (`max_root_disk_bytes`), checked on the path **and** on the opened inode; the validated handle is what the provider serves |
+| Provider (pure Rust) | `crates/rish-softvm-x86_64/src/pure_rust.rs` | Binds the validated root-disk handle as the virtio-blk backend and attaches the emulated block device |
+| Provider (TCTI/QEMU) | `crates/rish-softvm-x86_64/src/provider.rs` | Forwards the path into `RishTctiConfigV1.root_disk_path` across the C ABI |
+| Device gate | `crates/rish-softvm-x86_64/src/engine.rs` (`validate_engine_config`) | Console, root block (implicit), and optional user NAT are admitted |
 | Swift | `platform/ios/RishBridge.swift` (`RishVMRunRequest.rootDiskPath`) | Encodes as `root_disk_path` |
 
 ### Format and mount-point semantics
@@ -84,34 +85,35 @@ image file. The format is a guest-side consumption contract (FAT16 as defined
 here), and the mount point is up to the guest init (convention: mount
 `/dev/vda` and copy over `/etc`, or mount at `/mnt/overlay`).
 
-### Prerequisites that are not met yet (stated plainly)
+### Prerequisites (status)
 
-1. **The pure-Rust interpreter emulates no block device.** The FFI path the
-   app actually uses (`vm_ffi.rs` builds a `PureRustProvider`) accepts and
-   validates `root_disk_path`, but the guest has no `/dev/vda` and never sees
-   the image content (confirmed dynamically below).
-2. **The kernel drivers are modules.** Alpine virt 6.18.35 has
-   `CONFIG_VIRTIO_BLK=m`, `CONFIG_VFAT_FS=m`, `CONFIG_EXT4_FS=m` (checked in
-   `config-6.18.35-0-virt`). The container initramfs ships no modules; the
-   docker initramfs ships modloop. Even with a block device present, the
-   container guest still needs module loading plus an init step that detects
-   `/dev/vda`, mounts it, and overlays `/etc`.
+1. **The pure-Rust interpreter emulates the block device.** This document
+   predates that work; `docs/guest-virtio-blk.md` records the device, the
+   fail-closed servicing contract, and the end-to-end proof: the guest sees
+   `/dev/vda`, mounts the FAT16 image, and reads and writes files through it.
+2. **The kernel drivers are modules and are now baked in.** Alpine virt
+   6.18.35 has `CONFIG_VIRTIO_BLK=m`, `CONFIG_VFAT_FS=m`; the container
+   initramfs bakes `virtio_blk`, `fat`, `vfat`, `nls_cp437`, `nls_ascii`,
+   and `nls_utf8` plus the virtio-net module stack (see
+   `docs/guest-virtio-blk.md` and `docs/guest-virtio-net.md`). The overlay
+   init insmods them, so the guest-side mount works; an init step that
+   mounts `/dev/vda` and overlays `/etc` is the app's job.
 3. **The TCTI (QEMU) path is only verified up to C ABI argument passing**;
    attaching a disk was not exercised against a QEMU provider.
 
 ## Verification record (what was actually checked)
 
 - Static: every code path in the table above was read and confirmed.
-- Dynamic A (FFI JSON, real boot): `vm_smoke` (the
-  `rish_vm_run_docker_json` example) booted the kernel + container initramfs
-  with a FAT16 root disk built by `build-root-disk.sh`. The boot succeeded
-  (1,172,500,000 boot units) but the guest `/dev` contained only
-  `console`, `null`, `ttyS0` and `cat /etc/apk/repositories` failed with
-  "No such file or directory": the parameter is accepted and the file is
-  validated, but the pure-Rust path does not attach the disk.
+- Dynamic A (FFI JSON, real boot, current): the proof recorded in
+  `docs/guest-virtio-blk.md` — `vm_smoke` (the `rish_vm_run_docker_json`
+  example) booted the kernel + container initramfs with a FAT16 root disk
+  built by `build-root-disk.sh`; the guest's `/dev/vda` appeared, `mount -t
+  vfat` succeeded, and the guest read the host-written marker file byte for
+  byte, and wrote a file the host extractor read back intact.
+- The earlier "Dynamic A" run recorded in the original version of this
+  document (guest had no block device) is superseded by the virtio-blk
+  milestone above.
 - Dynamic B (iOS simulator, C ABI + Swift): `run-vm-simulator.sh` staged
-  `rish-root-disk.img` into the demo bundle and passed it as
-  `rootDiskPath`; the in-guest probe shows the same absence of a block
-  device.
-- Not verified: real devices / arm64, QEMU TCTI disk attach, and an actual
-  in-guest vfat mount (module gap above).
+  `rish-root-disk.img` into the demo bundle; in-guest probing on the iOS
+  simulator path has not been re-run since the block device landed.
+- Not verified: real devices / arm64, QEMU TCTI disk attach.

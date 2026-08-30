@@ -30,37 +30,58 @@ platform driver probes the register file (magic `virt`, version 2, device id
   ready/notify, interrupt status/ack, device status with reset, and the
   block config space (capacity as two words, seg_max, blk_size).
 - Feature bits offered: `VIRTIO_F_VERSION_1`, `VIRTIO_BLK_F_SEG_MAX`
-  (126), `VIRTIO_BLK_F_BLK_SIZE` (512).
-- One split virtqueue (max 128 descriptors) with `VIRTIO_BLK_T_IN` (read),
-  `VIRTIO_BLK_T_OUT` (write), and `VIRTIO_BLK_T_GET_ID` (fixed serial
-  `RISH-VIRTIO-BLK-01`, space-padded) processing. Multi-segment requests are
-  supported; data is moved in bounded 64 KiB chunks so a hostile segment
-  length cannot force a large allocation.
+  (62, matching the 64-descriptor chain budget: header + segments + status),
+  `VIRTIO_BLK_F_BLK_SIZE` (512).
+- One split virtqueue (max 128 descriptors, minimum 3 so a request chain
+  fits) with `VIRTIO_BLK_T_IN` (read), `VIRTIO_BLK_T_OUT` (write), and
+  `VIRTIO_BLK_T_GET_ID` (fixed serial `RISH-VIRTIO-BLK-01`, space-padded)
+  processing. Multi-segment requests are supported; all data movement
+  (including GET_ID) happens in bounded 64 KiB chunks so a hostile segment
+  length cannot force a large host allocation.
 - Used-ring completions raise one interrupt edge on I/O APIC pin 10 through
   both interrupt controllers, drained on the CPU device tick, matching the
   16550 wiring.
-- Fail-closed bounds checking everywhere: the three rings must fit in guest
-  RAM before the first drain; every descriptor address is checked on access;
-  chains that leave the ring, cycle, or exceed the device limit, and any
-  guest-physical access outside RAM, latch a **sticky device fault** (the
-  device stops servicing until the machine restarts) instead of panicking or
-  reading past the end of memory. Requests past the backend capacity complete
-  with `VIRTIO_BLK_S_IOERR` and move no data. Host backend I/O failures also
-  complete the request with IOERR and keep the device alive.
+- **Whole-chain validation before any data movement.** Every request chain
+  is fully validated first — header/status shape, every descriptor inside
+  guest RAM, the direction bits each request type demands (IN/GET_ID data
+  descriptors device-writable, OUT data descriptors device-readable), and
+  sector-aligned IN/OUT lengths — and only then is a single byte moved
+  between guest RAM and the host disk. A malformed chain fails closed with
+  a **sticky device fault** (the device stops servicing until the machine
+  restarts) and can never leave a partial copy in guest RAM or a partial
+  write on the host disk.
+- Further fail-closed bounds checking: the three rings must fit in guest RAM
+  before the first drain; the available-ring delta between two drains is
+  capped by the queue size (a larger delta is a malformed ring, not a
+  license to replay one request thousands of times); chains that leave the
+  ring, cycle, or exceed the device limit latch the fault; queue kicks
+  before the driver sets `DRIVER_OK` are dropped; queue configuration
+  written through a nonexistent queue selection is ignored; requests past
+  the backend capacity complete with `VIRTIO_BLK_S_IOERR` and move no data;
+  used-ring lengths count exactly the device-writable bytes written (data +
+  status for IN/GET_ID, the status byte alone for OUT and error
+  completions). Host backend I/O failures also complete the request with
+  IOERR and keep the device alive; a host hard error mid-request can leave
+  earlier 64 KiB chunks committed (the same undefined-data-state contract
+  real disks offer), but no *guest-controllable* input can cause a partial
+  transfer.
 - The host file is the backend (`FileBlockBackend`, opened read-write, with
   pread/pwrite on unix): the disk image is never held in memory. Sizes that
   are not a multiple of 512 bytes are rejected at attach time.
 
 ## Provider wiring (`crates/rish-softvm-x86_64/src/pure_rust.rs`)
 
-`PureRustProvider::create` now opens the validated `root_disk_path` as a
-`FileBlockBackend`, attaches it to the interpreter, appends the
-`virtio_mmio.device` cmdline fragment, and declares
-`abi::FEATURE_VIRTIO_BLOCK`. The existing artifact validation is untouched
-(regular file, non-empty, at most 16 GiB, `artifacts.rs`). A command line
-that already declares `virtio_mmio.device` is rejected (the provider would
-otherwise double-attach the same window), and the provider keeps rejecting
-user networking.
+`PureRustProvider::create` binds the validated `root_disk_path` handle as a
+`FileBlockBackend` and attaches it to the interpreter. Artifact validation
+opens each file once and re-checks the opened inode (regular file,
+non-empty, at most 16 GiB, `artifacts.rs`); the provider reads the kernel,
+initrd, and root disk through that handle, never a re-opened path, so a
+path swap after validation cannot substitute an unchecked file. The
+provider appends the `virtio_mmio.device` cmdline fragments for the block
+device and (with `RISH_NETWORK=user-nat`) the network device, and declares
+`abi::FEATURE_VIRTIO_BLOCK` plus `abi::FEATURE_USER_NETWORK`. A command
+line that already declares `virtio_mmio.device` is rejected (the provider
+would otherwise double-attach the same window).
 
 ## Guest driver availability (`guest/x86_64/`)
 
@@ -76,8 +97,10 @@ insmods them after devtmpfs is mounted, so `/dev/vda` appears via devtmpfs as
 soon as `virtio_blk` registers; insmod failures are tolerated so a disk-less
 boot still reaches the agent.
 
-The rebuilt initramfs is 10,252,288 bytes (deterministic across two builds),
-sha256 `00077738b28950a7d95047d31dccb959b68df6abe3c5da13a05fc16d55f5e01e`.
+The current rebuilt initramfs (after the virtio-net milestone added the CA
+bundle and the failover module stack) is 10,797,056 bytes (deterministic
+across two builds), sha256
+`f45151656e71b3a3f4285023923a11bf37eec09fb4e2d76fbd74ed9952843492`.
 The previous capability (offline `apk add tree`) still passes (see
 `docs/guest-apk-offline.md`).
 

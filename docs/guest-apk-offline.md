@@ -32,22 +32,24 @@ packages end to end -- inside the pure-Rust interpreter, with no network.
   `/usr/bin/tree` binary runs. Raw output is quoted below.
 - Reproducibility: two consecutive builds produced byte-identical archives.
 
-## What was NOT proven (fail-closed)
+## What was NOT proven at the time of this proof (fail-closed)
 
-1. **Remote mirror URLs are unavailable.** The pure-Rust interpreter has no
-   virtio-net and no user-mode NAT/DNS (the roadmap item is still unchecked).
-   Only the `file://` repository works; an `https://dl-cdn...` mirror would
-   fail. This proof says nothing about network-based `apk update`.
-2. **Block-device configuration injection is unavailable.** The interpreter
-   emulates no virtio-blk; `root_disk_path` is accepted and validated but the
-   guest sees no disk (see `docs/guest-root-disk.md`). Configuration cannot
-   reach the guest through a root disk today; it must be baked at build time,
-   as this work does.
-3. **Nothing persists.** The initramfs rootfs lives in RAM. Installed packages
-   vanish at power-off; the `apk` database starts empty by design (the
-   initramfs payload sits outside apk's bookkeeping). A persistent guest still
-   needs block-device emulation plus the kernel modules listed in
-   `docs/guest-root-disk.md`.
+The first two gaps below were closed by later milestones and are listed for
+history only:
+
+1. **Remote mirror URLs.** Since the virtio-net milestone
+   (`docs/guest-virtio-net.md`) the interpreter has virtio-net with user-mode
+   NAT/DNS, and `apk update` against the real Alpine mirror is proven there
+   (with the documented network-flake caveat).
+2. **Block-device configuration injection.** Since the virtio-blk milestone
+   (`docs/guest-virtio-blk.md`) the interpreter emulates a virtio-mmio block
+   device over `root_disk_path`; the guest sees `/dev/vda` and can mount the
+   FAT16 image. Configuration can now reach the guest through a root disk,
+   though this document's proof still bakes it in at build time.
+3. **Nothing persists in this proof.** The initramfs rootfs lives in RAM.
+   Installed packages vanish at power-off; the `apk` database starts empty by
+   design (the initramfs payload sits outside apk's bookkeeping). A
+   persistent guest can now keep state on the root disk image.
 4. **Only a two-package snapshot is pinned.** The index is a frozen `main`
    snapshot: no community repo, no version drift follow-up, no `apk upgrade`
    path. Expanding the package set means pinning more assets the same way.
@@ -77,10 +79,12 @@ additionally bakes six kernel modules (virtio_blk, fat, vfat, nls_cp437,
 nls_ascii, nls_utf8) out of the pinned netboot initramfs, and the overlay
 init installs the busybox applets before mounting proc/sys/devtmpfs (the
 mounts previously ran before the applet links existed and silently failed).
-The deterministic rebuild now produces:
+The virtio-net milestone (`docs/guest-virtio-net.md`) then added the CA
+bundle and the virtio_net/failover module stack. The current deterministic
+rebuild produces:
 
-- 10,252,288 bytes
-- `df72a43ba0308b396e729d2daec758f04f8d5ad38792ef2ec1d232d21f6b85ad`
+- 10,797,056 bytes
+- `f45151656e71b3a3f4285023923a11bf37eec09fb4e2d76fbd74ed9952843492`
 
 The offline-apk regression below was re-run against this exact image and
 passes unchanged.
