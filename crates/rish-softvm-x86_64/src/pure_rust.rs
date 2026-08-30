@@ -16,7 +16,8 @@
 //! rish-softvm-core virtio and net modules for the implemented and explicitly
 //! unimplemented features.
 
-use std::fs;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 
 use rish_softvm_core::bzimage::{self, BootParams};
 use rish_softvm_core::net::{NetConfig, SlirpNetBackend};
@@ -117,12 +118,37 @@ fn host_architecture() -> String {
     std::env::consts::ARCH.to_owned()
 }
 
-fn read_artifact(kind: &'static str, path: &std::path::Path) -> Result<Vec<u8>, SoftVmError> {
-    fs::read(path).map_err(|source| SoftVmError::ArtifactRead {
+/// Reads an artifact through the handle the validation opened. Reading the
+/// path again would let a swapped file (TOCTOU) bypass validation, so the
+/// handle is the only read path.
+fn read_artifact(
+    kind: &'static str,
+    path: &std::path::Path,
+    file: Option<&File>,
+) -> Result<Vec<u8>, SoftVmError> {
+    let mut handle = file.ok_or_else(|| SoftVmError::ArtifactRead {
         kind,
         path: path.to_path_buf(),
-        source,
-    })
+        source: std::io::Error::other("artifact handle was not kept open at validation"),
+    })?;
+    // The kernel header check may have advanced the shared descriptor's
+    // position; always read from the start.
+    handle
+        .seek(SeekFrom::Start(0))
+        .map_err(|source| SoftVmError::ArtifactRead {
+            kind,
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let mut bytes = Vec::new();
+    handle
+        .read_to_end(&mut bytes)
+        .map_err(|source| SoftVmError::ArtifactRead {
+            kind,
+            path: path.to_path_buf(),
+            source,
+        })?;
+    Ok(bytes)
 }
 
 impl MachineProvider for PureRustProvider {
@@ -155,9 +181,13 @@ impl MachineProvider for PureRustProvider {
                 "the pure-Rust provider requires a 64-bit Linux bzImage".to_owned(),
             ));
         }
-        let kernel = read_artifact("kernel", request.artifacts.kernel.path())?;
+        let kernel = read_artifact(
+            "kernel",
+            request.artifacts.kernel.path(),
+            request.artifacts.kernel.file(),
+        )?;
         let initrd = match &request.artifacts.initrd {
-            Some(file) => Some(read_artifact("initrd", file.path())?),
+            Some(file) => Some(read_artifact("initrd", file.path(), file.file())?),
             None => None,
         };
         // Boot the guest with the host's wall clock: the guest's TLS stack
@@ -170,16 +200,29 @@ impl MachineProvider for PureRustProvider {
             .unwrap_or(0);
         let mut cpu = Cpu::new(memory_mib, boot_epoch_seconds)
             .map_err(|error| SoftVmError::InvalidConfig(error.to_string()))?;
-        // The validated root disk image becomes the virtio-blk backend. The
-        // backend rejects non-512-byte-multiple sizes; everything else about
-        // the image stays the guest's business (format, mount point).
-        let backend =
-            FileBlockBackend::open(request.artifacts.root_disk.path()).map_err(|source| {
-                SoftVmError::ArtifactRead {
+        // The validated root disk image becomes the virtio-blk backend,
+        // bound to the already-open validated handle (never a re-opened
+        // path). The backend rejects non-512-byte-multiple sizes;
+        // everything else about the image stays the guest's business
+        // (format, mount point).
+        let root_disk_path = request.artifacts.root_disk.path().to_path_buf();
+        let root_disk =
+            request
+                .artifacts
+                .root_disk
+                .into_file()
+                .ok_or_else(|| SoftVmError::ArtifactRead {
                     kind: "root disk",
-                    path: request.artifacts.root_disk.path().to_path_buf(),
-                    source,
-                }
+                    path: root_disk_path.clone(),
+                    source: std::io::Error::other(
+                        "root disk handle was not kept open at validation",
+                    ),
+                })?;
+        let backend =
+            FileBlockBackend::from_file(root_disk).map_err(|source| SoftVmError::ArtifactRead {
+                kind: "root disk",
+                path: root_disk_path,
+                source,
             })?;
         cpu.attach_virtio_blk(Box::new(backend))
             .map_err(|error| SoftVmError::InvalidConfig(error.to_string()))?;

@@ -5,7 +5,6 @@
 //! limits (regular file, non-empty, at most 16 GiB) keep applying unchanged.
 
 use std::fs::File;
-use std::path::Path;
 
 use crate::virtio::VirtioError;
 
@@ -28,17 +27,14 @@ pub struct FileBlockBackend {
 }
 
 impl FileBlockBackend {
-    /// Opens a disk image file and records its validated length. The caller
-    /// (the provider artifact validation) already checked that the path
-    /// names a regular, non-empty file within the engine size limit.
-    pub fn open(path: &Path) -> Result<Self, std::io::Error> {
-        // The guest mounts the root disk read-write (overlay staging, apk
-        // cache), so the backend needs write access too. A read-only path
-        // fails here instead of surfacing as a broken guest disk later.
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)?;
+    /// Takes ownership of an already-open, pre-validated disk image handle.
+    /// The provider's artifact layer opened the file read-write and checked
+    /// the opened inode (regular file, non-empty, within the engine size
+    /// limit); binding to that handle instead of re-opening the path means
+    /// a later path swap cannot substitute a file that skipped validation.
+    /// The guest mounts the root disk read-write (overlay staging, apk
+    /// cache), so the handle must have been opened with write access.
+    pub fn from_file(file: File) -> Result<Self, std::io::Error> {
         let length = file.metadata()?.len();
         Ok(Self { file, length })
     }
@@ -157,7 +153,12 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("disk.img");
         std::fs::write(&path, vec![0x11; 8192]).unwrap();
-        let mut backend = FileBlockBackend::open(&path).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut backend = FileBlockBackend::from_file(file).unwrap();
         assert_eq!(backend.length(), 8192);
         backend.write_at(4096, &[1, 2, 3, 4]).unwrap();
         let mut buffer = [0_u8; 4];

@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File},
-    io::Read,
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
 
@@ -20,10 +20,16 @@ pub enum KernelFormat {
     Elf64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct ArtifactFile {
     path: PathBuf,
     bytes: u64,
+    /// The open handle the validation was performed on. Consumers that need
+    /// the file contents must read through this handle, never re-open the
+    /// path: a path swap between validation and use (TOCTOU) would otherwise
+    /// substitute a file that never passed the checks. Shared through an Arc
+    /// because the worker keeps a cloned artifact set for its snapshots.
+    file: Option<std::sync::Arc<File>>,
 }
 
 impl ArtifactFile {
@@ -36,9 +42,29 @@ impl ArtifactFile {
     pub fn bytes(&self) -> u64 {
         self.bytes
     }
+
+    /// The validated open handle. Always `Some` for artifacts loaded through
+    /// [`ValidatedArtifacts::load`].
+    #[must_use]
+    pub fn file(&self) -> Option<&File> {
+        self.file.as_deref()
+    }
+
+    /// The validated open handle by value. When another clone of this
+    /// artifact still shares the handle, the descriptor is duplicated; the
+    /// duplicate refers to the same open file, so the inode stays the one
+    /// that was validated.
+    #[must_use]
+    pub fn into_file(self) -> Option<File> {
+        let shared = self.file?;
+        match std::sync::Arc::try_unwrap(shared) {
+            Ok(file) => Some(file),
+            Err(shared) => shared.try_clone().ok(),
+        }
+    }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct ValidatedArtifacts {
     pub kernel: ArtifactFile,
     pub kernel_format: KernelFormat,
@@ -48,21 +74,36 @@ pub struct ValidatedArtifacts {
 
 impl ValidatedArtifacts {
     pub(crate) fn load(config: &VmConfig, limits: &EngineLimits) -> Result<Self, SoftVmError> {
-        let kernel = regular_file(
+        let mut kernel = regular_file(
             Path::new(&config.kernel_path),
             "kernel",
             limits.max_kernel_bytes,
+            false,
         )?;
-        let kernel_format = validate_kernel(kernel.path())?;
+        // The kernel header check reads through the same handle the
+        // metadata validation used, so the two checks can never observe
+        // different files.
+        let kernel_path = kernel.path().to_path_buf();
+        let kernel_format = validate_kernel(
+            std::sync::Arc::get_mut(
+                kernel
+                    .file
+                    .as_mut()
+                    .expect("regular_file always keeps the open handle"),
+            )
+            .expect("the fresh artifact handle is not yet shared"),
+            &kernel_path,
+        )?;
         let initrd = config
             .initrd_path
             .as_deref()
-            .map(|path| regular_file(Path::new(path), "initrd", limits.max_initrd_bytes))
+            .map(|path| regular_file(Path::new(path), "initrd", limits.max_initrd_bytes, false))
             .transpose()?;
         let root_disk = regular_file(
             Path::new(&config.root_disk_path),
             "root disk",
             limits.max_root_disk_bytes,
+            true,
         )?;
         Ok(Self {
             kernel,
@@ -73,7 +114,16 @@ impl ValidatedArtifacts {
     }
 }
 
-fn regular_file(path: &Path, kind: &'static str, limit: u64) -> Result<ArtifactFile, SoftVmError> {
+/// Validates a path, then opens it once and re-validates the opened inode,
+/// keeping the handle. Everything the engine reads afterwards goes through
+/// this handle, so a path swap after validation (TOCTOU) cannot substitute
+/// a file that skipped the regular-file, non-empty, and size-limit checks.
+fn regular_file(
+    path: &Path,
+    kind: &'static str,
+    limit: u64,
+    writable: bool,
+) -> Result<ArtifactFile, SoftVmError> {
     let metadata = fs::metadata(path).map_err(|source| SoftVmError::ArtifactRead {
         kind,
         path: path.to_path_buf(),
@@ -96,18 +146,58 @@ fn regular_file(path: &Path, kind: &'static str, limit: u64) -> Result<ArtifactF
             limit,
         });
     }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    if writable {
+        options.write(true);
+    }
+    let file = options
+        .open(path)
+        .map_err(|source| SoftVmError::ArtifactRead {
+            kind,
+            path: path.to_path_buf(),
+            source,
+        })?;
+    // Re-check the opened inode: the path-level metadata above is only a
+    // fast fail for config errors; these checks bind to what was opened.
+    let opened = file
+        .metadata()
+        .map_err(|source| SoftVmError::ArtifactRead {
+            kind,
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if !opened.is_file() {
+        return Err(SoftVmError::InvalidConfig(format!(
+            "{kind} path must name a regular file"
+        )));
+    }
+    if opened.len() == 0 {
+        return Err(SoftVmError::InvalidConfig(format!(
+            "{kind} artifact cannot be empty"
+        )));
+    }
+    if opened.len() > limit {
+        return Err(SoftVmError::ArtifactTooLarge {
+            kind,
+            actual: opened.len(),
+            limit,
+        });
+    }
     Ok(ArtifactFile {
         path: path.to_path_buf(),
-        bytes: metadata.len(),
+        bytes: opened.len(),
+        file: Some(std::sync::Arc::new(file)),
     })
 }
 
-fn validate_kernel(path: &Path) -> Result<KernelFormat, SoftVmError> {
-    let mut file = File::open(path).map_err(|source| SoftVmError::ArtifactRead {
-        kind: "kernel",
-        path: path.to_path_buf(),
-        source,
-    })?;
+fn validate_kernel(file: &mut File, path: &Path) -> Result<KernelFormat, SoftVmError> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| SoftVmError::ArtifactRead {
+            kind: "kernel",
+            path: path.to_path_buf(),
+            source,
+        })?;
     let mut header = vec![0; LINUX_BOOT_HEADER_END];
     let read = file
         .read(&mut header)
@@ -169,9 +259,10 @@ mod tests {
         image[0x1fe..0x200].copy_from_slice(&[0x55, 0xaa]);
         image[0x202..0x206].copy_from_slice(b"HdrS");
         file.write_all(&image).unwrap();
+        let path = file.path().to_path_buf();
 
         assert!(matches!(
-            validate_kernel(file.path()),
+            validate_kernel(file.as_file_mut(), &path),
             Err(SoftVmError::InvalidKernel(_))
         ));
     }
@@ -186,7 +277,62 @@ mod tests {
         image[6] = 1;
         image[18..20].copy_from_slice(&ELF_MACHINE_X86_64.to_le_bytes());
         file.write_all(&image).unwrap();
+        let path = file.path().to_path_buf();
 
-        assert_eq!(validate_kernel(file.path()).unwrap(), KernelFormat::Elf64);
+        assert_eq!(
+            validate_kernel(file.as_file_mut(), &path).unwrap(),
+            KernelFormat::Elf64
+        );
+    }
+
+    #[test]
+    fn the_root_disk_binds_to_the_validated_inode_not_the_path() {
+        use rish_vm::{VmAcceleration, VmDevice};
+
+        let directory = tempfile::tempdir().unwrap();
+        let kernel_path = directory.path().join("vmlinuz");
+        let disk_path = directory.path().join("root.img");
+        // A minimal valid 64-bit bzImage header so the kernel passes
+        // validate_kernel.
+        let mut image = vec![0_u8; LINUX_BOOT_HEADER_END];
+        image[0x1fe..0x200].copy_from_slice(&[0x55, 0xaa]);
+        image[0x202..0x206].copy_from_slice(b"HdrS");
+        image[0x236..0x238].copy_from_slice(&XLF_KERNEL_64.to_le_bytes());
+        std::fs::write(&kernel_path, &image).unwrap();
+        std::fs::write(&disk_path, vec![0x11; 4096]).unwrap();
+
+        let config = VmConfig {
+            architecture: "x86_64".to_owned(),
+            vcpus: 1,
+            memory_mib: 128,
+            kernel_path: kernel_path.to_string_lossy().into_owned(),
+            initrd_path: None,
+            root_disk_path: disk_path.to_string_lossy().into_owned(),
+            acceleration: VmAcceleration::Interpreter,
+            devices: vec![VmDevice::Console],
+            command_line: String::new(),
+        };
+        let artifacts = ValidatedArtifacts::load(&config, &EngineLimits::default()).unwrap();
+
+        // After validation, a hostile process swaps the path for a sparse
+        // file far beyond the engine limit.
+        std::fs::remove_file(&disk_path).unwrap();
+        let swapped = File::create(&disk_path).unwrap();
+        swapped.set_len(32 * 1024 * 1024 * 1024).unwrap();
+
+        assert_eq!(artifacts.root_disk.bytes(), 4096);
+        // The backend binds to the validated handle: the original 4096-byte
+        // image, not the 32 GiB replacement.
+        let mut backend = rish_softvm_core::virtio::FileBlockBackend::from_file(
+            artifacts.root_disk.into_file().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            rish_softvm_core::virtio::BlockBackend::length(&backend),
+            4096
+        );
+        let mut first = [0_u8; 4];
+        rish_softvm_core::virtio::BlockBackend::read_at(&mut backend, 0, &mut first).unwrap();
+        assert_eq!(first, [0x11; 4]);
     }
 }
