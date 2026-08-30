@@ -217,10 +217,9 @@ impl Memory {
         // servicing after it latches a fault, so this is the only place the
         // host can see why.
         if std::env::var_os("RISH_DBG_NET").is_some() {
-            if self
-                .net_dbg_last
-                .map_or(true, |last| last.elapsed() >= std::time::Duration::from_secs(2))
-            {
+            if self.net_dbg_last.map_or(true, |last| {
+                last.elapsed() >= std::time::Duration::from_secs(2)
+            }) {
                 self.net_dbg_last = Some(std::time::Instant::now());
                 eprintln!(
                     "[rish-softvm net] fault={:?} {}",

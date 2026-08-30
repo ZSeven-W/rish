@@ -232,7 +232,12 @@ impl TcpState {
                 guest_mss,
                 our_isn,
                 our_next: our_isn.wrapping_add(1),
-                our_una: our_isn.wrapping_add(1),
+                // The SYN-ACK occupies sequence our_isn, so the first
+                // unacknowledged sequence number starts AT our_isn; the
+                // guest's acknowledgement of the handshake (our_isn + 1)
+                // then advances past it and pops the SYN-ACK from the
+                // retransmission queue.
+                our_una: our_isn,
                 pending: VecDeque::new(),
                 unacked: VecDeque::new(),
                 retransmit_deadline: None,
@@ -608,33 +613,39 @@ fn retransmit(
         return;
     }
     let remote = Ipv4Addr::from(conn.key.remote_addr);
-    if let Some(front) = conn.unacked.front_mut() {
-        // Resend the oldest unacknowledged segment verbatim.
-        let segment = build_segment(
-            conn.key.remote_port,
-            conn.key.local_port,
-            front.seq,
-            conn.guest_next,
-            if front.seq == conn.our_isn {
-                FLAG_SYN | FLAG_ACK
-            } else {
-                FLAG_ACK
-            },
-            OUR_WINDOW,
-            if front.seq == conn.our_isn {
-                &[2, 4, (OUR_MSS >> 8) as u8, OUR_MSS as u8]
-            } else {
-                &[]
-            },
-            &front.bytes,
-        );
-        emit(wrap_tcp(
-            remote,
-            config.guest_ip,
-            &segment,
-            next_identification(ip_id),
-        ));
-        front.last_sent = now;
+    if !conn.unacked.is_empty() {
+        // Resend every unacknowledged segment (bounded by the 64-segment
+        // cap): under burst loss, resending only the oldest would cost
+        // one retransmission timeout per lost segment and stall the
+        // connection long enough for the remote to give up. Sequence
+        // numbers make the resent data idempotent for the guest.
+        for front in conn.unacked.iter_mut() {
+            let segment = build_segment(
+                conn.key.remote_port,
+                conn.key.local_port,
+                front.seq,
+                conn.guest_next,
+                if front.seq == conn.our_isn {
+                    FLAG_SYN | FLAG_ACK
+                } else {
+                    FLAG_ACK
+                },
+                OUR_WINDOW,
+                if front.seq == conn.our_isn {
+                    &[2, 4, (OUR_MSS >> 8) as u8, OUR_MSS as u8]
+                } else {
+                    &[]
+                },
+                &front.bytes,
+            );
+            emit(wrap_tcp(
+                remote,
+                config.guest_ip,
+                &segment,
+                next_identification(ip_id),
+            ));
+            front.last_sent = now;
+        }
     } else if conn.fin_sent && !conn.fin_acked {
         let segment = build_segment(
             conn.key.remote_port,

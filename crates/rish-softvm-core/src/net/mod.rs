@@ -246,17 +246,6 @@ impl NetBackend for SlirpNetBackend {
             self.counters.dropped_bad_packet = self.counters.dropped_bad_packet.saturating_add(1);
             return;
         };
-        if std::env::var_os("RISH_DBG_NET").is_some() {
-            let src = if frame.len() >= 12 {
-                [frame[6], frame[7], frame[8], frame[9], frame[10], frame[11]]
-            } else {
-                [0_u8; 6]
-            };
-            eprintln!(
-                "[rish-softvm net rx] dst={:02x?} src={:02x?} type={:#06x} len={} ours={:02x?}",
-                dst, src, ethertype, frame.len(), self.config.mac,
-            );
-        }
         if !for_us(dst, self.config.mac, self.config.gateway_mac) {
             self.counters.dropped_not_for_us = self.counters.dropped_not_for_us.saturating_add(1);
             return;
