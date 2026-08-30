@@ -15,7 +15,7 @@ use rish_guest_protocol::{DEFAULT_MAX_FRAME_SIZE, Envelope, Hello, Message, Peer
 use rish_softvm_x86_64::{
     EngineLimits, MachineState, PureRustProvider, SerialGuestTransport, X86_64SoftwareEngine,
 };
-use rish_vm::{GuestChannel, VmAcceleration, VmConfig, VmDevice};
+use rish_vm::{GuestChannel, VmAcceleration, VmConfig, VmDevice, VmNetworkMode};
 use serde::{Deserialize, Serialize};
 
 const BOOT_OK_MARKER: &[u8] = b"RISH_X86_64_BOOT_OK";
@@ -35,6 +35,9 @@ struct VmRunRequest {
     command: Vec<String>,
     #[serde(default)]
     command_line: Option<String>,
+    /// Optional network mode: "disabled" (default) or "user-nat".
+    #[serde(default)]
+    network: Option<String>,
     #[serde(default = "default_boot_budget")]
     boot_budget_units: u64,
     #[serde(default = "default_handshake_budget")]
@@ -134,6 +137,14 @@ fn boot_channel(
         }
     };
 
+    let mut devices = vec![VmDevice::Console];
+    match request.network.as_deref() {
+        None | Some("disabled") => {}
+        Some("user-nat") => devices.push(VmDevice::Network {
+            mode: VmNetworkMode::UserNat,
+        }),
+        Some(other) => return Err(format!("unknown network mode \"{other}\"")),
+    }
     let config = VmConfig {
         architecture: "x86_64".to_owned(),
         vcpus: 1,
@@ -142,7 +153,7 @@ fn boot_channel(
         initrd_path: Some(request.initrd_path.clone()),
         root_disk_path,
         acceleration: VmAcceleration::Interpreter,
-        devices: vec![VmDevice::Console],
+        devices,
         command_line: request.command_line.clone().unwrap_or_default(),
     };
 
