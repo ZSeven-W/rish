@@ -16,6 +16,19 @@ pub trait GuestMemory {
     fn ram_bytes(&self) -> u64;
     fn read(&self, address: u64, output: &mut [u8]) -> Result<(), VirtioError>;
     fn write(&mut self, address: u64, input: &[u8]) -> Result<(), VirtioError>;
+    /// Fails closed unless `address..address+bytes` lies entirely inside
+    /// guest RAM, without reading or writing anything. Devices call this to
+    /// validate a whole chain before draining it, even for buffers they end
+    /// up discarding.
+    fn check_range(&self, address: u64, bytes: u64) -> Result<(), VirtioError> {
+        let end = address
+            .checked_add(bytes)
+            .ok_or(VirtioError::OutOfBounds { address, bytes })?;
+        if end > self.ram_bytes() {
+            return Err(VirtioError::OutOfBounds { address, bytes });
+        }
+        Ok(())
+    }
 }
 
 /// Maximum descriptors accepted in one request chain (header + data segments
