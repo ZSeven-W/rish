@@ -164,6 +164,11 @@ pub fn icmp_echo_reply(packet: Ipv4Packet<'_>, identification: &mut u16) -> Opti
     if payload.len() < 8 || payload[0] != 8 || payload[1] != 0 {
         return None;
     }
+    // The request must carry a valid ICMP checksum; a forged echo must not
+    // get a reply.
+    if checksum(payload) != 0 {
+        return None;
+    }
     let mut icmp = Vec::with_capacity(payload.len());
     icmp.push(0); // echo reply
     icmp.push(0);
@@ -254,6 +259,25 @@ mod tests {
             u16::from_be_bytes([parsed.payload[6], parsed.payload[7]]),
         );
         assert_eq!(&parsed.payload[8..], b"dns-payload");
+    }
+
+    #[test]
+    fn echo_replies_refuse_a_request_with_a_bad_checksum() {
+        // Regression: the ICMP checksum of an incoming echo request was
+        // never verified, so any frame on the wire could elicit an echo
+        // reply.
+        let mut icmp = Vec::new();
+        icmp.extend_from_slice(&[8, 0, 0, 0]); // type, code, checksum 0
+        icmp.extend_from_slice(&0x1234_u16.to_be_bytes());
+        icmp.extend_from_slice(&7_u16.to_be_bytes());
+        icmp.extend_from_slice(b"ping-payload");
+        let mut packet = Vec::new();
+        let header = build_header(20 + icmp.len(), PROTOCOL_ICMP, GUEST, GW, 1);
+        packet.extend_from_slice(&header);
+        packet.extend_from_slice(&icmp);
+        let parsed = parse(&packet).unwrap();
+        let mut identification = 9;
+        assert!(icmp_echo_reply(parsed, &mut identification).is_none());
     }
 
     #[test]
