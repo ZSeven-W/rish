@@ -187,14 +187,17 @@ example.com index page over the backend's TCP proxy. (e) fetched, verified
   plain HTTP through the same TCP path; its in-guest `md5sum` matched the
   host-side download byte for byte
   (`49b42f25cc3954542206bd437b624710`).
-- `apk update` was run 14 more times across two boots; 13 succeeded and
-  one failed mid-transfer with an `I/O error` from the guest's TLS stack.
-  The failure is intermittent, tied to real network conditions: under
-  burst loss the backend's single retransmission timer used to stall long
-  enough for the remote side to give up. It now resends every
-  unacknowledged segment per timeout (bounded, idempotent), which cut the
-  recovery time; the remaining residual is the honest limit of a TCP
-  bridge without fast retransmit or SACK (see the inventory below).
+- `apk update` was then run repeatedly to measure reliability: 18 more
+  attempts across four boots, 16 successes and 2 failures (one mid-transfer
+  `I/O error`, one handshake `TLS: unspecified error` from the guest's TLS
+  stack, each on a different boot). An immediate retry succeeded in every
+  observed case (3/3). The failures are intermittent and tied to real
+  network conditions: under burst loss the backend's single retransmission
+  timer stalls the connection until the loss is resent, and a TCP bridge
+  without fast retransmit or SACK is exactly that slow (see the inventory
+  below). The retransmit now resends every unacknowledged segment per
+  timeout (bounded, idempotent), which cut the recovery time; the residual
+  flakiness is reported here as-is, not papered over.
 
 ### Offline regression (unchanged capability)
 
