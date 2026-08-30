@@ -20,7 +20,13 @@
 //!   with one retransmission timer.
 //! - One retransmission timer per connection (750 ms, 8 tries) resends the
 //!   oldest unacknowledged segment; after the retry budget the connection
-//!   is reset.
+//!   is reset, and the RST segment is actually sent to the guest (never
+//!   just counted).
+//! - At most MAX_CONNECTIONS concurrent outbound connections (one host
+//!   thread each); a SYN past the cap gets a RST. Host connects and socket
+//!   writes are bounded by timeouts, and a device reset drops every
+//!   connection, so no teardown path (guest RST, retry exhaustion, or
+//!   device reset) can strand a blocked thread or socket.
 //! - Inbound (host-to-guest) connections are not supported: there is no
 //!   listener. Only outbound connections the guest initiates exist.
 //! - No half-close data beyond delivery: once the guest FINs, its data is
@@ -33,8 +39,11 @@
 //! thread from reading the socket), and the interpreter thread never
 //! blocks on either.
 
+use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, VecDeque};
+use std::hash::{BuildHasher, Hasher};
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
 use std::time::{Duration, Instant};
 
@@ -59,6 +68,26 @@ const MAX_RETRANSMITS: u32 = 8;
 /// FIN never seen) is kept before it is dropped.
 const LINGER_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Ceiling on concurrent outbound connections (one host thread and two
+/// bounded channels each). A SYN past the cap is refused with a RST, so a
+/// hostile guest cannot exhaust host threads or sockets.
+const MAX_CONNECTIONS: usize = 64;
+
+/// Per-process counter mixed into every initial-sequence-number seed, so
+/// seeds stay distinct even when the host clock reads before 1970 (which
+/// used to collapse every seed to one fixed constant).
+static NEXT_ISN_SALT: AtomicU64 = AtomicU64::new(1);
+
+/// Folds the wall-clock part and the per-process salt through a hasher
+/// keyed with OS entropy. time_nanos is None when the host clock reads
+/// before the Unix epoch; the salt alone still keeps seeds distinct.
+fn isn_seed(time_nanos: Option<u32>, salt: u64) -> u32 {
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u32(time_nanos.unwrap_or(0));
+    hasher.write_u64(salt);
+    hasher.finish() as u32
+}
+
 /// One connection the backend terminates.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ConnKey {
@@ -75,6 +104,11 @@ struct OutSeg {
     /// Payload bytes (empty for the SYN-ACK), kept verbatim for
     /// retransmission.
     bytes: Vec<u8>,
+    /// True for the SYN-ACK segment: the retransmission path rebuilds its
+    /// SYN flag and MSS option from this, never from sequence equality
+    /// (a data segment whose sequence landed on our_isn after a 2^32 wrap
+    /// would otherwise retransmit as SYN-ACK).
+    syn: bool,
     last_sent: Instant,
 }
 
@@ -124,6 +158,9 @@ fn seq_ge(a: u32, b: u32) -> bool {
 fn seq_lt(a: u32, b: u32) -> bool {
     ((a.wrapping_sub(b)) as i32) < 0
 }
+fn seq_le(a: u32, b: u32) -> bool {
+    ((a.wrapping_sub(b)) as i32) <= 0
+}
 
 /// The connection table and the next initial sequence number.
 pub struct TcpState {
@@ -133,14 +170,23 @@ pub struct TcpState {
 
 impl TcpState {
     pub fn new() -> Self {
-        let seed = std::time::SystemTime::now()
+        let time_nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.subsec_nanos())
-            .unwrap_or(0x1234);
+            .ok();
+        let salt = NEXT_ISN_SALT.fetch_add(1, Ordering::Relaxed);
         Self {
             connections: HashMap::new(),
-            next_isn: seed ^ 0x9E37_79B9,
+            next_isn: isn_seed(time_nanos, salt),
         }
+    }
+
+    /// Drops every connection: the channel halves disconnect, so each host
+    /// thread exits and closes its socket (bounded by its connect/write
+    /// timeouts). Called on device reset so no stale connection or data
+    /// survives into the next driver session.
+    pub fn reset(&mut self) {
+        self.connections.clear();
     }
 
     /// Handles one TCP segment the guest sent. A SYN opens a connection
@@ -175,6 +221,30 @@ impl TcpState {
             remote_port: segment.dport,
         };
         if segment.flags & FLAG_SYN != 0 && segment.flags & FLAG_ACK == 0 {
+            if !self.connections.contains_key(&key) && self.connections.len() >= MAX_CONNECTIONS {
+                // Refuse the same way an unknown connection gets refused:
+                // a RST the guest must treat as connection refused, never
+                // another host thread past the cap.
+                let rst = build_segment(
+                    segment.dport,
+                    segment.sport,
+                    segment.ack,
+                    0,
+                    FLAG_RST | FLAG_ACK,
+                    0,
+                    &[],
+                    &[],
+                );
+                let remote = Ipv4Addr::from(key.remote_addr);
+                emit(wrap_tcp(
+                    remote,
+                    config.guest_ip,
+                    &rst,
+                    next_identification(ip_id),
+                ));
+                counters.tcp_resets = counters.tcp_resets.saturating_add(1);
+                return;
+            }
             self.open(key, segment, counters);
             return;
         }
@@ -330,31 +400,34 @@ fn process_segment(
     }
     if segment.flags & FLAG_ACK != 0 {
         conn.guest_window = u32::from(segment.window);
-        // Clamp the acknowledgement to what we actually sent.
-        let mut ack = segment.ack;
-        if seq_gt(ack, conn.our_next) {
-            ack = conn.our_next;
-        }
-        if seq_gt(ack, conn.our_una) {
-            while let Some(front) = conn.unacked.front() {
-                let end = front.seq.wrapping_add(front.bytes.len() as u32);
-                if seq_ge(ack, end) {
-                    conn.unacked.pop_front();
-                } else {
-                    break;
+        // RFC 793: only acknowledgements inside the receive window
+        // [our_una, our_next] are acceptable. Anything past our_next used
+        // to be clamped and then confirmed data the guest never received;
+        // anything before our_una could appear to advance the queue. Both
+        // are ignored outright.
+        let ack = segment.ack;
+        if seq_ge(ack, conn.our_una) && seq_le(ack, conn.our_next) {
+            if seq_gt(ack, conn.our_una) {
+                while let Some(front) = conn.unacked.front() {
+                    let end = front.seq.wrapping_add(front.bytes.len() as u32);
+                    if seq_ge(ack, end) {
+                        conn.unacked.pop_front();
+                    } else {
+                        break;
+                    }
+                }
+                conn.our_una = ack;
+                conn.retransmits = 0;
+                if conn.unacked.is_empty() {
+                    conn.retransmit_deadline = None;
                 }
             }
-            conn.our_una = ack;
-            conn.retransmits = 0;
-            if conn.unacked.is_empty() {
-                conn.retransmit_deadline = None;
+            if !conn.established && ack == conn.our_isn.wrapping_add(1) {
+                conn.established = true;
             }
-        }
-        if !conn.established && ack == conn.our_isn.wrapping_add(1) {
-            conn.established = true;
-        }
-        if conn.fin_sent && seq_ge(ack, conn.our_next) {
-            conn.fin_acked = true;
+            if conn.fin_sent && seq_ge(ack, conn.our_next) {
+                conn.fin_acked = true;
+            }
         }
     }
     let mut ack_needed = false;
@@ -385,11 +458,16 @@ fn process_segment(
         // out-of-order buffering; the guest retransmits.
     }
     if segment.flags & FLAG_FIN != 0 {
-        if segment.seq == conn.guest_next {
+        // The FIN lands at seq + payload_len: a segment carrying both
+        // payload and FIN advances guest_next by the payload above, so
+        // comparing the raw seq here treated every payload+FIN as a
+        // duplicate and the close never completed.
+        let fin_seq = segment.seq.wrapping_add(segment.payload.len() as u32);
+        if fin_seq == conn.guest_next {
             conn.guest_next = conn.guest_next.wrapping_add(1);
             conn.guest_fin = true;
             ack_needed = true;
-        } else if seq_lt(segment.seq, conn.guest_next) {
+        } else if seq_lt(fin_seq, conn.guest_next) {
             // Duplicate FIN: re-acknowledge.
             ack_needed = true;
         }
@@ -435,6 +513,18 @@ fn drain_host_events(
     emit: &mut dyn FnMut(Vec<u8>),
 ) {
     loop {
+        // Stop before the next event could push the pending buffer past
+        // its cap. The unread events keep the bounded channel full, which
+        // stalls the host thread (it stops reading the socket and the host
+        // TCP stack then shrinks its window); send_pending drains the
+        // buffer as the guest acknowledges. Resetting here used to kill
+        // legitimate bursts that outpaced one poll -- the likeliest cause
+        // of the intermittent mid-transfer apk update failures. An event is
+        // at most the 16 KiB read chunk, so the buffer stays bounded by
+        // cap + 16 KiB.
+        if conn.pending.len() >= TCP_PENDING_CAP {
+            return;
+        }
         let event = match conn.host_rx.try_recv() {
             Ok(event) => event,
             Err(TryRecvError::Empty) => return,
@@ -473,13 +563,6 @@ fn drain_host_events(
                 counters.tcp_resets = counters.tcp_resets.saturating_add(1);
             }
             HostEvent::Data(bytes) => {
-                if conn.pending.len() + bytes.len() > TCP_PENDING_CAP {
-                    // Fail closed on our own buffer limit: reset the
-                    // connection rather than grow without bound.
-                    conn.closed = true;
-                    counters.tcp_resets = counters.tcp_resets.saturating_add(1);
-                    return;
-                }
                 conn.pending.extend(bytes);
             }
             HostEvent::Eof => {
@@ -517,6 +600,7 @@ fn send_syn_ack(
     conn.unacked.push_back(OutSeg {
         seq: conn.our_isn,
         bytes: Vec::new(),
+        syn: true,
         last_sent: now,
     });
     conn.retransmit_deadline = Some(now + RETRANSMIT_TIMEOUT);
@@ -584,6 +668,7 @@ fn send_pending(
         conn.unacked.push_back(OutSeg {
             seq: conn.our_next,
             bytes: bytes.clone(),
+            syn: false,
             last_sent: now,
         });
         conn.our_next = conn.our_next.wrapping_add(bytes.len() as u32);
@@ -608,6 +693,26 @@ fn retransmit(
     }
     conn.retransmits = conn.retransmits.saturating_add(1);
     if conn.retransmits > MAX_RETRANSMITS {
+        // The budget ran out: tell the guest with an actual RST, not just
+        // a counter. Under sustained loss the guest would otherwise wait
+        // out its own much longer timeout in silence.
+        let segment = build_segment(
+            conn.key.remote_port,
+            conn.key.local_port,
+            conn.our_next,
+            conn.guest_next,
+            FLAG_RST | FLAG_ACK,
+            0,
+            &[],
+            &[],
+        );
+        let remote = Ipv4Addr::from(conn.key.remote_addr);
+        emit(wrap_tcp(
+            remote,
+            config.guest_ip,
+            &segment,
+            next_identification(ip_id),
+        ));
         conn.closed = true;
         counters.tcp_resets = counters.tcp_resets.saturating_add(1);
         return;
@@ -618,20 +723,23 @@ fn retransmit(
         // cap): under burst loss, resending only the oldest would cost
         // one retransmission timeout per lost segment and stall the
         // connection long enough for the remote to give up. Sequence
-        // numbers make the resent data idempotent for the guest.
+        // numbers make the resent data idempotent for the guest. The SYN
+        // flag comes from the segment record, never from comparing the
+        // sequence against our_isn (a 2^32 wrap would turn resent data
+        // into a SYN-ACK).
         for front in conn.unacked.iter_mut() {
             let segment = build_segment(
                 conn.key.remote_port,
                 conn.key.local_port,
                 front.seq,
                 conn.guest_next,
-                if front.seq == conn.our_isn {
+                if front.syn {
                     FLAG_SYN | FLAG_ACK
                 } else {
                     FLAG_ACK
                 },
                 OUR_WINDOW,
-                if front.seq == conn.our_isn {
+                if front.syn {
                     &[2, 4, (OUR_MSS >> 8) as u8, OUR_MSS as u8]
                 } else {
                     &[]
