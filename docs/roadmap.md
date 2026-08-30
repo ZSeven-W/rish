@@ -75,7 +75,8 @@ UTM/QEMU TCTI 不再作为产品路径，其 adapter 仅作文档化的备选 pr
 - [ ] x86_64 Linux kernel/initramfs 可复现构建
 - [ ] Youki/systemd capability probe 与完整 guest agent handler
 - [ ] Native Linux OEM executor 与执行时主动 syscall 重验
-- [ ] 用户态 NAT、DNS、TCP/UDP 端口转发
+- [x] 用户态 virtio-net + DNS 转发 + 出站 TCP NAT（网关 ARP/ICMP、
+  TCP/UDP 端口转发不在其中）——证明见 docs/guest-virtio-net.md
 - [ ] suspend/checkpoint/restore
 
 
