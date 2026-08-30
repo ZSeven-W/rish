@@ -26,6 +26,11 @@ fn main() {
         "root_disk_path": "/tmp/rish-rootdisk.img",
         "memory_mib": env_u64("RISH_MEMORY_MIB", 1024),
         "command": command,
+        "network": if std::env::var("RISH_NETWORK").as_deref() == Ok("user-nat") {
+            "user-nat"
+        } else {
+            "disabled"
+        },
         "command_line": "console=ttyS0,115200n8 rdinit=/init panic=-1 oops=panic nokaslr cgroup_no_v1=all 8250.nr_uarts=1",
         "boot_budget_units": env_u64("RISH_BOOT_BUDGET", 25_000_000_000),
         "handshake_budget_units": env_u64("RISH_HANDSHAKE_BUDGET", 15_000_000_000),
