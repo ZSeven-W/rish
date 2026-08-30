@@ -283,13 +283,27 @@ never breaks out of the iOS, Android, or HarmonyOS host sandbox.
 
 ## Documentation
 
-[Architecture](docs/architecture.md) ·
-[Platform matrix](docs/platform-matrix.md) ·
-[OCI data plane](docs/oci-pipeline.md) ·
-[Command compatibility](docs/command-compatibility.md) ·
-[ADR-0001: offload-first](docs/decisions/0001-offload-first.md) ·
-[ADR-0002: pure-software Linux](docs/decisions/0002-pure-software-linux.md) ·
-[Roadmap](docs/roadmap.md)
+Documentation lives in the private [Z-Seven document center][center]; this
+repository is the implementation truth.
+
+[Architecture][arch] ·
+[Platform matrix][matrix] ·
+[OCI data plane][oci] ·
+[Command compatibility][compat] ·
+[ADR-0001: offload-first][adr1] ·
+[ADR-0002: pure-software Linux][adr2] ·
+[ADR-0003: pure-Rust interpreter first][adr3] ·
+[Roadmap][roadmap]
+
+[center]: https://github.com/ZSeven-W/openpencil-docs/tree/main/rish
+[arch]: https://github.com/ZSeven-W/openpencil-docs/blob/main/rish/reference/architecture.md
+[matrix]: https://github.com/ZSeven-W/openpencil-docs/blob/main/rish/reference/platform-matrix.md
+[oci]: https://github.com/ZSeven-W/openpencil-docs/blob/main/rish/reference/oci-pipeline.md
+[compat]: https://github.com/ZSeven-W/openpencil-docs/blob/main/rish/reference/command-compatibility.md
+[adr1]: https://github.com/ZSeven-W/openpencil-docs/blob/main/rish/decisions/0001-offload-first.md
+[adr2]: https://github.com/ZSeven-W/openpencil-docs/blob/main/rish/decisions/0002-pure-software-linux.md
+[adr3]: https://github.com/ZSeven-W/openpencil-docs/blob/main/rish/decisions/0003-pure-rust-interpreter-first.md
+[roadmap]: https://github.com/ZSeven-W/openpencil-docs/blob/main/rish/reference/roadmap.md
 
 ## License
 
