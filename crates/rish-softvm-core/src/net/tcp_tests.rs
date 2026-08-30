@@ -187,6 +187,20 @@ fn full_connection_over_host_loopback() {
         &mut counters,
         &mut frames,
     );
+    // The handshake acknowledgement pops the SYN-ACK from the retransmit
+    // queue: the timer must be disarmed (regression: it used to retransmit
+    // the SYN-ACK forever and reset the connection).
+    {
+        let key = ConnKey {
+            local_port: 40000,
+            remote_addr: remote.octets(),
+            remote_port,
+        };
+        let conn = state.connections.get(&key).unwrap();
+        assert!(conn.established);
+        assert!(conn.unacked.is_empty());
+        assert!(conn.retransmit_deadline.is_none());
+    }
 
     // Guest data reaches the host socket.
     let data = build_segment(

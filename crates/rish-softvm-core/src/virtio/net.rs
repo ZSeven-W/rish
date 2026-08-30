@@ -606,18 +606,14 @@ impl VirtioMmioNet {
             return Ok(0);
         }
         // Zero header: no offloads, no GSO, no csum, no mergeable buffers.
-        let mut header_bytes = [0_u8; VIRTIO_NET_HDR_BYTES];
+        let header_bytes = [0_u8; VIRTIO_NET_HDR_BYTES];
         if chain[0].length >= VIRTIO_NET_HDR_BYTES as u32 {
             memory.write(chain[0].address, &header_bytes)?;
         } else {
-            memory.write(
-                chain[0].address,
-                &header_bytes[..chain[0].length as usize],
-            )?;
+            memory.write(chain[0].address, &header_bytes[..chain[0].length as usize])?;
             let mut rest = chain[0].length as usize;
             for descriptor in &chain[1..count] {
-                let step = (VIRTIO_NET_HDR_BYTES - rest)
-                    .min(descriptor.length as usize);
+                let step = (VIRTIO_NET_HDR_BYTES - rest).min(descriptor.length as usize);
                 memory.write(descriptor.address, &header_bytes[rest..rest + step])?;
                 rest += step;
                 if rest == VIRTIO_NET_HDR_BYTES {
