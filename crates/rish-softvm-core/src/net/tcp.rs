@@ -542,10 +542,19 @@ fn drain_host_events(
                 }
             }
             HostEvent::ConnectFailed(_message) => {
+                // The RST must land in the guest's receive window. A
+                // failure before the SYN-ACK used the SYN-ACK sequence;
+                // after the handshake (the redial budget ran out) the RST
+                // must carry our_next or the guest ignores it.
+                let seq = if conn.established {
+                    conn.our_next
+                } else {
+                    conn.our_isn
+                };
                 let segment = build_segment(
                     conn.key.remote_port,
                     conn.key.local_port,
-                    conn.our_isn,
+                    seq,
                     conn.guest_next,
                     FLAG_RST | FLAG_ACK,
                     0,

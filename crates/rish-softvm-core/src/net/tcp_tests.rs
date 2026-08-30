@@ -692,3 +692,136 @@ fn a_payload_and_fin_in_one_segment_advances_the_fin_sequence() {
         1005
     );
 }
+
+#[test]
+fn a_transient_pre_response_close_is_redialed_instead_of_killing_the_fetch() {
+    // Regression: a CDN edge that resets or closes a freshly accepted
+    // connection (rate limiting, load shedding) used to surface as a FIN
+    // right after the SYN-ACK, and apk reported "TLS: unspecified error".
+    // Until the first response byte arrives the host thread must redial the
+    // same address and replay the pre-response flight, so the guest sees
+    // one unbroken connection and its data lands on the dial that stays.
+    use std::io::{Read, Write};
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let remote_port = listener.local_addr().unwrap().port();
+    let remote = Ipv4Addr::new(127, 0, 0, 1);
+    let mut state = TcpState::new();
+    let mut counters = NetCounters::default();
+    let mut frames = Vec::new();
+
+    // Server side: close the first two connections without a single byte,
+    // then serve the third and echo the payload back.
+    std::thread::spawn(move || {
+        for attempt in 0..3 {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            if attempt < 2 {
+                drop(stream);
+                continue;
+            }
+            let mut buffer = [0_u8; 64];
+            let length = stream.read(&mut buffer).unwrap();
+            stream.write_all(&buffer[..length]).unwrap();
+            drop(stream);
+        }
+    });
+
+    // Guest SYN, SYN-ACK, handshake ACK.
+    let syn = build_segment(40000, remote_port, 1000, 0, FLAG_SYN, 65535, &[], &[]);
+    handle(
+        &mut state,
+        guest_tcp(&syn, remote),
+        &mut counters,
+        &mut frames,
+    );
+    let mut frames = poll_until(
+        &mut state,
+        &mut counters,
+        |frames, _counters| {
+            frames.iter().any(|frame| {
+                let parsed = ipv4::parse(frame).unwrap();
+                parsed.payload[13] & FLAG_SYN != 0
+            })
+        },
+        Duration::from_secs(5),
+    );
+    let syn_ack = frames
+        .iter()
+        .find_map(|frame| {
+            let parsed = ipv4::parse(frame).unwrap();
+            (parsed.payload[13] & FLAG_SYN != 0).then_some(parsed)
+        })
+        .expect("SYN-ACK");
+    let our_isn = u32::from_be_bytes(syn_ack.payload[4..8].try_into().unwrap());
+    let ack = build_segment(
+        40000,
+        remote_port,
+        1001,
+        our_isn.wrapping_add(1),
+        FLAG_ACK,
+        65535,
+        &[],
+        &[],
+    );
+    handle(
+        &mut state,
+        guest_tcp(&ack, remote),
+        &mut counters,
+        &mut frames,
+    );
+
+    // Guest data: the first two dials die before a response byte, so the
+    // host thread must replay this flight on the third dial.
+    let data = build_segment(
+        40000,
+        remote_port,
+        1001,
+        our_isn.wrapping_add(1),
+        FLAG_ACK | 0x08,
+        65535,
+        &[],
+        b"hello from guest",
+    );
+    handle(
+        &mut state,
+        guest_tcp(&data, remote),
+        &mut counters,
+        &mut frames,
+    );
+
+    // The echo arrives as a data segment from the remote address, with no
+    // RST and no premature FIN in between.
+    let mut frames = poll_until(
+        &mut state,
+        &mut counters,
+        |frames, _counters| {
+            frames.iter().any(|frame| {
+                let parsed = ipv4::parse(frame).unwrap();
+                parsed.protocol == ipv4::PROTOCOL_TCP
+                    && parsed.payload[13] & FLAG_SYN == 0
+                    && !parsed.payload[20..].is_empty()
+            })
+        },
+        Duration::from_secs(10),
+    );
+    let reply = frames
+        .iter()
+        .find_map(|frame| {
+            let parsed = ipv4::parse(frame).unwrap();
+            (parsed.payload[13] & FLAG_SYN == 0 && !parsed.payload[20..].is_empty())
+                .then_some(parsed)
+        })
+        .expect("echoed data segment");
+    assert_eq!(reply.src, remote);
+    assert_eq!(&reply.payload[20..], b"hello from guest");
+    assert_eq!(counters.tcp_resets, 0);
+    assert!(!frames.iter().any(|frame| {
+        let parsed = ipv4::parse(frame).unwrap();
+        parsed.protocol == ipv4::PROTOCOL_TCP && parsed.payload[13] & FLAG_FIN != 0
+    }));
+    drop(state);
+}
+
