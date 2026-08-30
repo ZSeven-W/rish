@@ -106,7 +106,14 @@ impl Harness {
     /// left on queue 0, the way the Linux virtio-mmio driver notifies
     /// (the written value IS the queue index).
     fn submit_tx(&mut self, payload: &[u8]) {
-        self.write_desc(TX_DESC_BASE, 0, HEADER_ADDR, 12 + payload.len() as u32, 0, 0);
+        self.write_desc(
+            TX_DESC_BASE,
+            0,
+            HEADER_ADDR,
+            12 + payload.len() as u32,
+            0,
+            0,
+        );
         self.bytes[HEADER_ADDR as usize..HEADER_ADDR as usize + 12].fill(0);
         self.bytes[HEADER_ADDR as usize + 12..HEADER_ADDR as usize + 12 + payload.len()]
             .copy_from_slice(payload);
@@ -126,8 +133,7 @@ impl Harness {
         self.write_desc(TX_DESC_BASE, 0, HEADER_ADDR, 12, DESC_FLAG_NEXT, 1);
         self.write_desc(TX_DESC_BASE, 1, DATA_ADDR, payload.len() as u32, 0, 0);
         self.bytes[HEADER_ADDR as usize..HEADER_ADDR as usize + 12].fill(0);
-        self.bytes[DATA_ADDR as usize..DATA_ADDR as usize + payload.len()]
-            .copy_from_slice(payload);
+        self.bytes[DATA_ADDR as usize..DATA_ADDR as usize + payload.len()].copy_from_slice(payload);
         self.bytes[TX_AVAIL_BASE as usize + 2..TX_AVAIL_BASE as usize + 4]
             .copy_from_slice(&1_u16.to_le_bytes());
         self.bytes[TX_AVAIL_BASE as usize + 4..TX_AVAIL_BASE as usize + 6]
@@ -149,7 +155,14 @@ impl Harness {
     /// a single writable descriptor holding the 12-byte header area plus
     /// the frame area.
     fn post_rx(&mut self, data_len: u32) {
-        self.write_desc(RX_DESC_BASE, 0, HEADER_ADDR, 12 + data_len, DESC_FLAG_WRITE, 0);
+        self.write_desc(
+            RX_DESC_BASE,
+            0,
+            HEADER_ADDR,
+            12 + data_len,
+            DESC_FLAG_WRITE,
+            0,
+        );
         self.bytes[RX_AVAIL_BASE as usize + 2..RX_AVAIL_BASE as usize + 4]
             .copy_from_slice(&1_u16.to_le_bytes());
         self.bytes[RX_AVAIL_BASE as usize + 4..RX_AVAIL_BASE as usize + 6]
