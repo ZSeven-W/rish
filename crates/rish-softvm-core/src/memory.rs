@@ -550,6 +550,13 @@ impl GuestMemory for DeviceMemory<'_> {
 
 /// Bumps the per-page write counters for every page the range touches.
 fn bump_page_counters(code_gen: &mut [u32], start: usize, len: usize) {
+    // A zero-length write (a device writing an empty slice, which the
+    // virtio-net RX path does for a zero-length descriptor) touches no
+    // page. The old (start + len - 1) underflowed at start == 0: debug
+    // builds panicked, release builds iterated ~4.5e15 pages.
+    if len == 0 {
+        return;
+    }
     let first = start / PAGE_SIZE as usize;
     let last = (start + len - 1) / PAGE_SIZE as usize;
     for page in first..=last {
@@ -628,5 +635,29 @@ mod tests {
             .read(VIRTIO_MMIO_BASE + 0x100, &mut capacity)
             .unwrap();
         assert_eq!(capacity, 8_u64.to_le_bytes());
+    }
+
+    #[test]
+    fn zero_length_device_writes_do_not_underflow_the_page_counters() {
+        // Regression: a device write of zero bytes at guest address 0
+        // computed (start + len - 1) / PAGE_SIZE with len == 0, underflowing
+        // usize in release and looping ~4.5e15 times; in debug it panicked.
+        // A virtio-net RX chain whose first descriptor is zero-length at
+        // address 0 walked straight into this.
+        let mut counters = [7_u32; 8];
+        bump_page_counters(&mut counters, 0, 0);
+        assert_eq!(counters, [7_u32; 8]);
+        // A zero-length write at a nonzero address must not bump anything
+        // either.
+        let mut counters = [7_u32; 8];
+        bump_page_counters(&mut counters, PAGE_SIZE as usize, 0);
+        assert_eq!(counters, [7_u32; 8]);
+        // And ordinary writes still bump exactly the pages they touch.
+        let mut counters = [0_u32; 8];
+        bump_page_counters(&mut counters, 0x1000, 0x2000);
+        assert_eq!(counters[0], 0);
+        assert_eq!(counters[1], 1);
+        assert_eq!(counters[2], 1);
+        assert_eq!(counters[3..], [0_u32; 5]);
     }
 }

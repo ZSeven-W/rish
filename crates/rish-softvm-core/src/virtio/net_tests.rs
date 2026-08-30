@@ -48,6 +48,13 @@ impl NetBackend for TestBackend {
     fn counters(&self) -> NetCounters {
         NetCounters::default()
     }
+
+    /// Mirrors the production backend: a device reset discards everything
+    /// the backend still holds.
+    fn reset(&mut self) {
+        self.inner.lock().unwrap().deliver.clear();
+        self.inner.lock().unwrap().enqueued.clear();
+    }
 }
 
 const MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
@@ -432,4 +439,250 @@ fn an_rx_avail_index_leap_beyond_the_queue_size_fails_closed() {
     std::thread::sleep(std::time::Duration::from_millis(2));
     assert!(!harness.poll().unwrap());
     assert!(harness.device.fault().is_some());
+}
+
+/// Publishes one RX chain of the given (address, length) descriptor pairs.
+fn post_rx_chain(harness: &mut Harness, descriptors: &[(u64, u32)]) {
+    for (index, (address, length)) in descriptors.iter().enumerate() {
+        let flags = if index + 1 < descriptors.len() {
+            DESC_FLAG_WRITE | DESC_FLAG_NEXT
+        } else {
+            DESC_FLAG_WRITE
+        };
+        let next = if index + 1 < descriptors.len() {
+            index as u16 + 1
+        } else {
+            0
+        };
+        harness.write_desc(RX_DESC_BASE, index as u16, *address, *length, flags, next);
+    }
+    harness.bytes[RX_AVAIL_BASE as usize + 2..RX_AVAIL_BASE as usize + 4]
+        .copy_from_slice(&1_u16.to_le_bytes());
+    harness.bytes[RX_AVAIL_BASE as usize + 4..RX_AVAIL_BASE as usize + 6]
+        .copy_from_slice(&0_u16.to_le_bytes());
+}
+
+#[test]
+fn a_zero_length_receive_descriptor_keeps_header_and_frame_layout() {
+    // Regression: a zero-length writable descriptor at guest address 0 made
+    // the device write an empty slice at address 0, whose page-counter bump
+    // underflowed (debug panic, release ~4.5e15-iteration hang). With the
+    // underflow gone the frame layout must still be right: the 12-byte
+    // header occupies the first 12 bytes of the CHAIN (here all inside the
+    // second descriptor), and the frame follows immediately after.
+    let mut harness = Harness::new();
+    harness.configure_queue(0, RX_DESC_BASE, RX_AVAIL_BASE, RX_USED_BASE, 4);
+    post_rx_chain(&mut harness, &[(0, 0), (DATA_ADDR, 128)]);
+    let frame = vec![0x42_u8; 60];
+    harness
+        .inner
+        .lock()
+        .unwrap()
+        .deliver
+        .push_back(frame.clone());
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    assert!(harness.poll().unwrap());
+    assert_eq!(harness.rx_used_entry(), (0, 12 + 60));
+    assert_eq!(
+        &harness.bytes[DATA_ADDR as usize..DATA_ADDR as usize + 12],
+        &[0_u8; 12],
+    );
+    assert_eq!(
+        &harness.bytes[DATA_ADDR as usize + 12..DATA_ADDR as usize + 12 + 60],
+        &frame[..],
+    );
+    assert!(harness.device.fault().is_none());
+}
+
+#[test]
+fn a_split_receive_chain_places_header_and_frame_contiguously() {
+    // Regression: with the header split across descriptors (6 bytes in the
+    // first, 6 in the second), the frame write skipped 12 bytes only in
+    // descriptor 0 -- so the frame landed at descriptor 1 offset 0, on top
+    // of the header tail, 6 bytes early. The header and frame must be laid
+    // out contiguously across the whole chain.
+    let mut harness = Harness::new();
+    harness.configure_queue(0, RX_DESC_BASE, RX_AVAIL_BASE, RX_USED_BASE, 4);
+    post_rx_chain(&mut harness, &[(HEADER_ADDR, 6), (DATA_ADDR, 128)]);
+    let frame = vec![0x42_u8; 60];
+    harness
+        .inner
+        .lock()
+        .unwrap()
+        .deliver
+        .push_back(frame.clone());
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    assert!(harness.poll().unwrap());
+    assert_eq!(harness.rx_used_entry(), (0, 12 + 60));
+    assert_eq!(
+        &harness.bytes[HEADER_ADDR as usize..HEADER_ADDR as usize + 6],
+        &[0_u8; 6],
+    );
+    assert_eq!(
+        &harness.bytes[DATA_ADDR as usize..DATA_ADDR as usize + 6],
+        &[0_u8; 6],
+    );
+    assert_eq!(
+        &harness.bytes[DATA_ADDR as usize + 6..DATA_ADDR as usize + 6 + 60],
+        &frame[..],
+    );
+}
+
+#[test]
+fn a_receive_chain_fails_before_writing_when_a_later_descriptor_is_out_of_ram() {
+    // Regression: the RX path wrote the header and frame into the chain's
+    // early descriptors and only then discovered a later descriptor outside
+    // RAM. The whole chain must validate before a single byte is written,
+    // the way the block device does.
+    let mut harness = Harness::new();
+    harness.configure_queue(0, RX_DESC_BASE, RX_AVAIL_BASE, RX_USED_BASE, 4);
+    // Descriptor 0 holds the header plus 20 of the 60 frame bytes; the
+    // rest spills into descriptor 1, which lies outside RAM. On the buggy
+    // path descriptor 0 was written before the out-of-RAM error surfaced.
+    harness.write_desc(
+        RX_DESC_BASE,
+        0,
+        HEADER_ADDR,
+        12 + 20,
+        DESC_FLAG_WRITE | DESC_FLAG_NEXT,
+        1,
+    );
+    harness.write_desc(
+        RX_DESC_BASE,
+        1,
+        RAM_BYTES as u64 + 0x2000,
+        64,
+        DESC_FLAG_WRITE,
+        0,
+    );
+    harness.bytes[RX_AVAIL_BASE as usize + 2..RX_AVAIL_BASE as usize + 4]
+        .copy_from_slice(&1_u16.to_le_bytes());
+    harness.bytes[RX_AVAIL_BASE as usize + 4..RX_AVAIL_BASE as usize + 6]
+        .copy_from_slice(&0_u16.to_le_bytes());
+    // A sentinel marks the buffer the device must not touch.
+    harness.bytes[HEADER_ADDR as usize..HEADER_ADDR as usize + 32].fill(0x5A);
+    let frame = vec![0x42_u8; 60];
+    harness.inner.lock().unwrap().deliver.push_back(frame);
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    assert!(!harness.poll().unwrap());
+    assert!(harness.device.fault().is_some());
+    assert_eq!(
+        &harness.bytes[HEADER_ADDR as usize..HEADER_ADDR as usize + 32],
+        &[0x5A_u8; 32],
+    );
+}
+
+#[test]
+fn a_device_reset_discards_stale_backend_frames() {
+    // Regression: a device reset (status 0) cleared only the device-side
+    // backlog; frames and connections the backend still held survived into
+    // the next driver session. After reset and reconfiguration, nothing
+    // produced before the reset may reach the guest.
+    let mut harness = Harness::new();
+    harness.configure_queue(0, RX_DESC_BASE, RX_AVAIL_BASE, RX_USED_BASE, 4);
+    harness.post_rx(2048);
+    let frame = vec![0x42_u8; 60];
+    harness.inner.lock().unwrap().deliver.push_back(frame);
+    harness.device.mmio_write(STATUS, 0);
+    // The driver reconfigures the device after the reset.
+    harness.configure_queue(0, RX_DESC_BASE, RX_AVAIL_BASE, RX_USED_BASE, 4);
+    harness.post_rx(2048);
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    assert!(!harness.poll().unwrap());
+    assert_eq!(harness.rx_used_entry(), (0, 0));
+}
+
+#[test]
+fn an_oversized_backend_frame_is_dropped_at_the_device() {
+    // Regression: the device MTU cap (1514 bytes) was only enforced on the
+    // transmit path; a backend-produced frame past it filled whatever
+    // buffer the driver posted, violating the documented device contract.
+    let mut harness = Harness::new();
+    harness.configure_queue(0, RX_DESC_BASE, RX_AVAIL_BASE, RX_USED_BASE, 4);
+    harness.post_rx(2048);
+    let frame = vec![0x42_u8; MAX_FRAME_BYTES + 1];
+    harness.inner.lock().unwrap().deliver.push_back(frame);
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    assert!(harness.poll().unwrap());
+    assert_eq!(harness.rx_used_entry(), (0, 0));
+    assert_eq!(harness.device.dropped(), (1, 0));
+    assert!(
+        harness.bytes[HEADER_ADDR as usize..HEADER_ADDR as usize + 12 + 2048]
+            .iter()
+            .all(|&byte| byte == 0)
+    );
+}
+
+/// A GuestMemory that reports a gigantic RAM size while backing only the
+/// queue rings with a real slice: descriptor buffers with near-u32::MAX
+/// lengths pass the bounds checks, exposing the completion-length
+/// truncation. Reads and writes remain slice-bounded.
+struct HugeMemory<'a> {
+    bytes: &'a mut [u8],
+}
+
+impl GuestMemory for HugeMemory<'_> {
+    fn ram_bytes(&self) -> u64 {
+        u64::MAX / 2
+    }
+
+    fn read(&self, address: u64, output: &mut [u8]) -> Result<(), VirtioError> {
+        let end = address
+            .checked_add(output.len() as u64)
+            .ok_or(VirtioError::OutOfBounds {
+                address,
+                bytes: output.len() as u64,
+            })?;
+        if end > self.bytes.len() as u64 {
+            return Err(VirtioError::OutOfBounds {
+                address,
+                bytes: output.len() as u64,
+            });
+        }
+        output.copy_from_slice(&self.bytes[address as usize..end as usize]);
+        Ok(())
+    }
+
+    fn write(&mut self, address: u64, input: &[u8]) -> Result<(), VirtioError> {
+        let end = address
+            .checked_add(input.len() as u64)
+            .ok_or(VirtioError::OutOfBounds {
+                address,
+                bytes: input.len() as u64,
+            })?;
+        if end > self.bytes.len() as u64 {
+            return Err(VirtioError::OutOfBounds {
+                address,
+                bytes: input.len() as u64,
+            });
+        }
+        self.bytes[address as usize..end as usize].copy_from_slice(input);
+        Ok(())
+    }
+}
+
+#[test]
+fn an_oversized_transmit_chain_reports_a_saturated_length() {
+    // Regression: the oversized-frame drop path published the total chain
+    // length as `total as u32`, truncating a u128 sum of descriptor
+    // lengths. Two near-u32::MAX descriptors overflow u32; the published
+    // length must saturate instead of wrapping.
+    let mut harness = Harness::new();
+    harness.configure_queue(1, TX_DESC_BASE, TX_AVAIL_BASE, TX_USED_BASE, 4);
+    harness.write_desc(TX_DESC_BASE, 0, 0x1_0000_0000, u32::MAX, DESC_FLAG_NEXT, 1);
+    harness.write_desc(TX_DESC_BASE, 1, 0x2_0000_0000, u32::MAX, 0, 0);
+    harness.bytes[TX_AVAIL_BASE as usize + 2..TX_AVAIL_BASE as usize + 4]
+        .copy_from_slice(&1_u16.to_le_bytes());
+    harness.bytes[TX_AVAIL_BASE as usize + 4..TX_AVAIL_BASE as usize + 6]
+        .copy_from_slice(&0_u16.to_le_bytes());
+    harness.device.mmio_write(QUEUE_NOTIFY, 1);
+    {
+        let mut memory = HugeMemory {
+            bytes: &mut harness.bytes,
+        };
+        assert!(harness.device.poll(&mut memory).unwrap());
+    }
+    assert_eq!(harness.tx_used_entry(), (0, u32::MAX));
+    assert_eq!(harness.device.dropped(), (0, 1));
+    assert!(harness.device.fault().is_none());
 }
