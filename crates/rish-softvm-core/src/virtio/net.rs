@@ -445,6 +445,15 @@ impl VirtioMmioNet {
         let queue = self.queues[QUEUE_TX];
         queue.validate(memory.ram_bytes())?;
         let avail = queue::avail_index(memory, &queue)?;
+        // The ring holds at most queue.size entries; a larger delta means
+        // the guest is replaying the same heads. Fail closed instead of
+        // servicing one frame thousands of times in a single poll.
+        let pending = avail.wrapping_sub(self.last_seen_avail[QUEUE_TX]);
+        if u32::from(pending) > u32::from(queue.size) {
+            return Err(VirtioError::BadQueue(
+                "transmit available ring grew by more than the queue size",
+            ));
+        }
         let mut completed = 0_u32;
         while self.last_seen_avail[QUEUE_TX] != avail {
             let head = queue::avail_head(memory, &queue, self.last_seen_avail[QUEUE_TX])?;
@@ -556,6 +565,14 @@ impl VirtioMmioNet {
             let avail = queue::avail_index(memory, &queue)?;
             if self.last_seen_avail[QUEUE_RX] == avail {
                 break;
+            }
+            // Same fail-closed bound as the transmit drain: the driver can
+            // never publish more than the ring holds between two polls.
+            let pending = avail.wrapping_sub(self.last_seen_avail[QUEUE_RX]);
+            if u32::from(pending) > u32::from(queue.size) {
+                return Err(VirtioError::BadQueue(
+                    "receive available ring grew by more than the queue size",
+                ));
             }
             let head = queue::avail_head(memory, &queue, self.last_seen_avail[QUEUE_RX])?;
             let frame = self.rx_backlog.pop_front().unwrap_or_default();

@@ -399,3 +399,37 @@ fn a_status_write_of_zero_resets_the_device() {
     assert!(!harness.device.queue_ready[QUEUE_TX]);
     assert_eq!(harness.device.irq_status, 0);
 }
+
+#[test]
+fn a_tx_avail_index_leap_beyond_the_queue_size_fails_closed() {
+    let mut harness = Harness::new();
+    harness.configure_queue(1, TX_DESC_BASE, TX_AVAIL_BASE, TX_USED_BASE, 4);
+    // One valid TX buffer, but avail.idx claims 65535 entries were added to
+    // a 4-entry ring: the device must not replay the same frame thousands
+    // of times inside one poll.
+    harness.submit_tx(b"replay");
+    harness.bytes[TX_AVAIL_BASE as usize + 2..TX_AVAIL_BASE as usize + 4]
+        .copy_from_slice(&0xFFFF_u16.to_le_bytes());
+    for slot in 0..4 {
+        harness.bytes[TX_AVAIL_BASE as usize + 4 + slot * 2..TX_AVAIL_BASE as usize + 6 + slot * 2]
+            .copy_from_slice(&0_u16.to_le_bytes());
+    }
+    assert!(!harness.poll().unwrap());
+    assert!(harness.device.fault().is_some());
+    // At most one frame may have reached the backend before the fault.
+    assert!(harness.inner.lock().unwrap().enqueued.len() <= 1);
+}
+
+#[test]
+fn an_rx_avail_index_leap_beyond_the_queue_size_fails_closed() {
+    let mut harness = Harness::new();
+    harness.configure_queue(0, RX_DESC_BASE, RX_AVAIL_BASE, RX_USED_BASE, 4);
+    harness.post_rx(2048);
+    harness.bytes[RX_AVAIL_BASE as usize + 2..RX_AVAIL_BASE as usize + 4]
+        .copy_from_slice(&0xFFFF_u16.to_le_bytes());
+    let frame = vec![0x42_u8; 60];
+    harness.inner.lock().unwrap().deliver.push_back(frame);
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    assert!(!harness.poll().unwrap());
+    assert!(harness.device.fault().is_some());
+}
