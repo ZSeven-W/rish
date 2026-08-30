@@ -12,6 +12,7 @@ pub mod cpu;
 pub mod devices;
 mod error;
 pub mod memory;
+pub mod net;
 mod ops;
 pub mod virtio;
 

@@ -1,8 +1,8 @@
-//! virtio-mmio block device emulation.
+//! virtio-mmio block and network device emulation.
 //!
 //! # Transport choice: virtio-mmio, not virtio-pci
 //!
-//! The pure-Rust interpreter emulates the block device behind the virtio-mmio
+//! The pure-Rust interpreter emulates devices behind the virtio-mmio
 //! transport instead of virtio-pci. Rationale:
 //!
 //! - virtio-mmio is a flat 512-byte MMIO register file plus one interrupt
@@ -12,16 +12,19 @@
 //! - The pinned virt kernel has the transport built in
 //!   (`CONFIG_VIRTIO_MMIO=y`) and supports command-line device discovery
 //!   (`CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y`): the provider appends
-//!   `virtio_mmio.device=1K@0xfebf0000:10` to the kernel command line and
-//!   the guest probes the register file at boot. virtio-pci would instead
-//!   need PCI bus enumeration (config space at 0xCF8/0xCFC plus either the
-//!   ACPI MCFG or legacy BARs) for the guest to find the device at all.
-//! - The device's IRQ rides the existing I/O APIC pin 10 (identity-mapped
-//!   from the ISA IRQ in the published MADT), so no new interrupt
-//!   infrastructure is needed.
+//!   `virtio_mmio.device=1K@0xfebf0000:10` (block) and
+//!   `virtio_mmio.device=1K@0xfebf1000:11` (network) fragments to the
+//!   kernel command line and the guest probes both register files at boot.
+//!   virtio-pci would instead need PCI bus enumeration (config space at
+//!   0xCF8/0xCFC plus either the ACPI MCFG or legacy BARs) for the guest to
+//!   find a device at all.
+//! - The devices' IRQs ride the existing I/O APIC pins 10 and 11
+//!   (identity-mapped from the ISA IRQs in the published MADT), so no new
+//!   interrupt infrastructure is needed.
 //!
-//! The block *driver* itself (`virtio_blk`) is a kernel module in the
-//! pinned guest; the container initramfs bakes it in and insmods it, see
+//! The block *driver* (`virtio_blk`) and the network *driver*
+//! (`virtio_net`) are kernel modules in the pinned guest; the container
+//! initramfs bakes them in and insmods them, see
 //! `guest/x86_64/build-container-initramfs.sh`.
 //!
 //! # Implemented scope
@@ -52,18 +55,25 @@
 //!   than guessing.
 
 mod block;
+mod net;
 mod queue;
 
 pub mod backend;
 
 pub use backend::{BlockBackend, FileBlockBackend};
 pub use block::VirtioMmioBlk;
+pub use net::VirtioMmioNet;
 pub use queue::GuestMemory;
 
-/// MMIO register window base. Clear of guest RAM (the pure-Rust provider
-/// caps memory at 1024 MiB), the local APIC (0xFEE0_0000), and the I/O APIC
-/// (0xFEC0_0000); matches QEMU's virtio-mmio placement on pc machines.
+/// MMIO register window base for the block device. Clear of guest RAM
+/// (the pure-Rust provider caps memory at 1024 MiB), the local APIC
+/// (0xFEE0_0000), and the I/O APIC (0xFEC0_0000); matches QEMU's
+/// virtio-mmio placement on pc machines.
 pub const VIRTIO_MMIO_BASE: u64 = 0xFEBF_0000;
+
+/// MMIO register window base for the network device, one page above the
+/// block device window.
+pub const VIRTIO_NET_MMIO_BASE: u64 = VIRTIO_MMIO_BASE + 0x1000;
 
 /// Byte size of the register file: spec registers plus the block config
 /// space (0x000..=0x1FF).
@@ -73,13 +83,20 @@ pub const VIRTIO_MMIO_REGISTER_BYTES: u64 = 0x200;
 /// advertises a 1 KiB region; reads past the register file return zero.
 pub const VIRTIO_MMIO_WINDOW_BYTES: u64 = 0x400;
 
-/// IRQ line the device raises: I/O APIC pin 10, matching the command-line
-/// fragment below.
+/// IRQ line the block device raises: I/O APIC pin 10, matching the
+/// command-line fragment below.
 pub const VIRTIO_IRQ: u8 = 10;
+
+/// IRQ line the network device raises: I/O APIC pin 11.
+pub const VIRTIO_NET_IRQ: u8 = 11;
 
 /// Command-line fragment the pure-Rust provider appends when it attaches the
 /// block device. Format: size (KiB) @ base address : irq.
 pub const VIRTIO_CMDLINE_FRAGMENT: &str = "virtio_mmio.device=1K@0xfebf0000:10";
+
+/// Command-line fragment the pure-Rust provider appends when it attaches the
+/// network device. The kernel parameter may be repeated, once per device.
+pub const VIRTIO_NET_CMDLINE_FRAGMENT: &str = "virtio_mmio.device=1K@0xfebf1000:11";
 
 /// Error surface for the virtio device. Everything fails closed: a malformed
 /// queue or an out-of-RAM access stops the device instead of touching memory
