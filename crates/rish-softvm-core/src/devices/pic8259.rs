@@ -132,8 +132,12 @@ impl Pic8259 {
 
     fn write_master_command(&mut self, value: u8) {
         if value & ICW1_INIT != 0 {
+            // ICW1 resets the chip: the previous vector base is gone until
+            // the full ICW sequence completes again. Delivering with a
+            // half-written base would corrupt interrupt vectors.
             self.master.init_state = 1;
             self.master.expect_icw4 = value & ICW1_ICW4 != 0;
+            self.master.initialized = false;
             return;
         }
         match value & 0b1110_0000 {
@@ -150,8 +154,11 @@ impl Pic8259 {
 
     fn write_slave_command(&mut self, value: u8) {
         if value & ICW1_INIT != 0 {
+            // Same reset discipline as the master: a half-finished
+            // re-initialization must deliver nothing.
             self.slave.init_state = 1;
             self.slave.expect_icw4 = value & ICW1_ICW4 != 0;
+            self.slave.initialized = false;
             return;
         }
         match value & 0b1110_0000 {
@@ -325,5 +332,42 @@ mod tests {
         pic.write(0x20, 1, u32::from(OCW2_EOI)).unwrap();
         pic.set_input(InterruptLines { asserted: 1 << 4 });
         assert_eq!(pic.pending_irq(), Some(4));
+    }
+
+    #[test]
+    fn a_partial_reinitialization_delivers_nothing_until_icw4() {
+        let mut pic = Pic8259::new();
+        init_pic(&mut pic);
+        pic.pulse(10);
+        assert_eq!(pic.pending_irq(), Some(10));
+        // Start a re-initialization and stop after ICW2: the chip must not
+        // deliver with a half-written vector base.
+        pic.write(0xA0, 1, u32::from(ICW1_INIT | ICW1_ICW4))
+            .unwrap();
+        pic.write(0xA1, 1, 0x70).unwrap();
+        assert_eq!(pic.pending_irq(), None);
+        // Finishing the sequence re-arms the chip with the new base.
+        pic.write(0xA1, 1, 2).unwrap();
+        pic.write(0xA1, 1, 1).unwrap();
+        pic.pulse(10);
+        assert_eq!(pic.pending_irq(), Some(10));
+        assert_eq!(pic.acknowledge(10), 0x70 + 2);
+    }
+
+    #[test]
+    fn a_partial_master_reinitialization_delivers_nothing_until_icw4() {
+        let mut pic = Pic8259::new();
+        init_pic(&mut pic);
+        pic.pulse(0);
+        assert_eq!(pic.pending_irq(), Some(0));
+        pic.write(0x20, 1, u32::from(ICW1_INIT | ICW1_ICW4))
+            .unwrap();
+        pic.write(0x21, 1, 0x40).unwrap();
+        assert_eq!(pic.pending_irq(), None);
+        pic.write(0x21, 1, 0x04).unwrap();
+        pic.write(0x21, 1, 1).unwrap();
+        pic.pulse(0);
+        assert_eq!(pic.pending_irq(), Some(0));
+        assert_eq!(pic.acknowledge(0), 0x40);
     }
 }
