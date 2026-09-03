@@ -503,23 +503,28 @@ fn shld_shrd(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
     let size = operand_size(instruction, 0);
     let destination = read_operand0(cpu, instruction)?;
     let source = read_register(&cpu.regs, instruction.op1_register(), size);
-    let count = match instruction.op2_kind() {
-        OpKind::Immediate8 => instruction.immediate(2) & 0x3F,
-        _ => read_register(&cpu.regs, Register::CL, 1) & 0x3F,
-    };
     let bits = u32::from(size) * 8;
-    let result = if instruction.mnemonic() == Mnemonic::Shld {
-        if count >= u64::from(bits) {
-            u64::MAX
-        } else {
-            (destination << count) | (source >> (bits - count as u32))
-        }
-    } else if count >= u64::from(bits) {
-        0
-    } else {
-        (destination >> count) | (source << (bits - count as u32))
-    };
     let mask = crate::ops::bits_mask(bits);
+    // Hardware masks the count to 5 bits for 16/32-bit operands and 6 bits
+    // for 64-bit operands; a zero count leaves the destination and flags
+    // untouched. For 16-bit operands a count of 16..=31 is architecturally
+    // undefined, and this implementation reduces it modulo the width.
+    let count = match instruction.op2_kind() {
+        OpKind::Immediate8 => instruction.immediate(2) & u64::from(bits - 1),
+        _ => read_register(&cpu.regs, Register::CL, 1) & u64::from(bits - 1),
+    };
+    if count == 0 {
+        return Ok(());
+    }
+    let count = count as u32;
+    // The shifted-out bits are discarded by hardware; wrapping shifts keep the
+    // same arithmetic in debug builds, where a checked shift would panic on
+    // the exact operands a real machine handles silently.
+    let result = if instruction.mnemonic() == Mnemonic::Shld {
+        (destination & mask).wrapping_shl(count) | ((source & mask) >> (bits - count))
+    } else {
+        ((destination & mask) >> count) | ((source & mask).wrapping_shl(bits - count))
+    };
     let result = result & mask;
     crate::ops::set_szp(&mut cpu.regs, result, bits);
     if count == 1 {
@@ -1001,6 +1006,52 @@ mod tests {
         assert_ne!(edx & (1 << 26), 0); // SSE2
         assert_ne!(edx & (1 << 15), 0); // CMOV
         assert_ne!(edx & (1 << 9), 0); // APIC
+    }
+
+    #[test]
+    fn shrd_64_with_zero_count_is_a_no_op() {
+        // 48 0F AC D8 00: shrd rax, rbx, 0. Hardware masks the count to zero
+        // and leaves the destination untouched; the interpreter must not
+        // panic on the masked-out shift (debug builds check shift overflow).
+        let mut cpu = cpu();
+        cpu.regs.set_gpr(index::RAX, 0x1234_5678_9ABC_DEF0);
+        cpu.regs.set_gpr(index::RBX, u64::MAX);
+        run(&mut cpu, 64, &[0x48, 0x0F, 0xAC, 0xD8, 0x00]).unwrap();
+        assert_eq!(cpu.regs.gpr(index::RAX), 0x1234_5678_9ABC_DEF0);
+    }
+
+    #[test]
+    fn shrd_64_discards_shifted_out_bits_without_panicking() {
+        // 48 0F AC D8 01: shrd rax, rbx, 1. The top source bits are shifted
+        // out and discarded by hardware; wrapping arithmetic keeps the same
+        // result in debug builds.
+        let mut cpu = cpu();
+        cpu.regs.set_gpr(index::RAX, 0x1);
+        cpu.regs.set_gpr(index::RBX, u64::MAX);
+        run(&mut cpu, 64, &[0x48, 0x0F, 0xAC, 0xD8, 0x01]).unwrap();
+        assert_eq!(cpu.regs.gpr(index::RAX), 0x8000_0000_0000_0000);
+    }
+
+    #[test]
+    fn shld_64_wraps_without_panicking() {
+        // 48 0F A4 D8 3F: shld rax, rbx, 63. The destination's shifted-out
+        // bits are discarded; only its low bit survives in bit 63.
+        let mut cpu = cpu();
+        cpu.regs.set_gpr(index::RAX, u64::MAX);
+        cpu.regs.set_gpr(index::RBX, 0);
+        run(&mut cpu, 64, &[0x48, 0x0F, 0xA4, 0xD8, 0x3F]).unwrap();
+        assert_eq!(cpu.regs.gpr(index::RAX), 0x8000_0000_0000_0000);
+    }
+
+    #[test]
+    fn shrd_32_masks_the_count_like_hardware() {
+        // 0F AC D8 20: shrd eax, ebx, 32. Hardware masks the count to 5 bits
+        // (32 & 0x1F == 0), so the destination is unchanged.
+        let mut cpu = cpu();
+        cpu.regs.set_gpr(index::RAX, 0x1234_5678);
+        cpu.regs.set_gpr(index::RBX, 0xDEAD_BEEF);
+        run(&mut cpu, 32, &[0x0F, 0xAC, 0xD8, 0x20]).unwrap();
+        assert_eq!(cpu.regs.gpr(index::RAX), 0x1234_5678);
     }
 
     #[test]
