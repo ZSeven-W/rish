@@ -2,11 +2,11 @@
 //!
 //! `rish_vm_run_docker_json` boots the in-repository pure-Rust x86_64
 //! interpreter with an app-supplied kernel and initramfs, waits for the guest
-//! init to report on the console, brings up the framed control channel, and
-//! runs one command inside the guest — the same path the desktop
-//! `pure_rust_guest` example drives. Everything crosses the ABI as UTF-8 JSON;
-//! the guest kernel and initramfs are named by filesystem path so the large
-//! binaries never travel through the JSON envelope.
+//! init and then the guest agent to report on the console, brings up the
+//! framed control channel, and runs one command inside the guest — the same
+//! path the desktop `pure_rust_guest` example drives. Everything crosses the
+//! ABI as UTF-8 JSON; the guest kernel and initramfs are named by filesystem
+//! path so the large binaries never travel through the JSON envelope.
 
 use std::sync::Arc;
 
@@ -14,13 +14,17 @@ use rish_core::HostReply;
 use rish_guest_protocol::{DEFAULT_MAX_FRAME_SIZE, Envelope, Hello, Message, PeerInfo, RequestId};
 use rish_softvm_x86_64::{
     EngineLimits, MachineState, PureRustProvider, SerialGuestTransport, X86_64SoftwareEngine,
+    guest_failed, guest_ready,
 };
 use rish_vm::{GuestChannel, VmAcceleration, VmConfig, VmDevice, VmNetworkMode};
 use serde::{Deserialize, Serialize};
 
-const BOOT_OK_MARKER: &[u8] = b"RISH_X86_64_BOOT_OK";
-const BOOT_FAILED_MARKER: &[u8] = b"RISH_X86_64_BOOT_FAILED";
 const BOOT_QUANTUM_UNITS: u64 = 500_000;
+
+/// Set this environment variable to echo the guest console to stderr while
+/// the guest boots. The console is otherwise consumed silently, which leaves a
+/// handshake failure with no guest-side evidence.
+const CONSOLE_DEBUG_ENV: &str = "RISH_DBG_CONSOLE";
 
 /// One docker-run request. Kernel and initramfs are paths (the app stages them
 /// as bundle resources); the command is the argv executed in the guest.
@@ -157,8 +161,13 @@ fn boot_channel(
         command_line: request.command_line.clone().unwrap_or_default(),
     };
 
-    // Stage 1: run until the guest init prints the boot marker.
+    // Stage 1: run until the guest init prints the boot marker AND the guest
+    // agent prints its ready marker. The agent resets the control UART's
+    // receive FIFO while it initializes the port (before it prints the ready
+    // marker), so a Hello written after the boot marker alone is discarded
+    // unread and the handshake below spins until its step budget runs out.
     let machine = engine.launch(&config).map_err(|error| error.to_string())?;
+    let echo_console = std::env::var_os(CONSOLE_DEBUG_ENV).is_some();
     let mut executed = 0_u64;
     let mut console = Vec::new();
     loop {
@@ -166,11 +175,14 @@ fn boot_channel(
             .run_units(BOOT_QUANTUM_UNITS)
             .map_err(|error| error.to_string())?;
         executed += report.executed_units;
+        if echo_console && !report.console.is_empty() {
+            eprint!("{}", String::from_utf8_lossy(&report.console));
+        }
         console.extend_from_slice(&report.console);
-        if contains(&console, BOOT_FAILED_MARKER) {
+        if guest_failed(&console) {
             return Err("guest init reported RISH_X86_64_BOOT_FAILED".to_owned());
         }
-        if contains(&console, BOOT_OK_MARKER) {
+        if guest_ready(&console) {
             break;
         }
         match report.snapshot.state {
@@ -179,7 +191,7 @@ fn boot_channel(
         }
         if executed > request.boot_budget_units {
             return Err(format!(
-                "boot budget exhausted after {executed} units without the boot marker"
+                "boot budget exhausted after {executed} units without the boot and agent-ready markers"
             ));
         }
     }
@@ -273,10 +285,6 @@ pub fn vm_session_exec_json(session: &VmSession, request_json: &str) -> String {
     serde_json::to_string(&response).unwrap_or_else(|_| {
         r#"{"protocol_version":1,"ok":false,"error":"serialize failed"}"#.into()
     })
-}
-
-fn contains(buffer: &[u8], marker: &[u8]) -> bool {
-    buffer.windows(marker.len()).any(|window| window == marker)
 }
 
 #[cfg(test)]
