@@ -2,7 +2,9 @@ use std::io;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use rish_guest_agent::{GuestAgent, NativeOperationHandler, bootstrap_guest_agent};
+use rish_guest_agent::{
+    CONTROL_PORT, CONTROL_READY_MARKER, GuestAgent, NativeOperationHandler, bootstrap_guest_agent,
+};
 use rish_guest_protocol::{Envelope, FrameDecoder, FrameEncoder};
 
 const INPUT_CHUNK_SIZE: usize = 64 * 1024;
@@ -10,8 +12,8 @@ const INPUT_CHUNK_SIZE: usize = 64 * 1024;
 /// I/O base of the control 16550 (COM2 / ttyS1). The agent drives these
 /// registers directly instead of reading and writing /dev/ttyS1, so the framed
 /// binary protocol never passes through the kernel serial line discipline or
-/// its receive-interrupt path — the two places that stall it.
-const CONTROL_PORT: u16 = 0x2F8;
+/// its receive-interrupt path — the two places that stall it. The value is
+/// exported from the library so host-side tests can assert the wiring contract.
 const REG_DATA: u16 = 0; // receive buffer / transmit holding register
 const REG_INTERRUPT_ENABLE: u16 = 1;
 const REG_FIFO_CONTROL: u16 = 2;
@@ -20,7 +22,6 @@ const REG_MODEM_CONTROL: u16 = 4;
 const REG_LINE_STATUS: u16 = 5;
 const LSR_DATA_READY: u8 = 1 << 0;
 const LSR_THR_EMPTY: u8 = 1 << 5;
-const CONTROL_READY_MARKER: &str = "RISH_GUEST_AGENT_READY";
 const CONTROL_TX_BURST: usize = 16;
 
 fn main() -> ExitCode {

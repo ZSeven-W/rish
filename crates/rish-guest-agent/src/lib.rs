@@ -26,6 +26,17 @@ pub use supervisor::{
 
 use probe::GuestProbe;
 
+/// I/O base of the control 16550 (COM2 / ttyS1). The agent drives these
+/// registers directly; the host machine must wire the control UART at exactly
+/// this port, and the host must wait for [`CONTROL_READY_MARKER`] on the
+/// console before writing the first framed Hello (the agent's port
+/// initialization resets the receive FIFO, which discards earlier input).
+pub const CONTROL_PORT: u16 = 0x2F8;
+
+/// Console readiness marker printed once the agent is polling the control
+/// UART. Hosts must not write a framed Hello before observing this marker.
+pub const CONTROL_READY_MARKER: &str = "RISH_GUEST_AGENT_READY";
+
 const MAX_REQUESTED_CAPABILITIES: usize = 64;
 const MAX_CAPABILITY_NAME_LENGTH: usize = 128;
 const MAX_EVENTS_PER_EXEC_POLL: usize = 4;
