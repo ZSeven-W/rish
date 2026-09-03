@@ -12,6 +12,7 @@ mod config;
 mod engine;
 mod error;
 mod machine;
+mod markers;
 mod provider;
 mod pure_rust;
 mod serial;
@@ -23,6 +24,9 @@ pub use config::{EngineLimits, TctiSourceLock};
 pub use engine::{DEFAULT_GUEST_COMMAND_LINE, X86_64SoftwareEngine};
 pub use error::SoftVmError;
 pub use machine::{BootSnapshot, RunReport, X86_64Machine};
+pub use markers::{
+    AGENT_READY_MARKER, BOOT_FAILED_MARKER, BOOT_OK_MARKER, contains, guest_failed, guest_ready,
+};
 pub use provider::{
     MachineProvider, MachineState, ProviderBuildInfo, ProviderKind, ProviderMachine,
     ProviderRequest, ProviderRun, ProviderSnapshot, TctiProvider,

@@ -12,15 +12,17 @@ use std::{env, path::PathBuf, process::ExitCode, sync::Arc, time::Instant};
 use rish_core::{Capability, Platform};
 use rish_softvm_x86_64::{
     EngineLimits, MachineProvider, PureRustProvider, SerialGuestTransport, X86_64SoftwareEngine,
+    guest_failed, guest_ready,
 };
 use rish_vm::{
     GuestChannel, GuestKernelContract, VmAcceleration, VmCandidate, VmConfig, VmDevice, VmEngine,
     VmError, VmProbe,
 };
 
-const BOOT_OK_MARKER: &[u8] = b"RISH_X86_64_BOOT_OK";
-const BOOT_FAILED_MARKER: &[u8] = b"RISH_X86_64_BOOT_FAILED";
-const AGENT_READY_MARKER: &[u8] = b"RISH_GUEST_AGENT_READY";
+// The boot-marker contract (BOOT_OK, AGENT_READY, BOOT_FAILED and the
+// guest_ready/guest_failed predicates) lives in rish_softvm_x86_64::markers
+// so every host entry point — this diagnostic example and the mobile-bridge
+// rish_vm_run_docker_json surface — observes the same handshake sequencing.
 
 struct Options {
     kernel: PathBuf,
@@ -198,10 +200,10 @@ fn run() -> Result<(), String> {
         // Print only the newly arrived bytes; keep the full buffer so the boot
         // markers are still detectable even when one spans two run chunks.
         print_console(&console, &mut printed);
-        if contains(&console, BOOT_FAILED_MARKER) {
+        if guest_failed(&console) {
             return Err("guest init reported RISH_X86_64_BOOT_FAILED".to_owned());
         }
-        if contains(&console, BOOT_OK_MARKER) && contains(&console, AGENT_READY_MARKER) {
+        if guest_ready(&console) {
             println!(
                 "[pure-rust-guest] boot and agent ready after {executed} units in {:?}",
                 started.elapsed()
@@ -310,10 +312,6 @@ fn run() -> Result<(), String> {
         return Err(format!("guest command exited with {}", reply.exit_code));
     }
     Ok(())
-}
-
-fn contains(buffer: &[u8], marker: &[u8]) -> bool {
-    buffer.windows(marker.len()).any(|window| window == marker)
 }
 
 fn print_console(buffer: &[u8], printed: &mut usize) {
