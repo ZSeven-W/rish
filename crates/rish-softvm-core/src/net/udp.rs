@@ -48,6 +48,7 @@ pub struct UdpState {
     upstream: Option<SocketAddr>,
     pending: HashMap<u16, PendingQuery>,
     next_id: u16,
+    system_dns: super::system_dns::SystemDns,
 }
 
 impl UdpState {
@@ -56,9 +57,17 @@ impl UdpState {
         socket.set_nonblocking(true)?;
         Ok(Self {
             socket,
-            upstream: host_nameserver(),
+            // iOS owns DNS through its system resolver, including VPN/split
+            // DNS settings. A host IPv6 nameserver also cannot be reached by
+            // this IPv4 UDP socket, so use the same system fallback there.
+            upstream: if cfg!(target_os = "ios") {
+                None
+            } else {
+                host_nameserver().filter(SocketAddr::is_ipv4)
+            },
             pending: HashMap::new(),
             next_id: 0,
+            system_dns: super::system_dns::SystemDns::new(),
         })
     }
 
@@ -102,9 +111,11 @@ impl UdpState {
         }
         let query = &payload[8..];
         let Some(upstream) = self.upstream else {
-            // No host resolver: DNS is unavailable and the guest's own
-            // resolver timeout will surface it.
-            counters.dns_drops = counters.dns_drops.saturating_add(1);
+            if self.system_dns.submit(query, src_port) {
+                counters.dns_queries = counters.dns_queries.saturating_add(1);
+            } else {
+                counters.dns_drops = counters.dns_drops.saturating_add(1);
+            }
             return;
         };
         if query.len() < 12 {
@@ -149,6 +160,7 @@ impl UdpState {
     /// device reset: queries from the previous driver session must not be
     /// answered into the next one.
     pub fn reset(&mut self) {
+        self.system_dns.reset();
         self.pending.clear();
         self.next_id = 0;
     }
@@ -164,6 +176,17 @@ impl UdpState {
         counters: &mut NetCounters,
         emit: &mut dyn FnMut(Vec<u8>),
     ) {
+        for (port, answer) in self.system_dns.poll(now) {
+            emit(wrap_udp(
+                config.gateway_ip,
+                config.guest_ip,
+                53,
+                port,
+                &answer,
+                next_identification(ip_id),
+            ));
+            counters.dns_answers = counters.dns_answers.saturating_add(1);
+        }
         let mut buffer = [0_u8; 4096];
         loop {
             let (length, from) = match self.socket.recv_from(&mut buffer) {
@@ -280,6 +303,39 @@ mod tests {
             payload,
             3,
         )
+    }
+
+    #[test]
+    fn no_resolv_conf_uses_system_dns_instead_of_dropping_queries() {
+        let mut state = UdpState::new().unwrap();
+        state.upstream = None;
+        let config = config();
+        let mut counters = NetCounters::default();
+        let mut frames = Vec::new();
+        let mut ip_id = 0;
+        state.handle(
+            ipv4::parse(&guest_udp(&dns_query(0xBEEF, "localhost"), 41000)).unwrap(),
+            &config,
+            &mut counters,
+        );
+        let start = Instant::now();
+        while frames.is_empty() && start.elapsed() < Duration::from_secs(5) {
+            state.poll(
+                Instant::now(),
+                &config,
+                &mut ip_id,
+                &mut counters,
+                &mut |frame| frames.push(frame),
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(counters.dns_queries, 1);
+        assert_eq!(counters.dns_answers, 1);
+        let ip = ipv4::parse(&frames[0]).unwrap();
+        let dns = &ip.payload[8..];
+        assert_eq!(&dns[..2], &[0xbe, 0xef]);
+        assert_eq!(dns[3] & 15, 0);
+        assert!(u16::from_be_bytes([dns[6], dns[7]]) > 0);
     }
 
     #[test]

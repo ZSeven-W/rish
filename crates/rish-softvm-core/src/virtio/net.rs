@@ -268,13 +268,12 @@ impl VirtioMmioNet {
                 1 => self.driver_features[1] = value,
                 _ => {}
             },
-            QUEUE_SEL => {
-                if value < QUEUE_COUNT as u32 {
+            QUEUE_SEL
+                if value < QUEUE_COUNT as u32 => {
                     self.queue_sel = value;
                 }
-            }
-            QUEUE_NUM => {
-                if !self.queue_ready[self.queue_sel as usize] {
+            QUEUE_NUM
+                if !self.queue_ready[self.queue_sel as usize] => {
                     self.queues[self.queue_sel as usize].size =
                         if value > 0 && value <= u32::from(QUEUE_NUM_MAX_VALUE) {
                             value as u16
@@ -282,7 +281,6 @@ impl VirtioMmioNet {
                             0
                         };
                 }
-            }
             QUEUE_READY => {
                 let selected = self.queue_sel as usize;
                 if value == 0 {
@@ -292,14 +290,13 @@ impl VirtioMmioNet {
                     self.queue_ready[selected] = true;
                 }
             }
-            QUEUE_NOTIFY => {
+            QUEUE_NOTIFY
                 // The written value IS the queue index (the driver does
                 // not select the queue first); any other value is invalid.
-                if value < QUEUE_COUNT as u32 && self.queue_ready[value as usize] {
+                if value < QUEUE_COUNT as u32 && self.queue_ready[value as usize] => {
                     self.kick_pending[value as usize] = true;
                     self.notify_count = self.notify_count.saturating_add(1);
                 }
-            }
             INTERRUPT_ACK => self.irq_status &= !value,
             STATUS => {
                 if value == 0 {

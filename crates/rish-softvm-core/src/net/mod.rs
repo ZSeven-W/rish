@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 mod ether;
 mod host;
 mod ipv4;
+mod system_dns;
 mod tcp;
 mod tcp_segment;
 mod udp;
@@ -131,9 +132,8 @@ pub struct SlirpNetBackend {
 
 impl SlirpNetBackend {
     /// Builds the backend: binds the host DNS socket and reads the host
-    /// resolver address from /etc/resolv.conf. DNS silently degrades (every
-    /// query dropped, counted) when the host exposes no resolver; TCP still
-    /// works by IP.
+    /// resolver address from /etc/resolv.conf. Hosts without that file use
+    /// bounded system getaddrinfo workers for A/AAAA queries.
     pub fn new(config: NetConfig) -> Result<Self, std::io::Error> {
         Ok(Self {
             config,
@@ -311,9 +311,10 @@ pub fn host_nameserver() -> Option<std::net::SocketAddr> {
     let contents = std::fs::read_to_string("/etc/resolv.conf").ok()?;
     for line in contents.lines() {
         let mut fields = line.split_whitespace();
-        if fields.next()? == "nameserver" {
-            let address = fields.next()?.parse().ok()?;
-            return Some(std::net::SocketAddr::new(address, 53));
+        if fields.next() == Some("nameserver") {
+            if let Some(address) = fields.next().and_then(|value| value.parse().ok()) {
+                return Some(std::net::SocketAddr::new(address, 53));
+            }
         }
     }
     None

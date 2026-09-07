@@ -3,9 +3,7 @@
 use iced_x86::{Instruction, Register};
 
 use crate::arch::registers::index;
-use crate::ops::{
-    arithmetic, branch, data, logic, sse, sse_int, sse3, sse4, stack, string, system, x87,
-};
+use crate::ops::{arithmetic, branch, data, logic, sse, sse_int, sse3, stack, string, system, x87};
 use crate::{CpuError, cpu::Cpu};
 
 impl Cpu {
@@ -21,6 +19,50 @@ impl Cpu {
             return system::system_op(self, instruction);
         }
         match mnemonic {
+            Mnemonic::Pmovsxbw
+            | Mnemonic::Pmovsxbd
+            | Mnemonic::Pmovsxbq
+            | Mnemonic::Pmovsxwd
+            | Mnemonic::Pmovsxwq
+            | Mnemonic::Pmovsxdq
+            | Mnemonic::Pmovzxbw
+            | Mnemonic::Pmovzxbd
+            | Mnemonic::Pmovzxbq
+            | Mnemonic::Pmovzxwd
+            | Mnemonic::Pmovzxwq
+            | Mnemonic::Pmovzxdq => crate::ops::sse_widen::execute(self, instruction),
+            Mnemonic::Haddpd | Mnemonic::Haddps | Mnemonic::Hsubpd | Mnemonic::Hsubps => {
+                crate::ops::sse_horizontal::execute(self, instruction)
+            }
+            Mnemonic::Roundsd | Mnemonic::Roundss | Mnemonic::Roundpd | Mnemonic::Roundps => {
+                crate::ops::sse_round::execute(self, instruction)
+            }
+            Mnemonic::Psadbw
+            | Mnemonic::Packuswb
+            | Mnemonic::Packssdw
+            | Mnemonic::Packsswb
+            | Mnemonic::Ptest
+            | Mnemonic::Pshufb
+            | Mnemonic::Cvttps2dq
+            | Mnemonic::Pmulhuw
+            | Mnemonic::Pmulhw
+            | Mnemonic::Pmullw
+            | Mnemonic::Pmaddwd
+            | Mnemonic::Pmaddubsw
+            | Mnemonic::Pblendvb
+            | Mnemonic::Pblendw
+            | Mnemonic::Blendps
+            | Mnemonic::Blendpd
+            | Mnemonic::Blendvps
+            | Mnemonic::Blendvpd
+            | Mnemonic::Palignr
+            | Mnemonic::Pextrb
+            | Mnemonic::Pextrd
+            | Mnemonic::Pextrq
+            | Mnemonic::Extractps
+            | Mnemonic::Pinsrb
+            | Mnemonic::Pinsrd
+            | Mnemonic::Pinsrq => crate::ops::sse_integer::execute(self, instruction),
             Mnemonic::Nop | Mnemonic::Pause => Ok(()),
             Mnemonic::Mov => data::mov(self, instruction),
             Mnemonic::Lea => data::lea(self, instruction),
@@ -123,51 +165,8 @@ impl Cpu {
             | Mnemonic::Sti
             | Mnemonic::Sahf
             | Mnemonic::Lahf => branch::flag_ops(self, instruction),
-            Mnemonic::Packuswb
-            | Mnemonic::Palignr
-            | Mnemonic::Pshufb
-            | Mnemonic::Pminsb
-            | Mnemonic::Pminsd
-            | Mnemonic::Pminuw
-            | Mnemonic::Pminud
-            | Mnemonic::Pmaxsb
-            | Mnemonic::Pmaxsd
-            | Mnemonic::Pmaxuw
-            | Mnemonic::Pmaxud
-            | Mnemonic::Ptest
-            | Mnemonic::Pmovsxbw
-            | Mnemonic::Pmovsxbd
-            | Mnemonic::Pmovsxbq
-            | Mnemonic::Pmovsxwd
-            | Mnemonic::Pmovsxwq
-            | Mnemonic::Pmovsxdq
-            | Mnemonic::Pmovzxbw
-            | Mnemonic::Pmovzxbd
-            | Mnemonic::Pmovzxbq
-            | Mnemonic::Pmovzxwd
-            | Mnemonic::Pmovzxwq
-            | Mnemonic::Pmovzxdq
-            | Mnemonic::Pinsrb
-            | Mnemonic::Pinsrd
-            | Mnemonic::Pinsrq
-            | Mnemonic::Pextrb
-            | Mnemonic::Pextrd
-            | Mnemonic::Pextrq
-            | Mnemonic::Insertps
-            | Mnemonic::Extractps => sse_int::packed_integer_op(self, instruction),
-            Mnemonic::Roundsd
-            | Mnemonic::Roundss
-            | Mnemonic::Roundpd
-            | Mnemonic::Roundps
-            | Mnemonic::Blendvpd
-            | Mnemonic::Blendvps
-            | Mnemonic::Pblendvb => sse4::sse4_op(self, instruction),
-            Mnemonic::Haddpd
-            | Mnemonic::Haddps
-            | Mnemonic::Hsubpd
-            | Mnemonic::Hsubps
-            | Mnemonic::Addsubpd
-            | Mnemonic::Addsubps => sse3::sse3_op(self, instruction),
+            Mnemonic::Insertps => sse_int::packed_integer_op(self, instruction),
+            Mnemonic::Addsubpd | Mnemonic::Addsubps => sse3::sse3_op(self, instruction),
             Mnemonic::Movaps
             | Mnemonic::Movups
             | Mnemonic::Movapd
@@ -255,6 +254,14 @@ impl Cpu {
             | Mnemonic::Pmaxub
             | Mnemonic::Pminsw
             | Mnemonic::Pmaxsw
+            | Mnemonic::Pminsb
+            | Mnemonic::Pmaxsb
+            | Mnemonic::Pminsd
+            | Mnemonic::Pmaxsd
+            | Mnemonic::Pminuw
+            | Mnemonic::Pmaxuw
+            | Mnemonic::Pminud
+            | Mnemonic::Pmaxud
             | Mnemonic::Paddusb
             | Mnemonic::Paddusw
             | Mnemonic::Psubusb

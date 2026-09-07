@@ -260,6 +260,19 @@ impl MachineProvider for PureRustProvider {
             command_line.push(' ');
             command_line.push_str(VIRTIO_NET_CMDLINE_FRAGMENT);
         }
+        if !command_line
+            .split_whitespace()
+            .any(|part| part.starts_with("random.trust_bootloader="))
+        {
+            command_line.push_str(" random.trust_bootloader=on");
+        }
+        if command_line.len() + 1
+            > (rish_softvm_core::boot::entropy::RNG_SETUP_BASE - bzimage::CMDLINE_BASE) as usize
+        {
+            return Err(SoftVmError::InvalidConfig(
+                "command line overlaps boot entropy record".into(),
+            ));
+        }
         bzimage::load(
             &mut cpu,
             &kernel,
@@ -270,6 +283,14 @@ impl MachineProvider for PureRustProvider {
             },
         )
         .map_err(|error| SoftVmError::InvalidKernel(error.to_string()))?;
+        // Fresh host OS entropy for every VM boot. It never enters a JSON
+        // request, bundle, disk image, diagnostic, or reusable seed file.
+        let mut seed = zeroize::Zeroizing::new([0_u8; rish_softvm_core::boot::entropy::SEED_BYTES]);
+        getrandom::fill(&mut *seed).map_err(|error| {
+            SoftVmError::InvalidConfig(format!("host entropy unavailable: {error}"))
+        })?;
+        rish_softvm_core::boot::entropy::install(&mut cpu, &seed)
+            .map_err(|error| SoftVmError::InvalidKernel(error.to_string()))?;
         Ok(Box::new(PureRustMachine {
             cpu,
             io: Box::new(io),

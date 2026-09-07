@@ -8,6 +8,8 @@ repository.workspace = true
 
 [dependencies]
 base64 = "0.22"
+getrandom = "0.4"
+zeroize = "1.8"
 rish-core.workspace = true
 rish-guest-protocol.workspace = true
 rish-softvm-core.workspace = true

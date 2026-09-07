@@ -66,11 +66,13 @@ mkdir -p -- "$rootfs/bin" "$rootfs/lib" "$rootfs/usr/bin" \
 # libc symlink and signing keys ship alongside it.
 tar -xzf "$rootfs_archive" -C "$rootfs" --no-same-owner \
     bin/busybox lib/ld-musl-x86_64.so.1 lib/libc.musl-x86_64.so.1 \
+    usr/bin/ssl_client \
     sbin/apk usr/lib/libapk.so.3.0.0 usr/lib/libssl.so.3 usr/lib/libcrypto.so.3 \
     usr/lib/libz.so.1.3.2 etc/apk/keys etc/apk/arch \
     etc/ssl/certs/ca-certificates.crt etc/ssl/cert.pem ||
     die "cannot extract busybox/apk closure from $rootfs_name"
 [ -f "$rootfs/bin/busybox" ] || die "busybox missing after extract"
+[ -f "$rootfs/usr/bin/ssl_client" ] || die "ssl_client missing after extract"
 [ -f "$rootfs/lib/ld-musl-x86_64.so.1" ] || die "ld-musl missing after extract"
 [ -f "$rootfs/sbin/apk" ] || die "apk missing after extract"
 ln -s libz.so.1.3.2 "$rootfs/usr/lib/libz.so.1"

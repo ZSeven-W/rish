@@ -208,17 +208,16 @@ impl VirtioMmioBlk {
                 _ => {}
             },
             QUEUE_SEL => self.queue_sel = value,
-            QUEUE_NUM => {
+            QUEUE_NUM
                 // The device has exactly one queue; configuration written
                 // through any other selection must not reach it.
-                if self.queue_sel == 0 && !self.queue_ready {
+                if self.queue_sel == 0 && !self.queue_ready => {
                     self.queue.size = if value > 0 && value <= u32::from(QUEUE_NUM_MAX_VALUE) {
                         value as u16
                     } else {
                         0
                     };
                 }
-            }
             QUEUE_READY => {
                 if self.queue_sel != 0 {
                     // No such queue: reject instead of programming queue 0.
@@ -229,11 +228,10 @@ impl VirtioMmioBlk {
                     self.queue_ready = true;
                 }
             }
-            QUEUE_NOTIFY => {
-                if value == self.queue_sel && self.queue_ready {
+            QUEUE_NOTIFY
+                if value == self.queue_sel && self.queue_ready => {
                     self.kick_pending = true;
                 }
-            }
             INTERRUPT_ACK => self.irq_status &= !value,
             STATUS => {
                 if value == 0 {

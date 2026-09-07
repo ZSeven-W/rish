@@ -219,18 +219,50 @@ impl SessionClient {
         events: &mut Vec<Event>,
         io: &I,
     ) -> Result<(), SessionError> {
-        let frames = self.pump(io, self.max_advances_per_request, &|envelope| {
-            matches!(
-                &envelope.message,
-                Message::Event(Event {
-                    event: EventKind::ProcessExited {
-                        execution_id: candidate,
+        self.collect_until_exit_observed(execution_id, events, io, &mut |_| Ok(()))
+    }
+
+    /// Observes only stream and exit events belonging to this execution.
+    /// The observer runs synchronously before the next guest advance.
+    pub fn collect_until_exit_observed<I: SessionIo>(
+        &mut self,
+        execution_id: &str,
+        events: &mut Vec<Event>,
+        io: &I,
+        observer: &mut dyn FnMut(&Event) -> Result<(), SessionError>,
+    ) -> Result<(), SessionError> {
+        let frames = self.pump_observed(
+            io,
+            self.max_advances_per_request,
+            &|envelope| {
+                matches!(
+                    &envelope.message,
+                    Message::Event(Event {
+                        event: EventKind::ProcessExited {
+                            execution_id: candidate,
+                            ..
+                        },
                         ..
-                    },
-                    ..
-                }) if candidate == execution_id
-            )
-        })?;
+                    }) if candidate == execution_id
+                )
+            },
+            &mut |envelope| {
+                if let Message::Event(event) = &envelope.message {
+                    match &event.event {
+                        EventKind::Stream {
+                            execution_id: candidate,
+                            ..
+                        }
+                        | EventKind::ProcessExited {
+                            execution_id: candidate,
+                            ..
+                        } if candidate == execution_id => observer(event)?,
+                        _ => {}
+                    }
+                }
+                Ok(())
+            },
+        )?;
         events.extend(
             frames
                 .into_iter()
@@ -252,7 +284,7 @@ impl SessionClient {
         io: &I,
     ) -> Result<ExecOutcome, SessionError> {
         let attach_stdin = !stdin.is_empty();
-        let exec = Operation::Exec(crate::ExecRequest {
+        let exec = crate::ExecRequest {
             argv,
             env,
             cwd,
@@ -262,8 +294,20 @@ impl SessionClient {
             attach_stdout: true,
             attach_stderr: true,
             timeout_ms: None,
-        });
-        let mut exchange = self.request(exec, io)?;
+        };
+        self.execute_observed(exec, &stdin, io, &mut |_, _| {})
+    }
+
+    /// Runs a process and forwards decoded, bounded output before it exits.
+    pub fn execute_observed<I: SessionIo>(
+        &mut self,
+        request: crate::ExecRequest,
+        stdin: &[u8],
+        io: &I,
+        observer: &mut dyn FnMut(StreamChannel, &[u8]),
+    ) -> Result<ExecOutcome, SessionError> {
+        let attach_stdin = request.attach_stdin;
+        let mut exchange = self.request(Operation::Exec(request), io)?;
         let execution_id = match exchange.response.outcome {
             ResponseOutcome::Success {
                 result: ResponsePayload::ExecStarted { execution_id, .. },
@@ -278,7 +322,7 @@ impl SessionClient {
         };
 
         if attach_stdin {
-            self.stream_stdin(&execution_id, &stdin, &mut exchange.events, io)?;
+            self.stream_stdin(&execution_id, stdin, &mut exchange.events, io)?;
         }
         let already_exited = exchange.events.iter().any(|event| {
             matches!(
@@ -289,41 +333,51 @@ impl SessionClient {
                 } if candidate == &execution_id
             )
         });
-        if !already_exited {
-            self.collect_until_exit(&execution_id, &mut exchange.events, io)?;
-        }
-
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut exited = None;
-        for event in exchange.events {
-            match event.event {
-                EventKind::Stream {
-                    execution_id: candidate,
-                    channel,
-                    data_base64,
-                    ..
-                } if candidate == execution_id => {
-                    let decoded = decode_base64(&data_base64)?;
-                    match channel {
-                        StreamChannel::Stdout => push_bounded(&mut stdout, decoded)?,
-                        StreamChannel::Stderr => push_bounded(&mut stderr, decoded)?,
-                        StreamChannel::Console => {}
+        {
+            let mut capture = |event: &Event| -> Result<(), SessionError> {
+                match &event.event {
+                    EventKind::Stream {
+                        execution_id: candidate,
+                        channel,
+                        data_base64,
+                        ..
+                    } if candidate == &execution_id => {
+                        if exited.is_some() {
+                            return Err(SessionError::Stream("stream after ProcessExited".into()));
+                        }
+                        let decoded = decode_base64(data_base64)?;
+                        let target = match channel {
+                            StreamChannel::Stdout | StreamChannel::Console => &mut stdout,
+                            StreamChannel::Stderr => &mut stderr,
+                        };
+                        let offset = target.len();
+                        push_bounded(target, decoded)?;
+                        observer(*channel, &target[offset..]);
                     }
-                }
-                EventKind::ProcessExited {
-                    execution_id: candidate,
-                    exit_code,
-                    signal,
-                } if candidate == execution_id => {
-                    if exited.is_some() {
-                        return Err(SessionError::Stream(
-                            "guest reported ProcessExited twice".to_owned(),
-                        ));
+                    EventKind::ProcessExited {
+                        execution_id: candidate,
+                        exit_code,
+                        signal,
+                    } if candidate == &execution_id => {
+                        if exited.is_some() {
+                            return Err(SessionError::Stream(
+                                "guest reported ProcessExited twice".into(),
+                            ));
+                        }
+                        exited = Some((*exit_code, *signal));
                     }
-                    exited = Some((exit_code, signal));
+                    _ => {}
                 }
-                _ => {}
+                Ok(())
+            };
+            for event in &exchange.events {
+                capture(event)?;
+            }
+            if !already_exited {
+                self.collect_until_exit_observed(&execution_id, &mut Vec::new(), io, &mut capture)?;
             }
         }
         let (exit_code, signal) =
@@ -401,20 +455,37 @@ impl SessionClient {
         max_advances: u64,
         done: &dyn Fn(&Envelope) -> bool,
     ) -> Result<Vec<Envelope>, SessionError> {
+        self.pump_observed(io, max_advances, done, &mut |_| Ok(()))
+    }
+
+    fn pump_observed<I: SessionIo>(
+        &mut self,
+        io: &I,
+        max_advances: u64,
+        done: &dyn Fn(&Envelope) -> bool,
+        observer: &mut dyn FnMut(&Envelope) -> Result<(), SessionError>,
+    ) -> Result<Vec<Envelope>, SessionError> {
         let mut advances = 0_u64;
         let mut collected: Vec<Envelope> = Vec::new();
-        let mut last_dropped = io.dropped_output();
+        let initial_dropped = io.dropped_output();
         loop {
-            if io.dropped_output() != last_dropped {
+            if io.dropped_output() != initial_dropped {
                 return Err(SessionError::DroppedBytes);
             }
             if advances >= max_advances {
                 return Err(SessionError::Deadline { advances });
             }
             let bytes = io.advance().map_err(SessionError::Advance)?;
+            if io.dropped_output() != initial_dropped {
+                return Err(SessionError::DroppedBytes);
+            }
             if !bytes.is_empty() {
                 self.decoder.push(&bytes).map_err(SessionError::Frame)?;
                 while let Some(frame) = self.decoder.next_frame().map_err(SessionError::Frame)? {
+                    if collected.len() >= MAX_FRAMES_PER_EXCHANGE {
+                        return Err(SessionError::TooManyFrames);
+                    }
+                    observer(&frame)?;
                     collected.push(frame);
                 }
             }
@@ -424,7 +495,6 @@ impl SessionClient {
             if collected.iter().any(done) {
                 return Ok(collected);
             }
-            last_dropped = io.dropped_output();
             advances = advances.saturating_add(1);
         }
     }
@@ -468,3 +538,7 @@ fn accept_stream(response: &Response, execution_id: &str) -> Result<(), SessionE
         ))),
     }
 }
+
+#[cfg(test)]
+#[path = "session_stream_tests.rs"]
+mod stream_tests;
