@@ -104,6 +104,24 @@ void *rish_vm_boot_session(const char *input, size_t input_len);
  */
 char *rish_vm_session_exec_json(void *session, const char *input, size_t input_len);
 
+/** Incremental output as a versioned JSON envelope:
+ * {protocol_version:1,event:"output",sequence:0,channel:"stdout",data_base64:"..."}.
+ * Channels are stdout, stderr, or console; sequence starts at zero per call.
+ * UTF-8 JSON bytes are borrowed only during the synchronous callback and are
+ * not NUL-terminated. Do not retain the
+ * pointer or re-enter/free the session from this callback. No credential is
+ * interpreted or stored by the bridge; the command owns its output contract.
+ */
+typedef void (*rish_vm_output_callback)(void *context, const char *event_json,
+                                        size_t length);
+
+/** Same owned JSON result as exec_json, with output delivered before exit.
+ * Call on a worker thread. The callback/context must remain valid until this
+ * call returns. The caller releases the returned string with rish_string_free.
+ */
+char *rish_vm_session_exec_stream_json(void *session, const char *input,
+    size_t input_len, void *context, rish_vm_output_callback callback);
+
 /** Releases a session handle from rish_vm_boot_session, shutting the guest down. */
 void rish_vm_session_free(void *session);
 

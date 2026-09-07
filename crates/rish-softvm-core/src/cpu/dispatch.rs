@@ -19,6 +19,50 @@ impl Cpu {
             return system::system_op(self, instruction);
         }
         match mnemonic {
+            Mnemonic::Pmovsxbw
+            | Mnemonic::Pmovsxbd
+            | Mnemonic::Pmovsxbq
+            | Mnemonic::Pmovsxwd
+            | Mnemonic::Pmovsxwq
+            | Mnemonic::Pmovsxdq
+            | Mnemonic::Pmovzxbw
+            | Mnemonic::Pmovzxbd
+            | Mnemonic::Pmovzxbq
+            | Mnemonic::Pmovzxwd
+            | Mnemonic::Pmovzxwq
+            | Mnemonic::Pmovzxdq => crate::ops::sse_widen::execute(self, instruction),
+            Mnemonic::Haddpd | Mnemonic::Haddps | Mnemonic::Hsubpd | Mnemonic::Hsubps => {
+                crate::ops::sse_horizontal::execute(self, instruction)
+            }
+            Mnemonic::Roundsd | Mnemonic::Roundss | Mnemonic::Roundpd | Mnemonic::Roundps => {
+                crate::ops::sse_round::execute(self, instruction)
+            }
+            Mnemonic::Psadbw
+            | Mnemonic::Packuswb
+            | Mnemonic::Packssdw
+            | Mnemonic::Packsswb
+            | Mnemonic::Ptest
+            | Mnemonic::Pshufb
+            | Mnemonic::Cvttps2dq
+            | Mnemonic::Pmulhuw
+            | Mnemonic::Pmulhw
+            | Mnemonic::Pmullw
+            | Mnemonic::Pmaddwd
+            | Mnemonic::Pmaddubsw
+            | Mnemonic::Pblendvb
+            | Mnemonic::Pblendw
+            | Mnemonic::Blendps
+            | Mnemonic::Blendpd
+            | Mnemonic::Blendvps
+            | Mnemonic::Blendvpd
+            | Mnemonic::Palignr
+            | Mnemonic::Pextrb
+            | Mnemonic::Pextrd
+            | Mnemonic::Pextrq
+            | Mnemonic::Extractps
+            | Mnemonic::Pinsrb
+            | Mnemonic::Pinsrd
+            | Mnemonic::Pinsrq => crate::ops::sse_integer::execute(self, instruction),
             Mnemonic::Nop | Mnemonic::Pause => Ok(()),
             Mnemonic::Mov => data::mov(self, instruction),
             Mnemonic::Lea => data::lea(self, instruction),
@@ -208,6 +252,14 @@ impl Cpu {
             | Mnemonic::Pmaxub
             | Mnemonic::Pminsw
             | Mnemonic::Pmaxsw
+            | Mnemonic::Pminsb
+            | Mnemonic::Pmaxsb
+            | Mnemonic::Pminsd
+            | Mnemonic::Pmaxsd
+            | Mnemonic::Pminuw
+            | Mnemonic::Pmaxuw
+            | Mnemonic::Pminud
+            | Mnemonic::Pmaxud
             | Mnemonic::Paddusb
             | Mnemonic::Paddusw
             | Mnemonic::Psubusb

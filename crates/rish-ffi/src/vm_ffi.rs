@@ -206,6 +206,14 @@ fn boot_channel(
 
 /// Runs one command over an already-bootstrapped channel.
 fn exec_on(channel: &SerialGuestTransport, argv: &[String]) -> Result<HostReply, String> {
+    exec_on_observed(channel, argv, &mut |_, _| {})
+}
+
+fn exec_on_observed(
+    channel: &SerialGuestTransport,
+    argv: &[String],
+    observer: &mut dyn FnMut(rish_guest_protocol::StreamChannel, &[u8]),
+) -> Result<HostReply, String> {
     let command = rish_core::GuestCommand {
         program: argv[0].clone(),
         args: argv[1..].to_vec(),
@@ -213,7 +221,9 @@ fn exec_on(channel: &SerialGuestTransport, argv: &[String]) -> Result<HostReply,
         cwd: "/".to_owned(),
         stdin: Vec::new(),
     };
-    channel.execute(&command).map_err(|error| error.to_string())
+    channel
+        .execute_observed(&command, observer)
+        .map_err(|error| error.to_string())
 }
 
 fn run(request: VmRunRequest) -> Result<VmRunResponse, String> {
@@ -248,6 +258,14 @@ pub fn vm_boot_session(request_json: &str) -> Result<Box<VmSession>, String> {
 /// Runs one command in a live session and returns the JSON result. The request
 /// is `{"command":["argv0","argv1",...]}`.
 pub fn vm_session_exec_json(session: &VmSession, request_json: &str) -> String {
+    vm_session_exec_observed_json(session, request_json, &mut |_, _| {})
+}
+
+pub fn vm_session_exec_observed_json(
+    session: &VmSession,
+    request_json: &str,
+    observer: &mut dyn FnMut(rish_guest_protocol::StreamChannel, &[u8]),
+) -> String {
     #[derive(Deserialize)]
     struct ExecRequest {
         command: Vec<String>,
@@ -256,7 +274,7 @@ pub fn vm_session_exec_json(session: &VmSession, request_json: &str) -> String {
         Ok(request) if request.command.is_empty() => {
             VmRunResponse::failure("command must have at least one element")
         }
-        Ok(request) => match exec_on(&session.channel, &request.command) {
+        Ok(request) => match exec_on_observed(&session.channel, &request.command, observer) {
             Ok(reply) => VmRunResponse {
                 protocol_version: 1,
                 ok: reply.exit_code == 0,

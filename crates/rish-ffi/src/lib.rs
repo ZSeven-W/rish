@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 mod pull_ffi;
 pub mod vm_ffi;
+pub mod vm_stream_ffi;
 
 pub use pull_ffi::{RishRegistryFetchCallback, pull_image_json};
 

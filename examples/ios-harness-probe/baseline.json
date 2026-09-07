@@ -1,0 +1,7 @@
+{
+  "phase": "baseline",
+  "memory_mib": 1024,
+  "commands": [
+    ["sh", "-lc", "uname -a; cat /proc/cpuinfo | head -24; free -m; /bin/busybox --help | head -2"]
+  ]
+}

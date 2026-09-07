@@ -134,6 +134,56 @@ impl SerialGuestTransport {
     }
 }
 
+impl SerialGuestTransport {
+    pub fn execute_observed(
+        &self,
+        command: &GuestCommand,
+        observer: &mut dyn FnMut(rish_guest_protocol::StreamChannel, &[u8]),
+    ) -> Result<HostReply, VmError> {
+        let _guard = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let io = self.io();
+        let mut client = self.lock_client()?;
+        if client.negotiated().is_none() {
+            return Err(VmError::Protocol(
+                "guest control session was not negotiated".to_owned(),
+            ));
+        }
+        let mut argv = Vec::with_capacity(command.args.len().saturating_add(1));
+        argv.push(command.program.clone());
+        argv.extend(command.args.iter().cloned());
+        let outcome = client
+            .execute_observed(
+                rish_guest_protocol::ExecRequest {
+                    argv,
+                    env: command.env.clone(),
+                    cwd: (command.cwd != "/").then(|| command.cwd.clone()),
+                    user: None,
+                    tty: false,
+                    attach_stdin: !command.stdin.is_empty(),
+                    attach_stdout: true,
+                    attach_stderr: true,
+                    timeout_ms: None,
+                },
+                &command.stdin,
+                &io,
+                observer,
+            )
+            .map_err(session_error)?;
+        let exit_code = outcome
+            .exit_code
+            .unwrap_or(outcome.signal.map_or(-1, |value| 128 + value));
+        Ok(HostReply {
+            exit_code,
+            stdout: outcome.stdout,
+            stderr: outcome.stderr,
+            payload: Value::Null,
+        })
+    }
+}
+
 impl GuestChannel for SerialGuestTransport {
     fn bootstrap(&self, hello: &Envelope) -> Result<Envelope, VmError> {
         let _guard = self
@@ -194,38 +244,7 @@ impl GuestChannel for SerialGuestTransport {
     }
 
     fn execute(&self, command: &GuestCommand) -> Result<HostReply, VmError> {
-        let _guard = self
-            .in_flight
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let io = self.io();
-        let mut client = self.lock_client()?;
-        if client.negotiated().is_none() {
-            return Err(VmError::Protocol(
-                "guest control session was not negotiated".to_owned(),
-            ));
-        }
-        let mut argv = Vec::with_capacity(command.args.len().saturating_add(1));
-        argv.push(command.program.clone());
-        argv.extend(command.args.iter().cloned());
-        let outcome = client
-            .execute(
-                argv,
-                command.env.clone(),
-                (command.cwd != "/").then(|| command.cwd.clone()),
-                command.stdin.clone(),
-                &io,
-            )
-            .map_err(session_error)?;
-        let exit_code = outcome
-            .exit_code
-            .unwrap_or(outcome.signal.map_or(-1, |value| 128 + value));
-        Ok(HostReply {
-            exit_code,
-            stdout: outcome.stdout,
-            stderr: outcome.stderr,
-            payload: Value::Null,
-        })
+        self.execute_observed(command, &mut |_, _| {})
     }
 }
 

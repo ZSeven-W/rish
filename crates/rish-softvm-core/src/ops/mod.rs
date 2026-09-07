@@ -5,10 +5,17 @@ pub mod branch;
 pub mod data;
 pub mod logic;
 pub mod sse;
+pub mod sse_horizontal;
+pub mod sse_integer;
+pub mod sse_round;
+pub mod sse_widen;
 pub mod stack;
 pub mod string;
 pub mod system;
 pub mod x87;
+
+#[cfg(test)]
+mod flags_tests;
 
 use iced_x86::{Instruction, OpKind, Register};
 
@@ -224,7 +231,7 @@ pub fn sub_with_flags(left: u64, right: u64, carry: bool, bits: u32) -> AddResul
     let right_t = right & mask;
     AddResult {
         result,
-        carry: left_t < right_t.wrapping_add(borrow),
+        carry: left_t < right_t || (carry && left_t == right_t),
         overflow: ((left_t ^ right_t) & (left_t ^ truncated) & sign_bit(bits)) != 0,
         adjust: ((left_t ^ right_t ^ truncated) & 0x10) != 0,
     }
@@ -249,7 +256,7 @@ pub fn set_szp(regs: &mut Registers, result: u64, bits: u32) {
     let mut flags = regs.rflags;
     flags.set(RFlags::SF, truncated & sign_bit(bits) != 0);
     flags.set(RFlags::ZF, truncated == 0);
-    flags.set(RFlags::PF, truncated.count_ones() % 2 == 0);
+    flags.set(RFlags::PF, (truncated as u8).count_ones() % 2 == 0);
     regs.rflags = flags;
 }
 

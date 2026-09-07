@@ -36,61 +36,36 @@ pub fn string_op(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuErro
             for _ in 0..count {
                 let source = cpu.regs.gpr(index::RSI);
                 let destination = cpu.regs.gpr(index::RDI);
-                let physical_source =
-                    cpu.translate(source, crate::arch::paging::AccessKind::Read)?;
-                let physical_destination =
-                    cpu.translate(destination, crate::arch::paging::AccessKind::Write)?;
                 let mut buffer = [0_u8; 8];
-                cpu.memory
-                    .read(physical_source, &mut buffer[..size as usize])?;
-                cpu.memory
-                    .write(physical_destination, &buffer[..size as usize])?;
+                cpu.read_linear_bytes(source, &mut buffer[..size as usize])?;
+                cpu.write_linear_bytes(destination, &buffer[..size as usize])?;
                 advance_both(&mut cpu.regs, direction);
-                decrement_counter(&mut cpu.regs, size);
+                decrement_counter(&mut cpu.regs, rep || repe || repne);
             }
         }
         Mnemonic::Stosb | Mnemonic::Stosw | Mnemonic::Stosd | Mnemonic::Stosq => {
             let value = read_accumulator(&cpu.regs, size);
             for _ in 0..count {
                 let destination = cpu.regs.gpr(index::RDI);
-                let physical =
-                    cpu.translate(destination, crate::arch::paging::AccessKind::Write)?;
-                match size {
-                    1 => cpu.memory.write_u8(physical, value as u8)?,
-                    2 => cpu.memory.write_u16(physical, value as u16)?,
-                    4 => cpu.memory.write_u32(physical, value as u32)?,
-                    _ => cpu.memory.write_u64(physical, value)?,
-                }
+                cpu.write_linear_bytes(destination, &value.to_le_bytes()[..size as usize])?;
                 advance_rdi(&mut cpu.regs, direction);
-                decrement_counter(&mut cpu.regs, size);
+                decrement_counter(&mut cpu.regs, rep || repe || repne);
             }
         }
         Mnemonic::Lodsb | Mnemonic::Lodsw | Mnemonic::Lodsd | Mnemonic::Lodsq => {
             for _ in 0..count {
                 let source = cpu.regs.gpr(index::RSI);
-                let physical = cpu.translate(source, crate::arch::paging::AccessKind::Read)?;
-                let value = match size {
-                    1 => u64::from(cpu.memory.read_u8(physical)?),
-                    2 => u64::from(cpu.memory.read_u16(physical)?),
-                    4 => u64::from(cpu.memory.read_u32(physical)?),
-                    _ => cpu.memory.read_u64(physical)?,
-                };
+                let value = read_value(cpu, source, size)?;
                 write_accumulator(&mut cpu.regs, size, value);
                 advance_rsi(&mut cpu.regs, direction);
-                decrement_counter(&mut cpu.regs, size);
+                decrement_counter(&mut cpu.regs, rep || repe || repne);
             }
         }
         Mnemonic::Scasb | Mnemonic::Scasw | Mnemonic::Scasd | Mnemonic::Scasq => {
             let accumulator = read_accumulator(&cpu.regs, size);
             for _ in 0..count {
                 let address = cpu.regs.gpr(index::RDI);
-                let physical = cpu.translate(address, crate::arch::paging::AccessKind::Read)?;
-                let value = match size {
-                    1 => u64::from(cpu.memory.read_u8(physical)?),
-                    2 => u64::from(cpu.memory.read_u16(physical)?),
-                    4 => u64::from(cpu.memory.read_u32(physical)?),
-                    _ => cpu.memory.read_u64(physical)?,
-                };
+                let value = read_value(cpu, address, size)?;
                 let flags =
                     crate::ops::sub_with_flags(accumulator, value, false, u32::from(size) * 8);
                 crate::ops::set_szp(&mut cpu.regs, flags.result, u32::from(size) * 8);
@@ -98,7 +73,7 @@ pub fn string_op(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuErro
                 crate::ops::set_overflow(&mut cpu.regs, flags.overflow);
                 crate::ops::set_adjust(&mut cpu.regs, flags.adjust);
                 advance_rdi(&mut cpu.regs, direction);
-                decrement_counter(&mut cpu.regs, size);
+                decrement_counter(&mut cpu.regs, rep || repe || repne);
                 if repe && !cpu.regs.rflags.contains(RFlags::ZF) {
                     break;
                 }
@@ -111,29 +86,15 @@ pub fn string_op(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuErro
             for _ in 0..count {
                 let source = cpu.regs.gpr(index::RSI);
                 let destination = cpu.regs.gpr(index::RDI);
-                let physical_source =
-                    cpu.translate(source, crate::arch::paging::AccessKind::Read)?;
-                let physical_destination =
-                    cpu.translate(destination, crate::arch::paging::AccessKind::Read)?;
-                let left = match size {
-                    1 => u64::from(cpu.memory.read_u8(physical_source)?),
-                    2 => u64::from(cpu.memory.read_u16(physical_source)?),
-                    4 => u64::from(cpu.memory.read_u32(physical_source)?),
-                    _ => cpu.memory.read_u64(physical_source)?,
-                };
-                let right = match size {
-                    1 => u64::from(cpu.memory.read_u8(physical_destination)?),
-                    2 => u64::from(cpu.memory.read_u16(physical_destination)?),
-                    4 => u64::from(cpu.memory.read_u32(physical_destination)?),
-                    _ => cpu.memory.read_u64(physical_destination)?,
-                };
+                let left = read_value(cpu, source, size)?;
+                let right = read_value(cpu, destination, size)?;
                 let flags = crate::ops::sub_with_flags(left, right, false, u32::from(size) * 8);
                 crate::ops::set_szp(&mut cpu.regs, flags.result, u32::from(size) * 8);
                 crate::ops::set_carry(&mut cpu.regs, flags.carry);
                 crate::ops::set_overflow(&mut cpu.regs, flags.overflow);
                 crate::ops::set_adjust(&mut cpu.regs, flags.adjust);
                 advance_both(&mut cpu.regs, direction);
-                decrement_counter(&mut cpu.regs, size);
+                decrement_counter(&mut cpu.regs, rep || repe || repne);
                 if repe && !cpu.regs.rflags.contains(RFlags::ZF) {
                     break;
                 }
@@ -145,6 +106,12 @@ pub fn string_op(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuErro
         _ => {}
     }
     Ok(())
+}
+
+fn read_value(cpu: &mut Cpu, address: u64, size: u8) -> Result<u64, CpuError> {
+    let mut bytes = [0; 8];
+    cpu.read_linear_bytes(address, &mut bytes[..size as usize])?;
+    Ok(u64::from_le_bytes(bytes))
 }
 
 fn advance_both(regs: &mut crate::arch::registers::Registers, direction: i64) {
@@ -160,8 +127,10 @@ fn advance_rdi(regs: &mut crate::arch::registers::Registers, direction: i64) {
     regs.gpr[index::RDI] = regs.gpr[index::RDI].wrapping_add(direction as u64);
 }
 
-fn decrement_counter(regs: &mut crate::arch::registers::Registers, _size: u8) {
-    regs.gpr[index::RCX] = regs.gpr[index::RCX].wrapping_sub(1);
+fn decrement_counter(regs: &mut crate::arch::registers::Registers, repeated: bool) {
+    if repeated {
+        regs.gpr[index::RCX] = regs.gpr[index::RCX].wrapping_sub(1);
+    }
 }
 
 fn read_accumulator(regs: &crate::arch::registers::Registers, size: u8) -> u64 {
@@ -216,6 +185,67 @@ mod tests {
         let size = instruction.len();
         cpu.regs.rip = 0x1000 + size as u64;
         cpu.dispatch(&instruction)
+    }
+
+    #[test]
+    fn movsq_stitches_nonadjacent_physical_pages() {
+        let mut cpu = cpu();
+        cpu.regs.cr0 |= crate::arch::registers::Cr0::PG | crate::arch::registers::Cr0::PE;
+        cpu.regs.cr4 |= crate::arch::registers::Cr4::PAE;
+        cpu.regs.cr3 = 0x10000;
+        for (address, value) in [
+            (0x10000, 0x11003),
+            (0x11000, 0x12003),
+            (0x12000, 0x13003),
+            (0x13008, 0x1003),
+            (0x13200, 0x50003),
+            (0x13208, 0x60003),
+            (0x13210, 0x70003),
+            (0x13218, 0x80003),
+        ] {
+            cpu.memory.write_u64(address, value).unwrap();
+        }
+        cpu.memory.write(0x50ffc, &[1, 2, 3, 4]).unwrap();
+        cpu.memory.write(0x60000, &[5, 6, 7, 8]).unwrap();
+        cpu.regs.gpr[index::RSI] = 0x40ffc;
+        cpu.regs.gpr[index::RDI] = 0x42ffc;
+        cpu.regs.gpr[index::RCX] = 1;
+        run(&mut cpu, 64, &[0xf3, 0x48, 0xa5]).unwrap();
+        let mut low = [0; 4];
+        let mut high = [0; 4];
+        cpu.memory.read(0x70ffc, &mut low).unwrap();
+        cpu.memory.read(0x80000, &mut high).unwrap();
+        assert_eq!(low, [1, 2, 3, 4]);
+        assert_eq!(high, [5, 6, 7, 8]);
+        cpu.regs.gpr[index::RSI] = 0x40ffc;
+        run(&mut cpu, 64, &[0x48, 0xad]).unwrap(); // lodsq
+        assert_eq!(cpu.regs.gpr[index::RAX], 0x0807_0605_0403_0201);
+        cpu.regs.gpr[index::RDI] = 0x42ffc;
+        run(&mut cpu, 64, &[0x48, 0xaf]).unwrap(); // scasq
+        assert!(cpu.regs.rflags.contains(RFlags::ZF));
+        cpu.regs.gpr[index::RSI] = 0x40ffc;
+        cpu.regs.gpr[index::RDI] = 0x42ffc;
+        run(&mut cpu, 64, &[0x48, 0xa7]).unwrap(); // cmpsq
+        assert!(cpu.regs.rflags.contains(RFlags::ZF));
+        cpu.regs.gpr[index::RAX] = 0x8877_6655_4433_2211;
+        cpu.regs.gpr[index::RDI] = 0x42ffc;
+        run(&mut cpu, 64, &[0x48, 0xab]).unwrap(); // stosq
+        cpu.memory.read(0x70ffc, &mut low).unwrap();
+        cpu.memory.read(0x80000, &mut high).unwrap();
+        assert_eq!(low, [0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(high, [0x55, 0x66, 0x77, 0x88]);
+    }
+
+    #[test]
+    fn unprefixed_string_operations_preserve_count_register() {
+        for opcode in [0xa4, 0xaa, 0xac, 0xae, 0xa6] {
+            let mut cpu = cpu();
+            cpu.regs.gpr[index::RSI] = 0x5000;
+            cpu.regs.gpr[index::RDI] = 0x6000;
+            cpu.regs.gpr[index::RCX] = 0x1234_5678_9abc_def0;
+            run(&mut cpu, 64, &[opcode]).unwrap();
+            assert_eq!(cpu.regs.gpr[index::RCX], 0x1234_5678_9abc_def0);
+        }
     }
 
     #[test]

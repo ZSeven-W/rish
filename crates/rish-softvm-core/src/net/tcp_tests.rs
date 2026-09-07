@@ -794,7 +794,7 @@ fn a_transient_pre_response_close_is_redialed_instead_of_killing_the_fetch() {
 
     // The echo arrives as a data segment from the remote address, with no
     // RST and no premature FIN in between.
-    let mut frames = poll_until(
+    let frames = poll_until(
         &mut state,
         &mut counters,
         |frames, _counters| {

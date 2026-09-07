@@ -145,30 +145,26 @@ pub fn jump(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
 pub fn cmovcc(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
     let condition =
         condition_of(instruction.mnemonic()).expect("dispatch only routes condition codes here");
+    // Intel defines the source read before testing the condition, including
+    // faults from a memory source even when the move is not selected.
+    let value = match instruction.op1_kind() {
+        OpKind::Memory => cpu.read_operand(instruction, 1, crate::ops::memory_size(instruction))?,
+        _ => read_register(
+            &cpu.regs,
+            instruction.op1_register(),
+            operand_size(instruction, 1),
+        ),
+    };
+    let size = operand_size(instruction, 0);
     if condition_holds(condition, cpu.regs.rflags) {
-        let value = match instruction.op1_kind() {
-            OpKind::Memory => {
-                cpu.read_operand(instruction, 1, crate::ops::memory_size(instruction))?
-            }
-            _ => read_register(
-                &cpu.regs,
-                instruction.op1_register(),
-                operand_size(instruction, 1),
-            ),
-        };
-        if instruction.op0_kind() == OpKind::Memory {
-            cpu.write_operand(instruction, 0, crate::ops::memory_size(instruction), value)?;
-        } else {
-            write_register(
-                &mut cpu.regs,
-                instruction.op0_register(),
-                operand_size(instruction, 0),
-                value,
-            );
-        }
+        write_register(&mut cpu.regs, instruction.op0_register(), size, value);
+    } else if size == 4 && cpu.regs.efer.contains(crate::arch::registers::Efer::LMA) {
+        let previous = read_register(&cpu.regs, instruction.op0_register(), 4);
+        write_register(&mut cpu.regs, instruction.op0_register(), 4, previous);
     }
     Ok(())
 }
+
 pub fn jcc(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
     let condition =
         condition_of(instruction.mnemonic()).expect("dispatch only routes condition codes here");
@@ -404,6 +400,29 @@ mod tests {
         run(&mut cpu, 64, &[0xE2, 0xFE], 0x1000).unwrap(); // loop -2
         assert_eq!(cpu.regs.gpr(index::RCX), 2);
         assert_eq!(cpu.regs.rip, 0x1000);
+    }
+
+    #[test]
+    fn false_cmov32_still_zeroes_the_upper_half() {
+        let mut cpu = cpu();
+        cpu.regs.gpr[0] = 0xffff_ffff_0000_0003;
+        cpu.regs.gpr[1] = 4;
+        cpu.regs.rflags.remove(RFlags::ZF);
+        run(&mut cpu, 64, &[0x0f, 0x44, 0xc1], 0x1000).unwrap();
+        assert_eq!(cpu.regs.gpr[0], 3);
+        cpu.regs.gpr[0] = 0xffff_ffff_0000_0003;
+        run(&mut cpu, 64, &[0x48, 0x0f, 0x44, 0xc1], 0x1000).unwrap();
+        assert_eq!(cpu.regs.gpr[0], 0xffff_ffff_0000_0003);
+    }
+
+    #[test]
+    fn false_cmov_still_reads_its_memory_source() {
+        let mut cpu = cpu();
+        cpu.regs.gpr[0] = 0xffff_ffff_0000_0003;
+        cpu.regs.gpr[1] = 0xffffe;
+        cpu.regs.rflags.remove(RFlags::ZF);
+        assert!(run(&mut cpu, 64, &[0x0f, 0x44, 0x01], 0x1000).is_err());
+        assert_eq!(cpu.regs.gpr[0], 0xffff_ffff_0000_0003);
     }
 
     #[test]
