@@ -132,9 +132,9 @@ impl Descriptor {
     #[must_use]
     pub fn decode(entry: u64) -> Self {
         Self {
-            base: (entry & 0xFF00_0000_0000_0000) >> 32
-                | (entry & 0x0000_00FF_0000_0000) >> 16
-                | (entry >> 16) & 0xFFFF,
+            base: ((entry & 0xFF00_0000_0000_0000) >> 32)
+                | ((entry & 0x0000_00FF_0000_0000) >> 16)
+                | ((entry >> 16) & 0xFFFF),
             limit: (((entry >> 48) & 0xF) as u32 * 0x10000) | (entry & 0xFFFF) as u32,
             granularity: entry & (1 << 55) != 0,
             default_32: entry & (1 << 54) != 0,
@@ -197,9 +197,9 @@ mod tests {
     fn decodes_base_and_limit_split_fields() {
         // base 0x12345678, limit 0x9ABCD (granularity off)
         let base: u64 = 0x1234_5678;
-        let entry = (base & 0xFF00_0000) << 32
-            | (base & 0x00FF_0000) << 16
-            | (base & 0xFFFF) << 16
+        let entry = ((base & 0xFF00_0000) << 32)
+            | ((base & 0x00FF_0000) << 16)
+            | ((base & 0xFFFF) << 16)
             | 0x9ABC;
         let descriptor = Descriptor::decode(entry);
         assert_eq!(descriptor.base, base);

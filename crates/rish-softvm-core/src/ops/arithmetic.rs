@@ -207,17 +207,17 @@ fn div(cpu: &mut Cpu, instruction: &Instruction, signed: bool) -> Result<(), Cpu
     let (dividend, dividend_size) = match size {
         1 => (read_register(&cpu.regs, Register::AX, 2), 1),
         2 => (
-            read_register(&cpu.regs, Register::DX, 2) << 16
+            (read_register(&cpu.regs, Register::DX, 2) << 16)
                 | read_register(&cpu.regs, Register::AX, 2),
             2,
         ),
         4 => (
-            read_register(&cpu.regs, Register::EDX, 4) << 32
+            (read_register(&cpu.regs, Register::EDX, 4) << 32)
                 | read_register(&cpu.regs, Register::EAX, 4),
             4,
         ),
         _ => (
-            read_register(&cpu.regs, Register::RDX, 8) << 32
+            (read_register(&cpu.regs, Register::RDX, 8) << 32)
                 | (read_register(&cpu.regs, Register::RAX, 8) & 0xFFFF_FFFF),
             8,
         ),

@@ -229,7 +229,7 @@ pub struct ValidatedChain<'a> {
     descriptors: &'a [Descriptor],
 }
 
-impl<'a> ValidatedChain<'a> {
+impl ValidatedChain<'_> {
     #[must_use]
     pub fn descriptors(&self) -> &[Descriptor] {
         self.descriptors

@@ -155,7 +155,7 @@ pub fn system_op(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuErro
         Mnemonic::Wrmsr => {
             let address = read_register(&cpu.regs, Register::ECX, 4) as u32;
             let value = read_register(&cpu.regs, Register::EAX, 4)
-                | read_register(&cpu.regs, Register::EDX, 4) << 32;
+                | (read_register(&cpu.regs, Register::EDX, 4) << 32);
             if !msr_write(cpu, address, value) {
                 return cpu.raise(VECTOR_GENERAL_PROTECTION, 0, true);
             }
@@ -488,7 +488,7 @@ pub fn extra_op(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError
             let index = read_register(&cpu.regs, Register::ECX, 4) as u32;
             if index == 0 {
                 let value = read_register(&cpu.regs, Register::EAX, 4)
-                    | read_register(&cpu.regs, Register::EDX, 4) << 32;
+                    | (read_register(&cpu.regs, Register::EDX, 4) << 32);
                 cpu.xcr0 = value & 0x7;
             }
         }

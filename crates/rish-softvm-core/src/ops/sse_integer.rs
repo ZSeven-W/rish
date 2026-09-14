@@ -525,7 +525,7 @@ mod tests {
             .write(0xffff8, &[255, 255, 255, 255, 0, 0, 0, 128])
             .unwrap();
         run(&mut cpu, &[0x66, 0x0f, 0x38, 0x35, 0x00]).unwrap();
-        assert_eq!(cpu.regs.xmm[0], 0x8000_0000_u128 << 64 | 0xffff_ffff);
+        assert_eq!(cpu.regs.xmm[0], (0x8000_0000_u128 << 64) | 0xffff_ffff);
     }
 
     #[test]

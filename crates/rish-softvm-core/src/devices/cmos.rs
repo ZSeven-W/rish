@@ -44,7 +44,7 @@ impl Cmos {
     }
 
     fn bcd(value: u64) -> u8 {
-        ((value / 10) as u8) << 4 | (value % 10) as u8
+        (((value / 10) as u8) << 4) | (value % 10) as u8
     }
 
     fn read_register(&self, register: u8) -> u8 {

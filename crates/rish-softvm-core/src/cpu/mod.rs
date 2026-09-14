@@ -463,16 +463,16 @@ impl Cpu {
         let linear = self.regs.code_base().wrapping_add(ip);
         let translation_epoch = self.tlb.epoch();
         let execution_context = self.decode_execution_context(bitness);
-        if !tlb_disabled()
-            && let Some(cached) = self.decoded.lookup_mapped(
+        if !tlb_disabled() {
+            if let Some(cached) = self.decoded.lookup_mapped(
                 &self.memory,
                 ip,
                 linear,
                 translation_epoch,
                 execution_context,
-            )
-        {
-            return Ok(cached);
+            ) {
+                return Ok(cached);
+            }
         }
         let mut window = [0_u8; MAX_INSTRUCTION_BYTES];
         let first = self.translate(linear, AccessKind::Execute)?;
