@@ -11,6 +11,20 @@ const INVALID: u32 = 1;
 const DENORMAL: u32 = 1 << 1;
 const PRECISION: u32 = 1 << 5;
 
+/// Legacy CVTDQ2PD converts only the low two signed i32 lanes (m64 for
+/// memory). Every i32 is exactly representable as f64, without exceptions.
+pub(super) fn cvtdq2pd(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
+    let raw = read_scalar_src(cpu, instruction, true)?;
+    let (low, _) = integer_to_float(i64::from(raw as i32), true, 0);
+    let (high, _) = integer_to_float(i64::from((raw >> 32) as i32), true, 0);
+    write_xmm(
+        &mut cpu.regs,
+        instruction.op0_register(),
+        u128::from(low) | (u128::from(high) << 64),
+    );
+    Ok(())
+}
+
 /// Legacy CVTPS2PD reads only the low two f32 lanes (m64 for memory) and
 /// replaces the whole XMM destination. Widening finite values is exact.
 pub(super) fn cvtps2pd(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {

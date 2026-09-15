@@ -313,6 +313,7 @@ impl Cpu {
             | Mnemonic::Cvtss2si
             | Mnemonic::Cvtss2sd
             | Mnemonic::Cvtps2pd
+            | Mnemonic::Cvtdq2pd
             | Mnemonic::Cvtsd2ss
             | Mnemonic::Cmpss
             | Mnemonic::Cmppd

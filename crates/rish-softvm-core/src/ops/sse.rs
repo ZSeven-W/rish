@@ -16,7 +16,7 @@ use numeric::*;
 
 #[path = "sse_convert.rs"]
 mod convert;
-use convert::{cvt2si_round, cvtps2pd, cvtsi2s, cvtts2si};
+use convert::{cvt2si_round, cvtdq2pd, cvtps2pd, cvtsi2s, cvtts2si};
 
 pub fn sse_op(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
     match instruction.mnemonic() {
@@ -148,6 +148,7 @@ pub fn sse_op(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> 
         Mnemonic::Cvtsd2si | Mnemonic::Cvtss2si => cvt2si_round(cpu, instruction),
         Mnemonic::Cvtss2sd => cvt_precision(cpu, instruction, true),
         Mnemonic::Cvtps2pd => cvtps2pd(cpu, instruction),
+        Mnemonic::Cvtdq2pd => cvtdq2pd(cpu, instruction),
         Mnemonic::Cvtsd2ss => cvt_precision(cpu, instruction, false),
         Mnemonic::Emms | Mnemonic::Femms => Ok(()),
         _ => Err(CpuError::UnimplementedInstruction {
