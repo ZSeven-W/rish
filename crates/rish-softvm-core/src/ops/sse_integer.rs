@@ -235,6 +235,31 @@ pub fn execute(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError>
                 }
             }
         }
+        Mnemonic::Packusdw => {
+            for (source, offset) in [(&left, 0), (&right, 8)] {
+                for (lane, dword) in source.chunks_exact(4).enumerate() {
+                    let value = i32::from_le_bytes(dword.try_into().expect("four-byte lane"))
+                        .clamp(0, i32::from(u16::MAX)) as u16;
+                    result[offset + lane * 2..offset + lane * 2 + 2]
+                        .copy_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+        Mnemonic::Pavgb => {
+            for lane in 0..16 {
+                result[lane] = ((u16::from(left[lane]) + u16::from(right[lane]) + 1) >> 1) as u8;
+            }
+        }
+        Mnemonic::Phaddd => {
+            for (source, offset) in [(&left, 0), (&right, 8)] {
+                for (lane, pair) in source.chunks_exact(8).enumerate() {
+                    let a = u32::from_le_bytes(pair[..4].try_into().expect("four-byte lane"));
+                    let b = u32::from_le_bytes(pair[4..].try_into().expect("four-byte lane"));
+                    result[offset + lane * 4..offset + lane * 4 + 4]
+                        .copy_from_slice(&a.wrapping_add(b).to_le_bytes());
+                }
+            }
+        }
         _ => return Err(unsupported()),
     }
     // Commit only after all source bytes have been read successfully.

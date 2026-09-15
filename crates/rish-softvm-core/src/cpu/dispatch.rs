@@ -41,6 +41,9 @@ impl Cpu {
             }
             Mnemonic::Psadbw
             | Mnemonic::Packuswb
+            | Mnemonic::Packusdw
+            | Mnemonic::Pavgb
+            | Mnemonic::Phaddd
             | Mnemonic::Packssdw
             | Mnemonic::Packsswb
             | Mnemonic::Ptest

@@ -7,6 +7,8 @@ pub mod logic;
 pub mod lsl;
 pub mod mxcsr;
 #[cfg(test)]
+mod packusdw_tests;
+#[cfg(test)]
 mod pmulld_tests;
 pub mod sse;
 pub mod sse3;
@@ -286,3 +288,6 @@ pub fn set_adjust(regs: &mut Registers, adjust: bool) {
 pub fn carry(regs: &Registers) -> bool {
     regs.rflags.contains(RFlags::CF)
 }
+
+#[cfg(test)]
+mod simd_average_horizontal_tests;
