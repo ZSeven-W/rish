@@ -299,6 +299,7 @@ impl Cpu {
             | Mnemonic::Minpd
             | Mnemonic::Maxpd
             | Mnemonic::Pmuludq
+            | Mnemonic::Pmulld
             | Mnemonic::Movhlps
             | Mnemonic::Movlhps
             | Mnemonic::Unpcklps

@@ -136,6 +136,7 @@ pub fn sse_op(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> 
         Mnemonic::Cmppd => cmp_float(cpu, instruction, false, true),
         Mnemonic::Cmpps => cmp_float(cpu, instruction, false, false),
         Mnemonic::Pmuludq => pmuludq(cpu, instruction),
+        Mnemonic::Pmulld => packed_arith(cpu, instruction, 32, PackedOp::MulWrap),
         Mnemonic::Movhlps => movhl(cpu, instruction, true),
         Mnemonic::Movlhps => movhl(cpu, instruction, false),
         Mnemonic::Unpcklps => unpck_float(cpu, instruction, 32, false),

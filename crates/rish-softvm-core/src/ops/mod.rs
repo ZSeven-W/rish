@@ -6,6 +6,8 @@ pub mod data;
 pub mod logic;
 pub mod lsl;
 pub mod mxcsr;
+#[cfg(test)]
+mod pmulld_tests;
 pub mod sse;
 pub mod sse3;
 #[cfg(test)]

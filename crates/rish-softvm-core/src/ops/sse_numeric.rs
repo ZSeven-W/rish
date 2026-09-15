@@ -6,6 +6,7 @@ use super::*;
 pub(super) enum PackedOp {
     AddWrap,
     SubWrap,
+    MulWrap,
     CmpGt,
     MinU,
     MaxU,
@@ -56,6 +57,8 @@ pub(super) fn packed_arith(
         let lane_result: u128 = match op {
             PackedOp::AddWrap => a.wrapping_add(b) & mask,
             PackedOp::SubWrap => a.wrapping_sub(b) & mask,
+            // Signed and unsigned multiplication have identical low lane bits.
+            PackedOp::MulWrap => a.wrapping_mul(b) & mask,
             PackedOp::CmpGt => {
                 if sext(a) > sext(b) {
                     mask
