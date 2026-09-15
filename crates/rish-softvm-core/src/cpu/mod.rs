@@ -273,6 +273,7 @@ impl Cpu {
             // hlt with interrupts enabled: the CPU is asleep. Advance the
             // clock sources so the timer can eventually fire, and keep the
             // serial lines fresh for the wake-up interrupt.
+            self.tsc = self.tsc.saturating_add(u64::from(DEVICE_TICK_INTERVAL));
             self.service_devices(DEVICE_TICK_INTERVAL);
             return Ok(());
         }

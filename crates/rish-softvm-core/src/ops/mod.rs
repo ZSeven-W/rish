@@ -25,6 +25,8 @@ pub mod x87_remainder;
 
 #[cfg(test)]
 mod flags_tests;
+#[cfg(test)]
+mod idle_clock_tests;
 
 use iced_x86::{Instruction, OpKind, Register};
 
