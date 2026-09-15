@@ -110,7 +110,7 @@ fn store_fp_memory(cpu: &mut Cpu, instruction: &Instruction, value: f64) -> Resu
 
 /// Stores `value` rounded to an integer of the reported width. `truncate`
 /// selects round-toward-zero (fisttp) instead of the control-word mode, which
-/// this model always treats as round-to-nearest.
+/// otherwise selects nearest-even, down, up, or toward-zero.
 fn store_int_memory(
     cpu: &mut Cpu,
     instruction: &Instruction,
@@ -121,7 +121,7 @@ fn store_int_memory(
     let rounded = if truncate {
         value.trunc()
     } else {
-        value.round_ties_even()
+        round_to_control(value, cpu.fpu_control_word)
     };
     let linear = cpu.effective_address(instruction, 0);
     match instruction.memory_size() {
@@ -131,6 +131,15 @@ fn store_int_memory(
         other => Err(CpuError::GuestFault(format!(
             "x87 integer store size {other:?} is unsupported"
         ))),
+    }
+}
+
+fn round_to_control(value: f64, control: u16) -> f64 {
+    match (control >> 10) & 3 {
+        0 => value.round_ties_even(),
+        1 => value.floor(),
+        2 => value.ceil(),
+        _ => value.trunc(),
     }
 }
 
@@ -225,12 +234,23 @@ fn source_index(instruction: &Instruction) -> usize {
         .unwrap_or(0)
 }
 
+/// For binary arithmetic/compare iced exposes the destination as operand 0
+/// and the source as operand 1. One-register forms name only their source.
+/// Pop arithmetic still uses `source_index`: its first register is the target.
+fn arithmetic_source_index(instruction: &Instruction) -> usize {
+    if instruction.op_count() > 1 {
+        st_index(instruction.op1_register()).unwrap_or(0)
+    } else {
+        source_index(instruction)
+    }
+}
+
 /// Reads the arithmetic operand: an ST register or a memory float.
 fn read_arith_operand(cpu: &mut Cpu, instruction: &Instruction) -> Result<f64, CpuError> {
     if instruction.op0_kind() == OpKind::Memory {
         read_fp_memory(cpu, instruction)
     } else {
-        Ok(cpu.fpu_st(source_index(instruction)))
+        Ok(cpu.fpu_st(arithmetic_source_index(instruction)))
     }
 }
 
@@ -280,15 +300,18 @@ pub fn x87_op(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> 
             store_int_memory(cpu, instruction, value, false)?;
         }
         Mnemonic::Fistp => {
-            let value = cpu.fpu_pop();
+            let value = cpu.fpu_st(0);
             store_int_memory(cpu, instruction, value, false)?;
+            cpu.fpu_pop();
         }
         Mnemonic::Fisttp => {
-            let value = cpu.fpu_pop();
+            let value = cpu.fpu_st(0);
             store_int_memory(cpu, instruction, value, true)?;
+            cpu.fpu_pop();
         }
 
         // ---- arithmetic on ST(0) ----
+        Mnemonic::Fprem => return super::x87_remainder::execute(cpu, instruction),
         Mnemonic::Fadd => {
             let rhs = read_arith_operand(cpu, instruction)?;
             let dst = destination_index(instruction);
@@ -372,13 +395,16 @@ pub fn x87_op(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> 
         Mnemonic::Fchs => cpu.fpu_set_st(0, -cpu.fpu_st(0)),
         Mnemonic::Fabs => cpu.fpu_set_st(0, cpu.fpu_st(0).abs()),
         Mnemonic::Fsqrt => cpu.fpu_set_st(0, cpu.fpu_st(0).sqrt()),
-        Mnemonic::Frndint => cpu.fpu_set_st(0, cpu.fpu_st(0).round_ties_even()),
+        Mnemonic::Frndint => {
+            cpu.fpu_set_st(0, round_to_control(cpu.fpu_st(0), cpu.fpu_control_word));
+        }
         Mnemonic::Fxch => {
-            let index = source_index(instruction);
+            let index = arithmetic_source_index(instruction);
             let top = cpu.fpu_st(0);
             let other = cpu.fpu_st(index);
             cpu.fpu_set_st(0, other);
             cpu.fpu_set_st(index, top);
+            cpu.fpu_status_word &= !(1 << 9); // FXCH clears C1; other CCs undefined.
         }
 
         // ---- compares that set the status word ----
@@ -408,11 +434,11 @@ pub fn x87_op(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> 
 
         // ---- compares that set EFLAGS ----
         Mnemonic::Fcomi | Mnemonic::Fucomi => {
-            let index = source_index(instruction);
+            let index = arithmetic_source_index(instruction);
             set_compare_flags(cpu, cpu.fpu_st(0), cpu.fpu_st(index));
         }
         Mnemonic::Fcomip | Mnemonic::Fucomip => {
-            let index = source_index(instruction);
+            let index = arithmetic_source_index(instruction);
             set_compare_flags(cpu, cpu.fpu_st(0), cpu.fpu_st(index));
             cpu.fpu_pop();
         }
@@ -485,6 +511,14 @@ pub fn x87_op(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> 
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "x87_operand_tests.rs"]
+mod operand_tests;
+
+#[cfg(test)]
+#[path = "x87_control_tests.rs"]
+mod control_tests;
 
 /// The destination ST register for a two-operand arithmetic form: the explicit
 /// register operand, or ST(0) for the memory / no-operand forms.

@@ -67,9 +67,7 @@ impl VmChannel {
         observer: &mut dyn FnMut(StreamChannel, &[u8]),
     ) -> Result<HostReply, String> {
         self.cancel.check()?;
-        let deadline = request
-            .timeout_ms
-            .map(|ms| Instant::now() + Duration::from_millis(ms));
+        let (request, deadline) = prepare_execution(request);
         // The ABI requires serialized execution; try_lock also fails closed on
         // accidental re-entry instead of deadlocking inside an output callback.
         let mut client = self.client.try_lock().map_err(|_| "E_VM_SESSION_BUSY")?;
@@ -99,6 +97,20 @@ impl VmChannel {
             payload: serde_json::Value::Null,
         })
     }
+}
+
+fn prepare_execution(mut request: ExecRequest) -> (ExecRequest, Option<Instant>) {
+    // ABI v2 deadlines use the host monotonic clock. A guest clock advances
+    // with the interpreter and can run faster than host wall time: forwarding
+    // this same budget would let its supervisor SIGKILL the child early and
+    // report exit 137 instead of the promised E_VM_TIMEOUT/session cancellation.
+    // This only changes the FFI producer; the guest protocol still supports
+    // deadlines for other callers that deliberately use guest-clock budgets.
+    let deadline = request
+        .timeout_ms
+        .take()
+        .map(|ms| Instant::now() + Duration::from_millis(ms));
+    (request, deadline)
 }
 
 fn control_error(error: SessionError) -> String {
@@ -150,6 +162,12 @@ impl SessionIo for MachineIo<'_> {
             .machine
             .run_units(self.limits.provider_quantum_units)
             .map_err(|error| error.to_string())?;
+        // Keep kernel diagnostics (including an OOM kill) observable during
+        // execution, using the same opt-in switch as the boot path. They are
+        // diagnostic stderr, never the program's framed stdout/stderr stream.
+        if !report.console.is_empty() && std::env::var_os("RISH_DBG_CONSOLE").is_some() {
+            eprint!("{}", String::from_utf8_lossy(&report.console));
+        }
         // run_units clears the worker flag at entry. This second token check
         // closes the race with an independent cancellation at that exact point.
         self.check()?;

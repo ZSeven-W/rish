@@ -4,6 +4,7 @@ pub mod arithmetic;
 pub mod branch;
 pub mod data;
 pub mod logic;
+pub mod lsl;
 pub mod mxcsr;
 pub mod sse;
 pub mod sse3;
@@ -18,6 +19,7 @@ pub mod stack;
 pub mod string;
 pub mod system;
 pub mod x87;
+pub mod x87_remainder;
 
 #[cfg(test)]
 mod flags_tests;

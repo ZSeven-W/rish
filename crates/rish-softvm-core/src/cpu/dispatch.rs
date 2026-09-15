@@ -19,6 +19,7 @@ impl Cpu {
             return system::system_op(self, instruction);
         }
         match mnemonic {
+            Mnemonic::Lsl => crate::ops::lsl::execute(self, instruction),
             Mnemonic::Ldmxcsr | Mnemonic::Stmxcsr => crate::ops::mxcsr::execute(self, instruction),
             Mnemonic::Pmovsxbw
             | Mnemonic::Pmovsxbd
@@ -341,6 +342,7 @@ impl Cpu {
             | Mnemonic::Fmul
             | Mnemonic::Fdiv
             | Mnemonic::Fdivr
+            | Mnemonic::Fprem
             | Mnemonic::Fiadd
             | Mnemonic::Fisub
             | Mnemonic::Fimul

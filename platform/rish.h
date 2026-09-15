@@ -131,7 +131,8 @@ void *rish_vm_boot_session_cancellable(const char *input, size_t input_len,
  * {"command":["argv0","argv1",...]}. Optional version 2 accepts
  * {"protocol_version":2,"command":[...],"cwd":"/workspace",
  *  "env":{"NAME":"value"},"timeout_ms":60000}. cwd is a guest path, never
- * a host mapping. timeout_ms is 1..86400000; expiry cancels this VM lifetime
+ * a host mapping. timeout_ms is 1..86400000 on the HOST monotonic clock (the
+ * budget is not forwarded to the guest clock); expiry cancels this VM lifetime
  * (E_VM_TIMEOUT), so free the session after the call returns. V1 behavior is
  * unchanged. Optional v2 max_output_bytes (1..67108864) bounds combined output;
  * exceeding it cancels the session with E_VM_OUTPUT_LIMIT. The exceeding chunk

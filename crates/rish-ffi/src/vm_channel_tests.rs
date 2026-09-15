@@ -185,13 +185,61 @@ fn host_deadline_stops_nonresponsive_guest_and_poisoned_session_is_not_reused() 
     let error = channel
         .execute_observed(request(Some(5)), None, &mut |_, _| {})
         .unwrap_err();
-    assert!(error.contains("E_VM_TIMEOUT"), "{error}");
+    assert_eq!(error, "E_VM_TIMEOUT");
     assert!(started.elapsed() < Duration::from_secs(3));
     assert_eq!(
         channel
             .execute_observed(request(None), None, &mut |_, _| {})
             .unwrap_err(),
         "E_VM_TIMEOUT"
+    );
+}
+
+#[test]
+fn exec_wire_omits_guest_deadline_but_host_budget_remains_active() {
+    use rish_guest_protocol::{FrameDecoder, Operation};
+    struct WireCapture(RefCell<Vec<u8>>);
+    impl SessionIo for WireCapture {
+        fn write(&self, bytes: &[u8]) -> usize {
+            self.0.borrow_mut().extend_from_slice(bytes);
+            bytes.len()
+        }
+        fn advance(&self) -> Result<Vec<u8>, String> {
+            Err("wire captured".into())
+        }
+        fn dropped_output(&self) -> u64 {
+            0
+        }
+    }
+    let (channel, _directory, _cancel) = channel();
+    negotiate(&channel);
+    let started = Instant::now();
+    let (request, deadline) = prepare_execution(request(Some(600_000)));
+    let budget = deadline.unwrap().duration_since(started);
+    assert!(budget >= Duration::from_secs(600));
+    assert!(budget < Duration::from_secs(601));
+    let wire = WireCapture(RefCell::new(Vec::new()));
+    let result =
+        channel
+            .client
+            .lock()
+            .unwrap()
+            .execute_observed(request, &[], &wire, &mut |_, _| {});
+    assert!(result.is_err());
+    let mut decoder = FrameDecoder::new(DEFAULT_MAX_FRAME_SIZE).unwrap();
+    decoder.push(&wire.0.into_inner()).unwrap();
+    let frame = decoder.next_frame().unwrap().unwrap();
+    assert!(decoder.next_frame().unwrap().is_none());
+    let Message::Request(request) = &frame.message else {
+        panic!("expected exec request")
+    };
+    let Operation::Exec(exec) = &request.operation else {
+        panic!("expected exec operation")
+    };
+    assert_eq!(exec.argv, ["test"]);
+    assert_eq!(
+        exec.timeout_ms, None,
+        "a guest-clock timeout must not SIGKILL before the host deadline"
     );
 }
 

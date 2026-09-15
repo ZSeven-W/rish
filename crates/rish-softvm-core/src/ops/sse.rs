@@ -14,6 +14,10 @@ mod numeric;
 pub(super) use numeric::read_scalar_mem;
 use numeric::*;
 
+#[path = "sse_convert.rs"]
+mod convert;
+use convert::{cvt2si_round, cvtsi2s, cvtts2si};
+
 pub fn sse_op(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
     match instruction.mnemonic() {
         Mnemonic::Movaps
@@ -694,33 +698,6 @@ fn psrldq(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
     Ok(())
 }
 
-fn cvtsi2s(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
-    // Integer GPR (or memory) to float scalar; stores the bit pattern of the
-    // converted value. The kernel boot path uses this only for constant math.
-    let bits = if instruction.mnemonic() == Mnemonic::Cvtsi2sd {
-        64
-    } else {
-        32
-    };
-    let integer = match instruction.op1_kind() {
-        OpKind::Memory => cpu.read_operand(instruction, 1, operand_size(instruction, 1))?,
-        _ => read_register(
-            &cpu.regs,
-            instruction.op1_register(),
-            operand_size(instruction, 1),
-        ),
-    };
-    let value = if bits == 64 {
-        (integer as i64) as f64
-    } else {
-        f64::from((integer as i32) as f32)
-    };
-    let mut destination = read_xmm(&cpu.regs, instruction.op0_register());
-    destination = (destination & !u128::from(u64::MAX)) | u128::from(value.to_bits());
-    write_xmm(&mut cpu.regs, instruction.op0_register(), destination);
-    Ok(())
-}
-
 #[cfg(test)]
 #[path = "sse_tests.rs"]
 mod tests;
@@ -728,3 +705,7 @@ mod tests;
 #[cfg(test)]
 #[path = "sse_shift_tests.rs"]
 mod shift_tests;
+
+#[cfg(test)]
+#[path = "sse_conversion_tests.rs"]
+mod conversion_tests;

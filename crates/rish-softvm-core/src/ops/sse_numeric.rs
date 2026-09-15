@@ -463,43 +463,6 @@ pub(super) fn cvt_precision(
     Ok(())
 }
 
-/// CVTSD2SI / CVTSS2SI: convert a scalar float to a signed integer using
-/// round-to-nearest-even, writing a general-purpose register.
-pub(super) fn cvt2si_round(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
-    let double = instruction.mnemonic() == Mnemonic::Cvtsd2si;
-    let raw = read_scalar_src(cpu, instruction, double)?;
-    let value = if double {
-        f64::from_bits(raw)
-    } else {
-        f64::from(f32::from_bits(raw as u32))
-    };
-    let rounded = value.round_ties_even();
-    let size = operand_size(instruction, 0);
-    let result = if size == 8 {
-        rounded as i64 as u64
-    } else {
-        rounded as i32 as u64
-    };
-    write_register(&mut cpu.regs, instruction.op0_register(), size, result);
-    Ok(())
-}
-
-pub(super) fn cvtts2si(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
-    let source = read_xmm(&cpu.regs, instruction.op1_register()) as u64;
-    let value = if instruction.mnemonic() == Mnemonic::Cvttsd2si {
-        f64::from_bits(source) as i64 as u64
-    } else {
-        f32::from_bits(source as u32) as i32 as u64
-    };
-    write_register(
-        &mut cpu.regs,
-        instruction.op0_register(),
-        operand_size(instruction, 0),
-        value,
-    );
-    Ok(())
-}
-
 pub(super) fn is_xmm(register: Register) -> bool {
     matches!(
         register,

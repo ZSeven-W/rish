@@ -1097,6 +1097,7 @@ fn may_fault(instruction: &Instruction) -> bool {
     matches!(
         instruction.mnemonic(),
         Mnemonic::Push
+            | Mnemonic::Lsl
             | Mnemonic::Pop
             | Mnemonic::Call
             | Mnemonic::Ret
