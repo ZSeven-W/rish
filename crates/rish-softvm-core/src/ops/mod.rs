@@ -2,6 +2,8 @@
 
 pub mod arithmetic;
 pub mod branch;
+#[cfg(test)]
+mod cvtps2pd_tests;
 pub mod data;
 pub mod logic;
 pub mod lsl;

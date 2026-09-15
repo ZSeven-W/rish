@@ -1,5 +1,5 @@
-//! Legacy scalar SSE integer conversions. Source integer width, floating
-//! precision, and destination integer width are independent instruction fields.
+//! Legacy SSE conversions. Integer widths, floating precision, and the
+//! number of converted lanes follow each instruction's operand contract.
 
 use super::{read_scalar_src, read_xmm, write_xmm};
 use crate::arch::registers::Cr4;
@@ -8,7 +8,62 @@ use crate::{Cpu, CpuError};
 use iced_x86::{Instruction, Mnemonic, OpKind};
 
 const INVALID: u32 = 1;
+const DENORMAL: u32 = 1 << 1;
 const PRECISION: u32 = 1 << 5;
+
+/// Legacy CVTPS2PD reads only the low two f32 lanes (m64 for memory) and
+/// replaces the whole XMM destination. Widening finite values is exact.
+pub(super) fn cvtps2pd(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
+    let raw = read_scalar_src(cpu, instruction, true)?;
+    let daz = cpu.mxcsr & (1 << 6) != 0;
+    let (low, low_exception) = widen_single(raw as u32, daz);
+    let (high, high_exception) = widen_single((raw >> 32) as u32, daz);
+    if record_exception(cpu, low_exception | high_exception)? {
+        write_xmm(
+            &mut cpu.regs,
+            instruction.op0_register(),
+            u128::from(low) | (u128::from(high) << 64),
+        );
+    }
+    Ok(())
+}
+
+/// Build IEEE-754 bits without depending on the host floating-point state.
+fn widen_single(raw: u32, daz: bool) -> (u64, u32) {
+    let sign = u64::from(raw >> 31) << 63;
+    let exponent = (raw >> 23) & 0xff;
+    let fraction = raw & 0x7f_ffff;
+    if exponent == 0 {
+        if fraction == 0 || daz {
+            return (sign, 0);
+        }
+        // A subnormal f32 is fraction * 2^-149, a normal finite f64.
+        let highest = 31 - fraction.leading_zeros();
+        let bits = sign
+            | (u64::from(highest + 874) << 52)
+            | ((u64::from(fraction) << (52 - highest)) & 0x000f_ffff_ffff_ffff);
+        return (bits, DENORMAL);
+    }
+    if exponent == 0xff {
+        let bits = sign | 0x7ff0_0000_0000_0000 | (u64::from(fraction) << 29);
+        return if fraction == 0 {
+            (bits, 0)
+        } else {
+            (
+                bits | (1 << 51),
+                if fraction & (1 << 22) == 0 {
+                    INVALID
+                } else {
+                    0
+                },
+            )
+        };
+    }
+    (
+        sign | (u64::from(exponent + 896) << 52) | (u64::from(fraction) << 29),
+        0,
+    )
+}
 
 pub(super) fn cvtsi2s(cpu: &mut Cpu, instruction: &Instruction) -> Result<(), CpuError> {
     let source_size = operand_size(instruction, 1);
