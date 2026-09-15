@@ -13,11 +13,12 @@ use std::sync::Arc;
 use rish_core::HostReply;
 use rish_guest_protocol::{DEFAULT_MAX_FRAME_SIZE, Envelope, Hello, Message, PeerInfo, RequestId};
 use rish_softvm_x86_64::{
-    EngineLimits, MachineState, PureRustProvider, SerialGuestTransport, X86_64SoftwareEngine,
-    guest_failed, guest_ready,
+    EngineLimits, MachineState, PureRustProvider, X86_64SoftwareEngine, guest_failed, guest_ready,
 };
-use rish_vm::{GuestChannel, VmAcceleration, VmConfig, VmDevice, VmNetworkMode};
+use rish_vm::{VmAcceleration, VmConfig, VmDevice, VmNetworkMode};
 use serde::{Deserialize, Serialize};
+
+use crate::{vm_cancel::Cancellation, vm_channel::VmChannel};
 
 const BOOT_QUANTUM_UNITS: u64 = 500_000;
 
@@ -36,6 +37,7 @@ struct VmRunRequest {
     root_disk_path: Option<String>,
     #[serde(default = "default_memory_mib")]
     memory_mib: u32,
+    #[serde(default)]
     command: Vec<String>,
     #[serde(default)]
     command_line: Option<String>,
@@ -88,6 +90,102 @@ impl VmRunResponse {
     }
 }
 
+#[derive(Deserialize)]
+struct ExecRequest {
+    #[serde(default = "legacy_exec_version")]
+    protocol_version: u32,
+    command: Vec<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    env: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    max_output_bytes: Option<usize>,
+}
+
+fn legacy_exec_version() -> u32 {
+    1
+}
+
+impl ExecRequest {
+    fn legacy(command: Vec<String>) -> Self {
+        Self {
+            protocol_version: 1,
+            command,
+            cwd: None,
+            env: None,
+            timeout_ms: None,
+            max_output_bytes: None,
+        }
+    }
+
+    fn into_protocol(self) -> Result<(rish_guest_protocol::ExecRequest, Option<usize>), String> {
+        if self.command.is_empty() {
+            return Err("command must have at least one element".into());
+        }
+        if !matches!(self.protocol_version, 1 | 2) {
+            return Err("unsupported exec protocol version".into());
+        }
+        if self.protocol_version == 1
+            && (self.cwd.is_some()
+                || self.env.is_some()
+                || self.timeout_ms.is_some()
+                || self.max_output_bytes.is_some())
+        {
+            return Err("execution options require exec protocol_version 2".into());
+        }
+        if self.cwd.as_ref().is_some_and(|cwd| {
+            !cwd.starts_with('/')
+                || cwd.len() > 4096
+                || cwd.contains('\0')
+                || cwd.split('/').any(|component| component == "..")
+        }) {
+            return Err("cwd must be an absolute guest path without parent traversal".into());
+        }
+        if self
+            .timeout_ms
+            .is_some_and(|ms| !(1..=86_400_000).contains(&ms))
+        {
+            return Err("timeout_ms must be between 1 and 86400000".into());
+        }
+        if self
+            .max_output_bytes
+            .is_some_and(|bytes| !(1..=64 * 1024 * 1024).contains(&bytes))
+        {
+            return Err("max_output_bytes must be between 1 and 67108864".into());
+        }
+        let env = self.env.unwrap_or_default();
+        if env.len() > 128
+            || env.iter().any(|(name, value)| {
+                name.is_empty() || name.contains(['=', '\0']) || value.contains('\0')
+            })
+            || env
+                .iter()
+                .map(|(name, value)| name.len() + value.len())
+                .sum::<usize>()
+                > 65_536
+        {
+            return Err("invalid or oversized guest environment".into());
+        }
+        Ok((
+            rish_guest_protocol::ExecRequest {
+                argv: self.command,
+                env,
+                cwd: self.cwd,
+                user: None,
+                tty: false,
+                attach_stdin: false,
+                attach_stdout: true,
+                attach_stderr: true,
+                timeout_ms: self.timeout_ms,
+            },
+            self.max_output_bytes,
+        ))
+    }
+}
+
 /// JSON entry point wrapped by the C ABI export in `lib.rs`.
 pub fn vm_run_docker_json(request: &str) -> String {
     let response = match serde_json::from_str::<VmRunRequest>(request) {
@@ -102,7 +200,7 @@ pub fn vm_run_docker_json(request: &str) -> String {
 /// A booted guest whose framed control channel stays open, so many commands
 /// run without rebooting — the interactive-shell surface for the mobile bridge.
 pub struct VmSession {
-    channel: SerialGuestTransport,
+    channel: VmChannel,
     boot_units: u64,
     _scratch_disk: Option<tempfile::NamedTempFile>,
 }
@@ -111,7 +209,9 @@ pub struct VmSession {
 /// with any throwaway root disk and the boot instruction count.
 fn boot_channel(
     request: &VmRunRequest,
-) -> Result<(SerialGuestTransport, Option<tempfile::NamedTempFile>, u64), String> {
+    cancel: Arc<Cancellation>,
+) -> Result<(VmChannel, Option<tempfile::NamedTempFile>, u64), String> {
+    cancel.claim()?;
     let limits = EngineLimits {
         max_units_per_request: request.handshake_budget_units,
         ..EngineLimits::default()
@@ -166,14 +266,18 @@ fn boot_channel(
     // receive FIFO while it initializes the port (before it prints the ready
     // marker), so a Hello written after the boot marker alone is discarded
     // unread and the handshake below spins until its step budget runs out.
-    let machine = engine.launch(&config).map_err(|error| error.to_string())?;
+    cancel.check()?;
+    let machine = Arc::new(engine.launch(&config).map_err(|error| error.to_string())?);
+    cancel.attach(&machine)?;
     let echo_console = std::env::var_os(CONSOLE_DEBUG_ENV).is_some();
     let mut executed = 0_u64;
     let mut console = Vec::new();
     loop {
+        cancel.check()?;
         let report = machine
             .run_units(BOOT_QUANTUM_UNITS)
             .map_err(|error| error.to_string())?;
+        cancel.check()?;
         executed += report.executed_units;
         if echo_console && !report.console.is_empty() {
             eprint!("{}", String::from_utf8_lossy(&report.console));
@@ -198,7 +302,7 @@ fn boot_channel(
     let boot_units = executed;
 
     // Stage 2: framed control channel over the second serial; bootstrap it.
-    let channel = SerialGuestTransport::new(machine, limits).map_err(|error| error.to_string())?;
+    let channel = VmChannel::new(machine, limits, cancel)?;
     let hello = Envelope::new(Message::Hello(Hello::host(
         RequestId::new("vm-bootstrap-1").map_err(|error| error.to_string())?,
         PeerInfo {
@@ -217,32 +321,24 @@ fn boot_channel(
 }
 
 /// Runs one command over an already-bootstrapped channel.
-fn exec_on(channel: &SerialGuestTransport, argv: &[String]) -> Result<HostReply, String> {
+fn exec_on(channel: &VmChannel, argv: &[String]) -> Result<HostReply, String> {
     exec_on_observed(channel, argv, &mut |_, _| {})
 }
 
 fn exec_on_observed(
-    channel: &SerialGuestTransport,
+    channel: &VmChannel,
     argv: &[String],
     observer: &mut dyn FnMut(rish_guest_protocol::StreamChannel, &[u8]),
 ) -> Result<HostReply, String> {
-    let command = rish_core::GuestCommand {
-        program: argv[0].clone(),
-        args: argv[1..].to_vec(),
-        env: Default::default(),
-        cwd: "/".to_owned(),
-        stdin: Vec::new(),
-    };
-    channel
-        .execute_observed(&command, observer)
-        .map_err(|error| error.to_string())
+    let (request, limit) = ExecRequest::legacy(argv.to_vec()).into_protocol()?;
+    channel.execute_observed(request, limit, observer)
 }
 
 fn run(request: VmRunRequest) -> Result<VmRunResponse, String> {
     if request.command.is_empty() {
         return Err("command must have at least one element".to_owned());
     }
-    let (channel, _scratch, boot_units) = boot_channel(&request)?;
+    let (channel, _scratch, boot_units) = boot_channel(&request, Arc::default())?;
     let reply = exec_on(&channel, &request.command)?;
     Ok(VmRunResponse {
         protocol_version: 1,
@@ -257,9 +353,16 @@ fn run(request: VmRunRequest) -> Result<VmRunResponse, String> {
 
 /// Boots a session for the interactive surface. The command field is ignored.
 pub fn vm_boot_session(request_json: &str) -> Result<Box<VmSession>, String> {
+    vm_boot_session_with_cancel(request_json, Arc::default())
+}
+
+pub(crate) fn vm_boot_session_with_cancel(
+    request_json: &str,
+    cancel: Arc<Cancellation>,
+) -> Result<Box<VmSession>, String> {
     let request: VmRunRequest = serde_json::from_str(request_json)
         .map_err(|error| format!("invalid request JSON: {error}"))?;
-    let (channel, scratch, boot_units) = boot_channel(&request)?;
+    let (channel, scratch, boot_units) = boot_channel(&request, cancel)?;
     Ok(Box::new(VmSession {
         channel,
         boot_units,
@@ -278,15 +381,11 @@ pub fn vm_session_exec_observed_json(
     request_json: &str,
     observer: &mut dyn FnMut(rish_guest_protocol::StreamChannel, &[u8]),
 ) -> String {
-    #[derive(Deserialize)]
-    struct ExecRequest {
-        command: Vec<String>,
-    }
     let response = match serde_json::from_str::<ExecRequest>(request_json) {
-        Ok(request) if request.command.is_empty() => {
-            VmRunResponse::failure("command must have at least one element")
-        }
-        Ok(request) => match exec_on_observed(&session.channel, &request.command, observer) {
+        Ok(request) => match request
+            .into_protocol()
+            .and_then(|(request, limit)| session.channel.execute_observed(request, limit, observer))
+        {
             Ok(reply) => VmRunResponse {
                 protocol_version: 1,
                 ok: reply.exit_code == 0,
@@ -307,7 +406,7 @@ pub fn vm_session_exec_observed_json(
 
 #[cfg(test)]
 mod tests {
-    use super::vm_run_docker_json;
+    use super::{ExecRequest, vm_run_docker_json};
     use serde_json::Value;
 
     #[test]
@@ -334,5 +433,47 @@ mod tests {
                 .unwrap()
                 .contains("command must have at least one element")
         );
+    }
+
+    #[test]
+    fn legacy_exec_and_explicit_v2_options_preserve_guest_arguments() {
+        let legacy: ExecRequest =
+            serde_json::from_str(r#"{"command":["/bin/sh","literal $HOME"]}"#).unwrap();
+        let (request, cap) = legacy.into_protocol().unwrap();
+        assert_eq!(request.argv, ["/bin/sh", "literal $HOME"]);
+        assert_eq!(request.cwd, None);
+        assert_eq!(request.timeout_ms, None);
+        assert_eq!(cap, None);
+        let extended: ExecRequest = serde_json::from_str(r#"{"protocol_version":2,"command":["python3","a b.py"],"cwd":"/workspace","env":{"VALUE":"$(literal)"},"timeout_ms":30,"max_output_bytes":512}"#).unwrap();
+        let (request, cap) = extended.into_protocol().unwrap();
+        assert_eq!(request.argv, ["python3", "a b.py"]);
+        assert_eq!(request.cwd.as_deref(), Some("/workspace"));
+        assert_eq!(request.env["VALUE"], "$(literal)");
+        assert_eq!(request.timeout_ms, Some(30));
+        assert_eq!(cap, Some(512));
+    }
+
+    #[test]
+    fn exec_options_are_versioned_and_reject_invalid_limits_or_paths() {
+        for extra in [
+            r#""protocol_version":1,"cwd":"/workspace""#,
+            r#""protocol_version":3"#,
+            r#""protocol_version":2,"cwd":"relative""#,
+            r#""protocol_version":2,"cwd":"/workspace/../etc""#,
+            r#""protocol_version":2,"env":{"BAD=NAME":"value"}"#,
+            r#""protocol_version":2,"timeout_ms":0"#,
+            r#""protocol_version":2,"timeout_ms":86400001"#,
+            r#""protocol_version":2,"max_output_bytes":0"#,
+            r#""protocol_version":2,"max_output_bytes":67108865"#,
+        ] {
+            let json = format!(r#"{{"command":["test"],{extra}}}"#);
+            assert!(
+                serde_json::from_str::<ExecRequest>(&json)
+                    .unwrap()
+                    .into_protocol()
+                    .is_err(),
+                "{json}"
+            );
+        }
     }
 }

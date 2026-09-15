@@ -5,9 +5,10 @@
 # plus the rish guest agent -- small enough to bundle as a mobile app
 # resource. Unlike build-docker-initramfs.sh this ships no container runtime;
 # the modules are the virtio-blk driver, the VFAT filesystem stack (plus the
-# NLS codepages the fat driver requests at mount time), and the virtio-net
-# driver with its failover dependencies, all from the pinned netboot
-# initramfs. The guest agent execs shell commands straight into the
+# NLS codepages the fat driver requests at mount time), the virtio-net
+# driver with its failover dependencies, and ext4 for runtime package disks.
+# Ext4 modules come from the pinned modloop; the other modules come from
+# the pinned netboot initramfs. The guest agent execs commands into the
 # interpreter's Linux guest.
 #
 # The offline repository lets the guest run `apk add` from pinned, hash-locked
@@ -28,6 +29,7 @@ downloads=${1:-"$script_dir/out/downloads"}
 output_dir=${2:-"$script_dir/out"}
 rootfs_name=alpine-minirootfs-3.24.1-x86_64.tar.gz
 netboot_initramfs=initramfs-virt
+modloop_name=modloop-virt
 kernel_version=6.18.35-0-virt
 output_name=rish-container.cpio
 temporary_dir=
@@ -48,6 +50,7 @@ command -v cargo >/dev/null 2>&1 || die "cargo is required"
 command -v tar >/dev/null 2>&1 || die "tar is required"
 command -v gzip >/dev/null 2>&1 || die "gzip is required"
 command -v cpio >/dev/null 2>&1 || die "cpio is required"
+command -v unsquashfs >/dev/null 2>&1 || die "unsquashfs is required (brew install squashfs)"
 
 "$script_dir/fetch-assets.sh" --offline "$downloads"
 
@@ -81,10 +84,8 @@ ln -s libz.so.1.3.2 "$rootfs/usr/lib/libz.so.1"
 # pinned virt kernel ships the block, vfat, and virtio-net drivers as
 # modules; the emulated machine exposes root_disk_path as a virtio-mmio
 # block device and the NIC as a second virtio-mmio device, so the guest
-# insmods these before use. They come from the pinned netboot initramfs
-# (the same asset the docker guest uses), not from the modloop squashfs:
-# gzip + cpio can extract them deterministically on every host, including
-# macOS where the case-colliding modloop tree cannot be unpacked.
+# insmods these before use. These existing modules come from the pinned
+# netboot initramfs (the same asset the docker guest uses).
 # virtio_blk and virtio_net's virtio core/ring/mmio prerequisites are built
 # in; vfat needs fat.ko and the fat driver requests the cp437 codepage and
 # the utf8 iocharset at mount time, so all three NLS modules ship too;
@@ -108,6 +109,23 @@ for module_path in \
         die "netboot initramfs is missing $module_path"
     install -m 0644 "$netboot_dir/usr/lib/modules/$kernel_version/$module_path" \
         "$modules_dir/$module_path"
+done
+
+# Ext4 runtime disks need modules absent from the small netboot initramfs.
+# The modloop is hash-verified by fetch-assets.sh above. Read only these
+# exact files to stdout: extracting its complete tree is unsafe on the
+# default macOS case-insensitive filesystem because some names collide.
+for module_path in \
+    kernel/lib/crc/crc16.ko \
+    kernel/fs/mbcache.ko \
+    kernel/fs/jbd2/jbd2.ko \
+    kernel/fs/ext4/ext4.ko; do
+    mkdir -p -- "$modules_dir/$(dirname -- "$module_path")"
+    unsquashfs -cat "$downloads/$modloop_name" \
+        "modules/$kernel_version/$module_path" > "$modules_dir/$module_path" ||
+        die "cannot extract $module_path from $modloop_name"
+    [ -s "$modules_dir/$module_path" ] || die "modloop module is empty: $module_path"
+    chmod 0644 "$modules_dir/$module_path"
 done
 
 # 3. The guest agent, cross-compiled for the musl x86_64 guest.
@@ -143,6 +161,12 @@ mkdir -p -- "$output_dir"
 output_dir=$(CDPATH= cd -- "$output_dir" && pwd)
 candidate="$temporary_dir/$output_name"
 "$packer" "$rootfs" "$candidate"
+# Verify the bytes actually packed, including module dependencies and PID 1
+# load order, before replacing any previously working app resource.
+verifier="$temporary_dir/verify-container-modules"
+rustc --edition=2021 -C opt-level=2 -D warnings \
+    "$script_dir/tools/verify-container-modules.rs" -o "$verifier"
+"$verifier" "$candidate"
 size=$(wc -c <"$candidate" | tr -d '[:space:]')
 mv -f -- "$candidate" "$output_dir/$output_name"
 printf 'built  %s (%s bytes)\n' "$output_dir/$output_name" "$size"

@@ -8,6 +8,8 @@ use rish_runtime::{
 use serde::{Deserialize, Serialize};
 
 mod pull_ffi;
+pub mod vm_cancel;
+mod vm_channel;
 pub mod vm_ffi;
 pub mod vm_stream_ffi;
 
@@ -353,13 +355,45 @@ pub unsafe extern "C" fn rish_vm_boot_session(
     }
 }
 
+/// Boots with an independent, one-shot cancellation handle. The session owns
+/// a clone of the token; its existing exec and stream calls observe cancellation.
+///
+/// # Safety
+/// `input` must contain `input_len` readable bytes. `cancel` must be a live
+/// handle from `rish_vm_cancel_new`, and must remain live until this call returns.
+/// It may be requested concurrently, but cannot be freed concurrently. Call
+/// this at most once per token. Free the returned session only after its calls
+/// have returned, using `rish_vm_session_free` exactly once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rish_vm_boot_session_cancellable(
+    input: *const c_char,
+    input_len: usize,
+    cancel: *mut std::ffi::c_void,
+) -> *mut std::ffi::c_void {
+    if input.is_null() || cancel.is_null() || input_len > MAX_ABI_REQUEST_BYTES {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees the live token and bounded readable input.
+    let cancel = unsafe { &*cancel.cast::<vm_cancel::CancelHandle>() }.clone();
+    let bytes = unsafe { std::slice::from_raw_parts(input.cast::<u8>(), input_len) };
+    let Ok(request) = std::str::from_utf8(bytes) else {
+        return std::ptr::null_mut();
+    };
+    match vm_ffi::vm_boot_session_with_cancel(request, cancel) {
+        Ok(session) => Box::into_raw(session).cast(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 /// Runs one command in a live session (from [`rish_vm_boot_session`]) and
 /// returns an owned JSON reply. The request is `{"command":["argv0",...]}`.
 ///
 /// # Safety
 ///
 /// `session` must be a live handle from [`rish_vm_boot_session`] that has not
-/// been freed. `input` must point to `input_len` readable bytes. The returned
+/// been freed. No other execution/free call may use this session concurrently.
+/// Request cancellation through its independent token, never by freeing it.
+/// `input` must point to `input_len` readable bytes. The returned
 /// pointer must be released once with [`rish_string_free`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rish_vm_session_exec_json(
@@ -390,7 +424,8 @@ pub unsafe extern "C" fn rish_vm_session_exec_json(
 /// # Safety
 ///
 /// `session` must be null or a live handle from [`rish_vm_boot_session`] that
-/// has not already been freed.
+/// has not already been freed. All boot/exec/stream calls on it must have
+/// returned, and no callback may still be using it.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rish_vm_session_free(session: *mut std::ffi::c_void) {
     if !session.is_null() {

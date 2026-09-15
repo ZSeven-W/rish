@@ -96,11 +96,49 @@ char *rish_vm_run_docker_json(const char *input, size_t input_len);
  */
 void *rish_vm_boot_session(const char *input, size_t input_len);
 
+/** Creates a one-shot cancellation token for exactly one VM lifetime. */
+void *rish_vm_cancel_new(void);
+
+/** Requests cancellation from any thread without touching the session handle.
+ * NULL is a no-op. Cancellation is sticky and cannot be reset. Boot, handshake
+ * and execution observe it between bounded provider quanta; active worker
+ * execution is also signalled. This call never waits for the guest or session.
+ * Do not race token destruction with this call or any other token use.
+ */
+void rish_vm_cancel_request(void *cancel);
+
+/** Releases token ownership exactly once, after all boot/request calls using
+ * this pointer have returned. NULL is a no-op. A booted session owns an internal
+ * reference, so it remains safe if the caller releases this handle first.
+ * Never access this pointer after free. Usually keep it until the run ends.
+ */
+void rish_vm_cancel_free(void *cancel);
+
+/** Same boot JSON and session handle as boot_session, with cancellation.
+ * The non-NULL token must come from cancel_new and stay alive through this
+ * call. Use a fresh token per boot (including failed boots). A cancelled boot
+ * returns NULL; cancelled exec/stream returns ok=false with E_VM_CANCELLED in
+ * error. Existing exec/stream calls automatically observe the session token.
+ * Cancel, wait for boot/exec to return, free any returned session exactly once,
+ * then free the token. Never cancel by concurrently freeing the session.
+ */
+void *rish_vm_boot_session_cancellable(const char *input, size_t input_len,
+                                      void *cancel);
+
 /**
  * Runs one command in a live session and returns an owned JSON reply
  * ({ok, exit_code, stdout, stderr, ...}). The request is
- * {"command":["argv0","argv1",...]}. The returned string belongs to Rust and
- * must be released with rish_string_free.
+ * {"command":["argv0","argv1",...]}. Optional version 2 accepts
+ * {"protocol_version":2,"command":[...],"cwd":"/workspace",
+ *  "env":{"NAME":"value"},"timeout_ms":60000}. cwd is a guest path, never
+ * a host mapping. timeout_ms is 1..86400000; expiry cancels this VM lifetime
+ * (E_VM_TIMEOUT), so free the session after the call returns. V1 behavior is
+ * unchanged. Optional v2 max_output_bytes (1..67108864) bounds combined output;
+ * exceeding it cancels the session with E_VM_OUTPUT_LIMIT. The exceeding chunk
+ * is not delivered to the callback. One bounded control batch may be decoded
+ * transiently before the cap is enforced. Default stream caps remain 64MiB.
+ * The returned string belongs to Rust; use rish_string_free.
+ * Execute on one worker at a time; do not race execution with session_free.
  */
 char *rish_vm_session_exec_json(void *session, const char *input, size_t input_len);
 
@@ -122,7 +160,8 @@ typedef void (*rish_vm_output_callback)(void *context, const char *event_json,
 char *rish_vm_session_exec_stream_json(void *session, const char *input,
     size_t input_len, void *context, rish_vm_output_callback callback);
 
-/** Releases a session handle from rish_vm_boot_session, shutting the guest down. */
+/** Releases a session from either boot ABI, exactly once after all its calls
+ * and callbacks have returned. NULL is a no-op. */
 void rish_vm_session_free(void *session);
 
 /** Releases a string returned by any JSON operation. */

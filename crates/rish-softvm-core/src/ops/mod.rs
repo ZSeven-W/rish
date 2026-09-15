@@ -4,6 +4,7 @@ pub mod arithmetic;
 pub mod branch;
 pub mod data;
 pub mod logic;
+pub mod mxcsr;
 pub mod sse;
 pub mod sse3;
 #[cfg(test)]
