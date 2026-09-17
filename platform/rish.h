@@ -78,7 +78,8 @@ char *rish_pull_image_json(
  *
  * Call this from a worker thread: it boots a Linux guest and is slow. The
  * request is UTF-8 JSON with kernel_path, initrd_path, an optional
- * root_disk_path, memory_mib, a command argv array, an optional command_line,
+ * root_disk_path, an optional writable data_disk_path the guest sees as
+ * /dev/vdb, memory_mib, a command argv array, an optional command_line,
  * and optional boot_budget_units / handshake_budget_units. The kernel and
  * initramfs are named by path (staged as app bundle resources) so the large
  * binaries never cross the ABI as data. The reply JSON carries ok, exit_code,
@@ -160,6 +161,22 @@ typedef void (*rish_vm_output_callback)(void *context, const char *event_json,
  */
 char *rish_vm_session_exec_stream_json(void *session, const char *input,
     size_t input_len, void *context, rish_vm_output_callback callback);
+
+/** Writes stdin to the command an exec_stream call is already running.
+ *
+ * A stream execution hands the guest one stdin buffer before the command
+ * starts, which cannot answer a prompt the command has not printed yet. Ask
+ * for it with "interactive_stdin":true on the exec request, then queue bytes
+ * here while the command runs; the execution writes them at its next frame
+ * boundary. This never takes the session lock that execution holds, so it may
+ * be called from another thread while the command is still running.
+ *
+ * Request: {"protocol_version":1,"action":"write_stdin","data_base64":"..."}
+ * or {"protocol_version":1,"action":"close_stdin"}. The reply carries ok, or
+ * ok=false with an error. Release the returned string with rish_string_free.
+ */
+char *rish_vm_session_control_json(void *session, const char *input,
+                                   size_t input_len);
 
 /** Releases a session from either boot ABI, exactly once after all its calls
  * and callbacks have returned. NULL is a no-op. */
