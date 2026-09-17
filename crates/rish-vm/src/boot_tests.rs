@@ -119,6 +119,7 @@ fn config() -> VmConfig {
         kernel_path: "/app/kernel".to_owned(),
         initrd_path: None,
         root_disk_path: "/app/root.img".to_owned(),
+        data_disk_path: None,
         acceleration: VmAcceleration::Interpreter,
         devices: vec![crate::VmDevice::Console],
         command_line: String::new(),

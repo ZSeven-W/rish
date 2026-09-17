@@ -70,6 +70,8 @@ pub struct ValidatedArtifacts {
     pub kernel_format: KernelFormat,
     pub initrd: Option<ArtifactFile>,
     pub root_disk: ArtifactFile,
+    /// Present only when the caller asked for a writable second disk.
+    pub data_disk: Option<ArtifactFile>,
 }
 
 impl ValidatedArtifacts {
@@ -105,11 +107,24 @@ impl ValidatedArtifacts {
             limits.max_root_disk_bytes,
             true,
         )?;
+        let data_disk = config
+            .data_disk_path
+            .as_deref()
+            .map(|path| {
+                regular_file(
+                    Path::new(path),
+                    "data disk",
+                    limits.max_root_disk_bytes,
+                    true,
+                )
+            })
+            .transpose()?;
         Ok(Self {
             kernel,
             kernel_format,
             initrd,
             root_disk,
+            data_disk,
         })
     }
 }
@@ -308,6 +323,7 @@ mod tests {
             kernel_path: kernel_path.to_string_lossy().into_owned(),
             initrd_path: None,
             root_disk_path: disk_path.to_string_lossy().into_owned(),
+            data_disk_path: None,
             acceleration: VmAcceleration::Interpreter,
             devices: vec![VmDevice::Console],
             command_line: String::new(),

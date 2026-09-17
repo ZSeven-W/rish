@@ -50,6 +50,11 @@ pub struct VmConfig {
     pub kernel_path: String,
     pub initrd_path: Option<String>,
     pub root_disk_path: String,
+    /// Optional writable second disk, exposed to the guest as /dev/vdb. The
+    /// root image is signed and read-only, so anything a run installs has to
+    /// be written here to survive the session.
+    #[serde(default)]
+    pub data_disk_path: Option<String>,
     pub acceleration: VmAcceleration,
     pub devices: Vec<VmDevice>,
     /// Linux kernel command line. An empty value lets the engine fall back
@@ -132,6 +137,7 @@ mod tests {
             kernel_path: "/kernel".to_owned(),
             initrd_path: None,
             root_disk_path: "/root.img".to_owned(),
+            data_disk_path: None,
             acceleration,
             devices: vec![VmDevice::Console],
             command_line: String::new(),

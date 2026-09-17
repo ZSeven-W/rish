@@ -178,6 +178,7 @@ fn run() -> Result<(), String> {
         kernel_path: options.kernel.to_string_lossy().into_owned(),
         initrd_path: Some(options.initrd.to_string_lossy().into_owned()),
         root_disk_path: options.root_disk.to_string_lossy().into_owned(),
+        data_disk_path: None,
         acceleration: VmAcceleration::Interpreter,
         devices: vec![VmDevice::Console],
         // Diagnostic override: keep the pinned guest cmdline but let the LAPIC

@@ -22,7 +22,8 @@ use std::io::{Read, Seek, SeekFrom};
 use rish_softvm_core::bzimage::{self, BootParams};
 use rish_softvm_core::net::{NetConfig, SlirpNetBackend};
 use rish_softvm_core::virtio::{
-    FileBlockBackend, VIRTIO_CMDLINE_FRAGMENT, VIRTIO_NET_CMDLINE_FRAGMENT,
+    FileBlockBackend, VIRTIO_BLK2_CMDLINE_FRAGMENT, VIRTIO_CMDLINE_FRAGMENT,
+    VIRTIO_NET_CMDLINE_FRAGMENT,
 };
 use rish_softvm_core::{Cpu, CpuError};
 
@@ -205,6 +206,7 @@ impl MachineProvider for PureRustProvider {
         // path). The backend rejects non-512-byte-multiple sizes;
         // everything else about the image stays the guest's business
         // (format, mount point).
+        let mut attached_data_disk = false;
         let root_disk_path = request.artifacts.root_disk.path().to_path_buf();
         let root_disk =
             request
@@ -226,6 +228,30 @@ impl MachineProvider for PureRustProvider {
             })?;
         cpu.attach_virtio_blk(Box::new(backend))
             .map_err(|error| SoftVmError::InvalidConfig(error.to_string()))?;
+        // The optional writable disk becomes /dev/vdb. The root image above is
+        // digest-verified and must stay byte-identical, so a run that installs
+        // something writes it here instead.
+        if let Some(data_disk) = request.artifacts.data_disk {
+            let data_disk_path = data_disk.path().to_path_buf();
+            let file = data_disk
+                .into_file()
+                .ok_or_else(|| SoftVmError::ArtifactRead {
+                    kind: "data disk",
+                    path: data_disk_path.clone(),
+                    source: std::io::Error::other(
+                        "data disk handle was not kept open at validation",
+                    ),
+                })?;
+            let backend =
+                FileBlockBackend::from_file(file).map_err(|source| SoftVmError::ArtifactRead {
+                    kind: "data disk",
+                    path: data_disk_path,
+                    source,
+                })?;
+            cpu.attach_virtio_blk2(Box::new(backend))
+                .map_err(|error| SoftVmError::InvalidConfig(error.to_string()))?;
+            attached_data_disk = true;
+        }
         // User-mode networking attaches the slirp-style backend from
         // rish-softvm-core: ARP/ICMP/DNS forwarding plus outbound TCP proxy
         // over host sockets. Anything else fails closed.
@@ -259,6 +285,10 @@ impl MachineProvider for PureRustProvider {
         if user_net {
             command_line.push(' ');
             command_line.push_str(VIRTIO_NET_CMDLINE_FRAGMENT);
+        }
+        if attached_data_disk {
+            command_line.push(' ');
+            command_line.push_str(VIRTIO_BLK2_CMDLINE_FRAGMENT);
         }
         if !command_line
             .split_whitespace()

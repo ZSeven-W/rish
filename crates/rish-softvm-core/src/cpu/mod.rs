@@ -228,6 +228,16 @@ impl Cpu {
         self.memory.attach_virtio_blk(device)
     }
 
+    /// Attaches a writable second block device, which the guest sees as
+    /// /dev/vdb. The guest discovers it through its own virtio_mmio
+    /// command-line fragment and it raises VIRTIO_BLK2_IRQ.
+    pub fn attach_virtio_blk2(&mut self, backend: Box<dyn BlockBackend>) -> Result<(), CpuError> {
+        let device = VirtioMmioBlk::new(backend).map_err(|error| {
+            CpuError::InvalidConfig(format!("second virtio block backend: {error}"))
+        })?;
+        self.memory.attach_virtio_blk2(device)
+    }
+
     /// Attaches the virtio-mmio network device backed by the given host-side
     /// user-mode backend. The guest discovers it through the virtio_mmio
     /// kernel command line (appended by the provider) and raises used-ring
@@ -324,6 +334,10 @@ impl Cpu {
             self.memory.ioapic_pulse(virtio::VIRTIO_IRQ, levels);
         }
         // Same edge discipline for the network device on its own IRQ line.
+        if self.memory.poll_virtio_blk2_irq() {
+            self.pic.pulse(virtio::VIRTIO_BLK2_IRQ);
+            self.memory.ioapic_pulse(virtio::VIRTIO_BLK2_IRQ, levels);
+        }
         if self.memory.poll_virtio_net() {
             self.pic.pulse(virtio::VIRTIO_NET_IRQ);
             self.memory.ioapic_pulse(virtio::VIRTIO_NET_IRQ, levels);

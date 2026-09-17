@@ -42,6 +42,7 @@ fn channel_with_output(output: &[u8]) -> (VmChannel, tempfile::TempDir, Arc<Canc
                 kernel_path: kernel.to_string_lossy().into(),
                 initrd_path: None,
                 root_disk_path: root.to_string_lossy().into(),
+                data_disk_path: None,
                 acceleration: VmAcceleration::Interpreter,
                 devices: vec![VmDevice::Console],
                 command_line: String::new(),

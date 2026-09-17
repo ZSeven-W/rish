@@ -26,6 +26,7 @@ fn config(kernel: &std::path::Path, root: &std::path::Path, memory_mib: u32) -> 
         kernel_path: kernel.to_string_lossy().into_owned(),
         initrd_path: None,
         root_disk_path: root.to_string_lossy().into_owned(),
+        data_disk_path: None,
         acceleration: VmAcceleration::Interpreter,
         devices: vec![VmDevice::Console],
         command_line: String::new(),

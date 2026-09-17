@@ -35,6 +35,11 @@ struct VmRunRequest {
     initrd_path: String,
     #[serde(default)]
     root_disk_path: Option<String>,
+    /// Writable second disk, seen by the guest as /dev/vdb. The root image is
+    /// digest-verified and must stay byte-identical, so whatever a run
+    /// installs has to be written here for the next one to find it.
+    #[serde(default)]
+    data_disk_path: Option<String>,
     #[serde(default = "default_memory_mib")]
     memory_mib: u32,
     #[serde(default)]
@@ -268,6 +273,7 @@ fn boot_channel(
         kernel_path: request.kernel_path.clone(),
         initrd_path: Some(request.initrd_path.clone()),
         root_disk_path,
+        data_disk_path: request.data_disk_path.clone(),
         acceleration: VmAcceleration::Interpreter,
         devices,
         command_line: request.command_line.clone().unwrap_or_default(),

@@ -6,8 +6,8 @@ use crate::CpuError;
 use crate::devices::ioapic::{IOAPIC_BASE, IOAPIC_SIZE, IoApic};
 use crate::devices::lapic::{LAPIC_BASE, LAPIC_SIZE, LocalApic};
 use crate::virtio::{
-    GuestMemory, VIRTIO_MMIO_BASE, VIRTIO_MMIO_REGISTER_BYTES, VIRTIO_MMIO_WINDOW_BYTES,
-    VIRTIO_NET_MMIO_BASE, VirtioError, VirtioMmioBlk, VirtioMmioNet,
+    GuestMemory, VIRTIO_BLK2_MMIO_BASE, VIRTIO_MMIO_BASE, VIRTIO_MMIO_REGISTER_BYTES,
+    VIRTIO_MMIO_WINDOW_BYTES, VIRTIO_NET_MMIO_BASE, VirtioError, VirtioMmioBlk, VirtioMmioNet,
 };
 
 pub struct Memory {
@@ -16,6 +16,7 @@ pub struct Memory {
     ioapic: RefCell<IoApic>,
     /// The virtio-mmio block device, when a backend is attached.
     virtio_blk: Option<RefCell<VirtioMmioBlk>>,
+    virtio_blk2: Option<RefCell<VirtioMmioBlk>>,
     /// The virtio-mmio network device, when a backend is attached.
     virtio_net: Option<RefCell<VirtioMmioNet>>,
     /// Host timestamp of the last RISH_DBG_NET diagnostics line.
@@ -50,6 +51,7 @@ impl Memory {
             lapic: None,
             ioapic: RefCell::new(IoApic::new()),
             virtio_blk: None,
+            virtio_blk2: None,
             virtio_net: None,
             net_dbg_last: None,
             generation: 0,
@@ -130,6 +132,10 @@ impl Memory {
         (VIRTIO_MMIO_BASE..VIRTIO_MMIO_BASE + VIRTIO_MMIO_WINDOW_BYTES).contains(&address)
     }
 
+    fn in_virtio_blk2(address: u64) -> bool {
+        (VIRTIO_BLK2_MMIO_BASE..VIRTIO_BLK2_MMIO_BASE + VIRTIO_MMIO_WINDOW_BYTES).contains(&address)
+    }
+
     fn in_virtio_net(address: u64) -> bool {
         (VIRTIO_NET_MMIO_BASE..VIRTIO_NET_MMIO_BASE + VIRTIO_MMIO_WINDOW_BYTES).contains(&address)
     }
@@ -143,6 +149,18 @@ impl Memory {
             ));
         }
         self.virtio_blk = Some(RefCell::new(device));
+        Ok(())
+    }
+
+    /// Attaches a second virtio-mmio block device, the one a guest sees as
+    /// /dev/vdb. Refused twice over for the same reason as the first.
+    pub fn attach_virtio_blk2(&mut self, device: VirtioMmioBlk) -> Result<(), CpuError> {
+        if self.virtio_blk2.is_some() {
+            return Err(CpuError::InvalidConfig(
+                "a second virtio block device is already attached".to_owned(),
+            ));
+        }
+        self.virtio_blk2 = Some(RefCell::new(device));
         Ok(())
     }
 
@@ -168,12 +186,42 @@ impl Memory {
             .and_then(|device| device.borrow().fault().map(str::to_owned))
     }
 
+    /// The sticky fail-closed fault the second block device latched, if any.
+    #[must_use]
+    pub fn virtio_blk2_fault(&self) -> Option<String> {
+        self.virtio_blk2
+            .as_ref()
+            .and_then(|device| device.borrow().fault().map(str::to_owned))
+    }
+
     /// The sticky fail-closed fault the network device latched, if any.
     #[must_use]
     pub fn virtio_net_fault(&self) -> Option<String> {
         self.virtio_net
             .as_ref()
             .and_then(|device| device.borrow().fault().map(str::to_owned))
+    }
+
+    /// The same drain for the second block device, on its own IRQ line.
+    pub fn poll_virtio_blk2_irq(&mut self) -> bool {
+        let Some(device) = &self.virtio_blk2 else {
+            return false;
+        };
+        let mut device = device.borrow_mut();
+        let mut guest = DeviceMemory {
+            ram: &mut self.ram,
+            code_gen: &mut self.code_gen,
+            wrote: false,
+        };
+        match device.poll_kick(&mut guest) {
+            Ok(completed) => {
+                if guest.wrote {
+                    self.generation = self.generation.wrapping_add(1);
+                }
+                completed
+            }
+            Err(_) => false,
+        }
     }
 
     /// Drains block requests the guest kicked since the last device tick.
@@ -278,6 +326,32 @@ impl Memory {
 
     #[inline]
     pub fn read(&self, address: u64, output: &mut [u8]) -> Result<(), CpuError> {
+        if Self::in_virtio_blk2(address) {
+            let offset = address - VIRTIO_BLK2_MMIO_BASE;
+            if offset >= VIRTIO_MMIO_REGISTER_BYTES {
+                for slot in output.iter_mut() {
+                    *slot = 0;
+                }
+                return Ok(());
+            }
+            if let Some(device) = &self.virtio_blk2 {
+                let value = device.borrow_mut().mmio_read(offset);
+                let bytes = value.to_le_bytes();
+                let count = output.len().min(4);
+                output[..count].copy_from_slice(&bytes[..count]);
+                if output.len() > 4 {
+                    let value2 = device.borrow_mut().mmio_read(offset + 4);
+                    let bytes2 = value2.to_le_bytes();
+                    let rest = output.len() - 4;
+                    output[4..].copy_from_slice(&bytes2[..rest]);
+                }
+            } else {
+                for slot in output.iter_mut() {
+                    *slot = 0;
+                }
+            }
+            return Ok(());
+        }
         if Self::in_virtio_net(address) {
             let offset = address - VIRTIO_NET_MMIO_BASE;
             if offset >= VIRTIO_MMIO_REGISTER_BYTES {
@@ -377,6 +451,20 @@ impl Memory {
 
     #[inline]
     pub fn write(&mut self, address: u64, input: &[u8]) -> Result<(), CpuError> {
+        if Self::in_virtio_blk2(address) {
+            let offset = address - VIRTIO_BLK2_MMIO_BASE;
+            if offset < VIRTIO_MMIO_REGISTER_BYTES {
+                if let Some(device) = &self.virtio_blk2 {
+                    let mut buffer = [0_u8; 4];
+                    let count = input.len().min(4);
+                    buffer[..count].copy_from_slice(&input[..count]);
+                    device
+                        .borrow_mut()
+                        .mmio_write(offset, u32::from_le_bytes(buffer));
+                }
+            }
+            return Ok(());
+        }
         if Self::in_virtio_net(address) {
             let offset = address - VIRTIO_NET_MMIO_BASE;
             if offset < VIRTIO_MMIO_REGISTER_BYTES {
@@ -669,5 +757,55 @@ mod tests {
         assert_eq!(counters[1], 1);
         assert_eq!(counters[2], 1);
         assert_eq!(counters[3..], [0_u32; 5]);
+    }
+
+    /// The guest identifies a device by the window it answers in. A second
+    /// block device that replied in the first device's window, or shared its
+    /// registers, would hand the guest another disk's geometry.
+    #[test]
+    fn the_second_block_window_is_its_own() {
+        use crate::virtio::backend::VecBlockBackend;
+        use crate::virtio::{
+            VIRTIO_BLK2_MMIO_BASE, VIRTIO_MMIO_BASE, VIRTIO_MMIO_WINDOW_BYTES,
+            VIRTIO_NET_MMIO_BASE, VirtioMmioBlk,
+        };
+
+        // The three windows are a page apart and never overlap. Checked at
+        // compile time, so a layout change fails the build rather than a run.
+        const _: () = assert!(VIRTIO_BLK2_MMIO_BASE == VIRTIO_MMIO_BASE + 0x2000);
+        const _: () = assert!(VIRTIO_MMIO_BASE + VIRTIO_MMIO_WINDOW_BYTES <= VIRTIO_NET_MMIO_BASE);
+        const _: () =
+            assert!(VIRTIO_NET_MMIO_BASE + VIRTIO_MMIO_WINDOW_BYTES <= VIRTIO_BLK2_MMIO_BASE);
+        assert!(!Memory::in_virtio(VIRTIO_BLK2_MMIO_BASE));
+        assert!(!Memory::in_virtio_net(VIRTIO_BLK2_MMIO_BASE));
+        assert!(Memory::in_virtio_blk2(VIRTIO_BLK2_MMIO_BASE));
+
+        let mut memory = Memory::new(1).unwrap();
+        // An unattached second window reads as zero and swallows writes.
+        let mut bytes = [0xFF_u8; 4];
+        memory.read(VIRTIO_BLK2_MMIO_BASE, &mut bytes).unwrap();
+        assert_eq!(bytes, [0; 4]);
+        memory
+            .write(VIRTIO_BLK2_MMIO_BASE, &[0x12, 0, 0, 0])
+            .unwrap();
+
+        let device = VirtioMmioBlk::new(Box::new(VecBlockBackend {
+            bytes: vec![0_u8; 4096],
+        }))
+        .unwrap();
+        memory.attach_virtio_blk2(device).unwrap();
+        // Attaching the second device must leave the first window empty, and
+        // a replacement is refused the way the first slot refuses one.
+        let mut first = [0xFF_u8; 4];
+        memory.read(VIRTIO_MMIO_BASE, &mut first).unwrap();
+        assert_eq!(first, [0; 4]);
+        let mut magic = [0_u8; 4];
+        memory.read(VIRTIO_BLK2_MMIO_BASE, &mut magic).unwrap();
+        assert_ne!(magic, [0; 4], "the attached device must answer here");
+        let second = VirtioMmioBlk::new(Box::new(VecBlockBackend {
+            bytes: vec![0_u8; 4096],
+        }))
+        .unwrap();
+        assert!(memory.attach_virtio_blk2(second).is_err());
     }
 }

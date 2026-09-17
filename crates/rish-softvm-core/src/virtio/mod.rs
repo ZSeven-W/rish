@@ -75,6 +75,12 @@ pub const VIRTIO_MMIO_BASE: u64 = 0xFEBF_0000;
 /// block device window.
 pub const VIRTIO_NET_MMIO_BASE: u64 = VIRTIO_MMIO_BASE + 0x1000;
 
+/// MMIO register window base for a second block device, one page above the
+/// network window. A guest that is given one sees it as /dev/vdb: the root
+/// image stays read-only and signed, so anything written at run time has to
+/// live on a disk of its own.
+pub const VIRTIO_BLK2_MMIO_BASE: u64 = VIRTIO_MMIO_BASE + 0x2000;
+
 /// Byte size of the register file: spec registers plus the block config
 /// space (0x000..=0x1FF).
 pub const VIRTIO_MMIO_REGISTER_BYTES: u64 = 0x200;
@@ -90,6 +96,9 @@ pub const VIRTIO_IRQ: u8 = 10;
 /// IRQ line the network device raises: I/O APIC pin 11.
 pub const VIRTIO_NET_IRQ: u8 = 11;
 
+/// IRQ line the second block device raises: I/O APIC pin 12.
+pub const VIRTIO_BLK2_IRQ: u8 = 12;
+
 /// Command-line fragment the pure-Rust provider appends when it attaches the
 /// block device. Format: size (KiB) @ base address : irq.
 pub const VIRTIO_CMDLINE_FRAGMENT: &str = "virtio_mmio.device=1K@0xfebf0000:10";
@@ -97,6 +106,9 @@ pub const VIRTIO_CMDLINE_FRAGMENT: &str = "virtio_mmio.device=1K@0xfebf0000:10";
 /// Command-line fragment the pure-Rust provider appends when it attaches the
 /// network device. The kernel parameter may be repeated, once per device.
 pub const VIRTIO_NET_CMDLINE_FRAGMENT: &str = "virtio_mmio.device=1K@0xfebf1000:11";
+
+/// Command-line fragment appended when a second block device is attached.
+pub const VIRTIO_BLK2_CMDLINE_FRAGMENT: &str = "virtio_mmio.device=1K@0xfebf2000:12";
 
 /// Error surface for the virtio device. Everything fails closed: a malformed
 /// queue or an out-of-RAM access stops the device instead of touching memory
