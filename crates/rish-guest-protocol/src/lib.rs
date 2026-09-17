@@ -16,7 +16,7 @@ pub use identifier::RequestId;
 pub use model::*;
 pub use session::{
     Exchange, ExecOutcome, MAX_EXEC_STREAM_BYTES, MAX_FRAMES_PER_EXCHANGE, NegotiatedSession,
-    SessionClient, SessionError, SessionIo, decode_base64, encode_base64,
+    PendingStdin, SessionClient, SessionError, SessionIo, decode_base64, encode_base64,
 };
 
 /// Stable protocol discriminator carried in every envelope.

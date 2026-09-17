@@ -178,3 +178,100 @@ fn full_execute_observes_decoded_spawn_output_before_exit() {
     assert_eq!(result.stdout, b"device-code");
     assert_eq!(observed.get(), 1);
 }
+
+/// Captures what the client writes, so a stdin frame emitted while the command
+/// is still running can be observed rather than inferred.
+struct RecordingIo {
+    packets: RefCell<VecDeque<Vec<u8>>>,
+    written: RefCell<Vec<u8>>,
+}
+
+impl SessionIo for RecordingIo {
+    fn write(&self, bytes: &[u8]) -> usize {
+        self.written.borrow_mut().extend_from_slice(bytes);
+        bytes.len()
+    }
+    fn advance(&self) -> Result<Vec<u8>, String> {
+        Ok(self.packets.borrow_mut().pop_front().unwrap_or_default())
+    }
+    fn dropped_output(&self) -> u64 {
+        0
+    }
+}
+
+struct QueuedAnswer {
+    pending: std::sync::Mutex<Option<Vec<u8>>>,
+    close: std::sync::atomic::AtomicBool,
+}
+
+impl PendingStdin for QueuedAnswer {
+    fn take_pending(&self) -> Option<Vec<u8>> {
+        self.pending.lock().unwrap().take()
+    }
+    fn close_requested(&self) -> bool {
+        self.close.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// The interactive login case: the command prints a prompt, the host answers it
+/// while the command is still running, and the answer reaches the guest as a
+/// WriteStdin for that execution. execute_observed cannot express this — it
+/// writes one buffer before the command starts and closes immediately.
+#[test]
+fn a_queued_answer_reaches_the_running_execution() {
+    let response = Response::success(
+        RequestId::new("vm-req-1").unwrap(),
+        ResponsePayload::ExecStarted {
+            execution_id: "login".into(),
+            pid: 7,
+        },
+    );
+    let started = FrameEncoder::new(DEFAULT_MAX_FRAME_SIZE)
+        .unwrap()
+        .encode(&Envelope::new(Message::Response(response)))
+        .unwrap();
+    let io = RecordingIo {
+        packets: RefCell::new(VecDeque::from([
+            started,
+            packet(stream("login")),
+            packet(exit()),
+        ])),
+        written: RefCell::new(Vec::new()),
+    };
+    let answer = std::sync::Arc::new(QueuedAnswer {
+        pending: std::sync::Mutex::new(Some(b"pasted-code\n".to_vec())),
+        close: std::sync::atomic::AtomicBool::new(true),
+    });
+    let mut client = SessionClient::new(8).unwrap();
+    client.negotiated = Some(NegotiatedSession {
+        session_id: "test".into(),
+        version: crate::CURRENT_PROTOCOL_VERSION,
+        max_frame_size: DEFAULT_MAX_FRAME_SIZE as u32,
+    });
+    let request = crate::ExecRequest {
+        argv: vec!["claude".into()],
+        env: Default::default(),
+        cwd: None,
+        user: None,
+        tty: false,
+        attach_stdin: true,
+        attach_stdout: true,
+        attach_stderr: true,
+        timeout_ms: None,
+    };
+
+    let result = client
+        .execute_interactive(request, &io, &mut |_, _| {}, answer)
+        .unwrap();
+
+    assert_eq!(result.exit_code, Some(0));
+    let written = String::from_utf8_lossy(&io.written.borrow()).into_owned();
+    assert!(
+        written.contains(&encode_base64(b"pasted-code\n")),
+        "the queued answer was never written: {written}"
+    );
+    assert!(written.contains("close_stdin"), "stdin was never closed");
+    // The binding must not outlive its execution, or a later command would be
+    // written into an id the guest has finished with.
+    assert!(client.interactive.is_none());
+}

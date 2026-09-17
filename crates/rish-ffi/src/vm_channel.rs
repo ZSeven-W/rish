@@ -1,23 +1,66 @@
 //! FFI control transport with cancellation/deadline checks at every quantum.
 
 use std::{
-    sync::{Arc, Mutex},
+    collections::VecDeque,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use rish_core::HostReply;
 use rish_guest_protocol::{
-    Envelope, ExecRequest, SessionClient, SessionError, SessionIo, StreamChannel,
+    Envelope, ExecRequest, PendingStdin, SessionClient, SessionError, SessionIo, StreamChannel,
 };
 use rish_softvm_x86_64::{EngineLimits, MachineState, X86_64Machine};
 
 use crate::vm_cancel::{CANCELLED, Cancellation, TIMED_OUT};
+
+/// Input queued for a command that is already running. It has its own lock so
+/// the thread queueing an answer never waits on the session lock the execution
+/// holds for as long as the command runs.
+#[derive(Default)]
+pub(crate) struct StdinInbox {
+    queued: Mutex<VecDeque<Vec<u8>>>,
+    close: AtomicBool,
+}
+
+impl StdinInbox {
+    pub(crate) fn write(&self, bytes: Vec<u8>) {
+        if let Ok(mut queued) = self.queued.lock() {
+            queued.push_back(bytes);
+        }
+    }
+
+    pub(crate) fn close(&self) {
+        self.close.store(true, Ordering::SeqCst);
+    }
+
+    fn reset(&self) {
+        if let Ok(mut queued) = self.queued.lock() {
+            queued.clear();
+        }
+        self.close.store(false, Ordering::SeqCst);
+    }
+}
+
+impl PendingStdin for StdinInbox {
+    fn take_pending(&self) -> Option<Vec<u8>> {
+        self.queued.lock().ok()?.pop_front()
+    }
+
+    fn close_requested(&self) -> bool {
+        self.close.load(Ordering::SeqCst)
+    }
+}
 
 pub(crate) struct VmChannel {
     pub(crate) machine: Arc<X86_64Machine>,
     limits: EngineLimits,
     cancel: Arc<Cancellation>,
     client: Mutex<SessionClient>,
+    pub(crate) stdin_inbox: Arc<StdinInbox>,
 }
 
 impl VmChannel {
@@ -38,6 +81,7 @@ impl VmChannel {
             limits,
             cancel,
             client: Mutex::new(client),
+            stdin_inbox: Arc::new(StdinInbox::default()),
         })
     }
 
@@ -83,6 +127,50 @@ impl VmChannel {
                     observer(channel, bytes);
                 }
             });
+        if exceeded {
+            return Err("E_VM_OUTPUT_LIMIT".into());
+        }
+        let outcome = result.map_err(control_error)?;
+        self.cancel.check()?;
+        Ok(HostReply {
+            exit_code: outcome
+                .exit_code
+                .unwrap_or(outcome.signal.map_or(-1, |value| 128 + value)),
+            stdout: outcome.stdout,
+            stderr: outcome.stderr,
+            payload: serde_json::Value::Null,
+        })
+    }
+
+    /// Runs a command whose stdin arrives while it runs. The inbox is emptied
+    /// first so an answer queued for an execution that has already ended cannot
+    /// be delivered to this one.
+    pub(crate) fn execute_interactive(
+        &self,
+        request: ExecRequest,
+        max_output_bytes: Option<usize>,
+        observer: &mut dyn FnMut(StreamChannel, &[u8]),
+    ) -> Result<HostReply, String> {
+        self.cancel.check()?;
+        let (request, deadline) = prepare_execution(request);
+        let mut client = self.client.try_lock().map_err(|_| "E_VM_SESSION_BUSY")?;
+        self.stdin_inbox.reset();
+        let mut output_bytes = 0_usize;
+        let mut exceeded = false;
+        let result = client.execute_interactive(
+            request,
+            &self.io(deadline),
+            &mut |channel, bytes| {
+                output_bytes = output_bytes.saturating_add(bytes.len());
+                if max_output_bytes.is_some_and(|limit| output_bytes > limit) {
+                    exceeded = true;
+                    self.cancel.request();
+                } else {
+                    observer(channel, bytes);
+                }
+            },
+            self.stdin_inbox.clone(),
+        );
         if exceeded {
             return Err("E_VM_OUTPUT_LIMIT".into());
         }

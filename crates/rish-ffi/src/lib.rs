@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 mod pull_ffi;
 pub mod vm_cancel;
 mod vm_channel;
+pub mod vm_control_ffi;
 pub mod vm_ffi;
 pub mod vm_stream_ffi;
 

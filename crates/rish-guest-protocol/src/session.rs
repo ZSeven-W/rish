@@ -6,7 +6,7 @@
 //! client never blocks, advances the guest in bounded steps, and fails closed
 //! on drops, malformed frames, or deadline breaches.
 
-use std::{collections::BTreeMap, fmt};
+use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use crate::{
     DEFAULT_MAX_FRAME_SIZE, Envelope, Event, EventKind, FrameDecoder, FrameEncoder, FrameError,
@@ -99,12 +99,31 @@ pub struct Exchange {
 }
 
 /// Stateful client for one guest session.
+/// Bytes a host queues for a command that is already running. `execute_observed`
+/// writes its whole stdin buffer up front and closes, which cannot answer a
+/// prompt the command has not printed yet. An interactive execution polls this
+/// at frame boundaries instead, so the answer can be written while the command
+/// waits for it.
+pub trait PendingStdin: Send + Sync {
+    /// Bytes to write now, or None when nothing is queued.
+    fn take_pending(&self) -> Option<Vec<u8>>;
+    /// Whether the host has finished writing and stdin should be closed.
+    fn close_requested(&self) -> bool;
+}
+
+struct InteractiveStdin {
+    execution_id: String,
+    source: Arc<dyn PendingStdin>,
+    closed: bool,
+}
+
 pub struct SessionClient {
     encoder: FrameEncoder,
     decoder: FrameDecoder,
     negotiated: Option<NegotiatedSession>,
     next_request_id: u64,
     max_advances_per_request: u64,
+    interactive: Option<InteractiveStdin>,
 }
 
 impl SessionClient {
@@ -118,6 +137,7 @@ impl SessionClient {
             negotiated: None,
             next_request_id: 1,
             max_advances_per_request,
+            interactive: None,
         })
     }
 
@@ -306,6 +326,32 @@ impl SessionClient {
         io: &I,
         observer: &mut dyn FnMut(StreamChannel, &[u8]),
     ) -> Result<ExecOutcome, SessionError> {
+        self.execute_with_stdin(request, stdin, io, observer, None)
+    }
+
+    /// Runs a command whose stdin the host writes while it runs, rather than
+    /// handing over one buffer before it starts.
+    pub fn execute_interactive<I: SessionIo>(
+        &mut self,
+        request: crate::ExecRequest,
+        io: &I,
+        observer: &mut dyn FnMut(StreamChannel, &[u8]),
+        source: Arc<dyn PendingStdin>,
+    ) -> Result<ExecOutcome, SessionError> {
+        self.execute_with_stdin(request, &[], io, observer, Some(source))
+    }
+
+    fn execute_with_stdin<I: SessionIo>(
+        &mut self,
+        request: crate::ExecRequest,
+        stdin: &[u8],
+        io: &I,
+        observer: &mut dyn FnMut(StreamChannel, &[u8]),
+        interactive: Option<Arc<dyn PendingStdin>>,
+    ) -> Result<ExecOutcome, SessionError> {
+        // An execution that ended early must not leave the pump writing into an
+        // id the guest has finished with.
+        self.interactive = None;
         let attach_stdin = request.attach_stdin;
         let mut exchange = self.request(Operation::Exec(request), io)?;
         let execution_id = match exchange.response.outcome {
@@ -321,7 +367,17 @@ impl SessionClient {
             }
         };
 
-        if attach_stdin {
+        if let Some(source) = interactive {
+            // Registered only once the id exists, so the pump addresses the
+            // execution it is actually collecting. attach_stdin stays the
+            // caller's decision; without it the guest has no pipe to write to.
+            self.interactive = Some(InteractiveStdin {
+                execution_id: execution_id.clone(),
+                source,
+                closed: false,
+            });
+        }
+        if attach_stdin && self.interactive.is_none() {
             self.stream_stdin(&execution_id, stdin, &mut exchange.events, io)?;
         }
         let already_exited = exchange.events.iter().any(|event| {
@@ -380,6 +436,7 @@ impl SessionClient {
                 self.collect_until_exit_observed(&execution_id, &mut Vec::new(), io, &mut capture)?;
             }
         }
+        self.interactive = None;
         let (exit_code, signal) =
             exited.ok_or_else(|| SessionError::Stream("no ProcessExited".to_owned()))?;
         Ok(ExecOutcome {
@@ -425,6 +482,73 @@ impl SessionClient {
             return Err(SessionError::NotNegotiated);
         }
         Ok(())
+    }
+
+    /// Writes whatever the host has queued for the running command, and closes
+    /// stdin once it says it is done. The reply is left for the pump already in
+    /// progress to collect as an ordinary frame; waiting for it here would
+    /// re-enter the pump that called this.
+    fn write_pending_stdin<I: SessionIo>(&mut self, io: &I) -> Result<(), SessionError> {
+        let Some(interactive) = self.interactive.as_ref() else {
+            return Ok(());
+        };
+        if interactive.closed {
+            return Ok(());
+        }
+        let execution_id = interactive.execution_id.clone();
+        let pending = interactive.source.take_pending();
+        let close = interactive.source.close_requested();
+        if pending.is_none() && !close {
+            return Ok(());
+        }
+        let version = self
+            .negotiated
+            .as_ref()
+            .ok_or(SessionError::NotNegotiated)?
+            .version;
+        if let Some(data) = pending {
+            self.write_stream_action(
+                &execution_id,
+                StreamAction::WriteStdin {
+                    data_base64: encode_base64(&data),
+                },
+                version,
+                io,
+            )?;
+        }
+        if close {
+            self.write_stream_action(&execution_id, StreamAction::CloseStdin, version, io)?;
+            if let Some(interactive) = self.interactive.as_mut() {
+                interactive.closed = true;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_stream_action<I: SessionIo>(
+        &mut self,
+        execution_id: &str,
+        action: StreamAction,
+        version: ProtocolVersion,
+        io: &I,
+    ) -> Result<(), SessionError> {
+        let id = RequestId::new(format!("vm-req-{}", self.next_request_id))
+            .map_err(|error| SessionError::Stream(error.to_string()))?;
+        self.next_request_id = self.next_request_id.saturating_add(1);
+        self.write_frame(
+            &Envelope::with_version(
+                version,
+                Message::Request(Request {
+                    id,
+                    operation: Operation::Stream(StreamRequest {
+                        execution_id: execution_id.to_owned(),
+                        action,
+                    }),
+                }),
+            ),
+            io,
+            self.max_advances_per_request,
+        )
     }
 
     fn write_frame<I: SessionIo>(
@@ -475,6 +599,7 @@ impl SessionClient {
             if advances >= max_advances {
                 return Err(SessionError::Deadline { advances });
             }
+            self.write_pending_stdin(io)?;
             let bytes = io.advance().map_err(SessionError::Advance)?;
             if io.dropped_output() != initial_dropped {
                 return Err(SessionError::DroppedBytes);

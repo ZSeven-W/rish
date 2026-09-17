@@ -103,6 +103,11 @@ struct ExecRequest {
     timeout_ms: Option<u64>,
     #[serde(default)]
     max_output_bytes: Option<usize>,
+    /// Keeps stdin open for the host to write while the command runs. The
+    /// default closes it as soon as the command starts, which is what a command
+    /// expecting EOF needs and what every existing caller relies on.
+    #[serde(default)]
+    interactive_stdin: bool,
 }
 
 fn legacy_exec_version() -> u32 {
@@ -118,6 +123,7 @@ impl ExecRequest {
             env: None,
             timeout_ms: None,
             max_output_bytes: None,
+            interactive_stdin: false,
         }
     }
 
@@ -203,6 +209,12 @@ pub struct VmSession {
     channel: VmChannel,
     boot_units: u64,
     _scratch_disk: Option<tempfile::NamedTempFile>,
+}
+
+impl VmSession {
+    pub(crate) fn stdin_inbox(&self) -> &crate::vm_channel::StdinInbox {
+        &self.channel.stdin_inbox
+    }
 }
 
 /// Boots the guest and brings up the bootstrapped control channel, returning it
@@ -382,21 +394,29 @@ pub fn vm_session_exec_observed_json(
     observer: &mut dyn FnMut(rish_guest_protocol::StreamChannel, &[u8]),
 ) -> String {
     let response = match serde_json::from_str::<ExecRequest>(request_json) {
-        Ok(request) => match request
-            .into_protocol()
-            .and_then(|(request, limit)| session.channel.execute_observed(request, limit, observer))
-        {
-            Ok(reply) => VmRunResponse {
-                protocol_version: 1,
-                ok: reply.exit_code == 0,
-                exit_code: Some(reply.exit_code),
-                stdout: Some(String::from_utf8_lossy(&reply.stdout).into_owned()),
-                stderr: Some(String::from_utf8_lossy(&reply.stderr).into_owned()),
-                boot_units: Some(session.boot_units),
-                error: None,
-            },
-            Err(error) => VmRunResponse::failure(error),
-        },
+        Ok(request) => {
+            let interactive = request.interactive_stdin;
+            match request.into_protocol().and_then(|(protocol, limit)| {
+                if interactive {
+                    session
+                        .channel
+                        .execute_interactive(protocol, limit, observer)
+                } else {
+                    session.channel.execute_observed(protocol, limit, observer)
+                }
+            }) {
+                Ok(reply) => VmRunResponse {
+                    protocol_version: 1,
+                    ok: reply.exit_code == 0,
+                    exit_code: Some(reply.exit_code),
+                    stdout: Some(String::from_utf8_lossy(&reply.stdout).into_owned()),
+                    stderr: Some(String::from_utf8_lossy(&reply.stderr).into_owned()),
+                    boot_units: Some(session.boot_units),
+                    error: None,
+                },
+                Err(error) => VmRunResponse::failure(error),
+            }
+        }
         Err(error) => VmRunResponse::failure(format!("invalid exec JSON: {error}")),
     };
     serde_json::to_string(&response).unwrap_or_else(|_| {
